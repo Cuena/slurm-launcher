@@ -1,0 +1,24 @@
+[build-system]
+requires = ["uv_build>=0.10.1,<0.11.0"]
+build-backend = "uv_build"
+
+[project]
+name = "slurm-launcher"
+version = "0.1.0"
+description = "Reusable remote SLURM launcher."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=14.3.2",
+    "ruff>=0.15.0",
+]
+
+[project.scripts]
+slurm-launcher = "launcher.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.uv.build-backend]
+module-root = ""
+module-name = "launcher"

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.venv/
+.uv-cache/
+.cache/
+
+slurm_output/
+remote_launcher_config.py
+examples/remote_launcher_config.mn5.py
+
+AGENTS.md

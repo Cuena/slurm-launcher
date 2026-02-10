@@ -1,0 +1,128 @@
+"""Configuration template for the remote SLURM launcher."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# Paths and cluster login
+# ---------------------------------------------------------------------------
+
+CONFIG_DIR = Path(__file__).resolve().parent
+LOCAL_ROOT = CONFIG_DIR  # Folder that gets rsynced to the cluster
+
+CLUSTER_LOGIN = "your_user@mn5.bsc.es"
+REMOTE_BASE_PATH = "/absolute/path/on/cluster/my_project"
+REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
+# Set to an absolute shared archive directory if you use slurm-dashboard.
+# Example: "/absolute/path/on/cluster/slurm-dashboard/logs"
+REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR: str | None = None
+# Optional human-friendly symlink view tree. If set with archive dir enabled,
+# launcher creates links like:
+#   <view>/<project>/<YYYY-MM-DD>/<job-name>-<job-id>.out|err
+# Example: "/absolute/path/on/cluster/slurm-dashboard/projects"
+REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
+
+PROJECT_NAME = LOCAL_ROOT.name.replace(" ", "_")
+
+# ---------------------------------------------------------------------------
+# Runtime mode
+# ---------------------------------------------------------------------------
+
+# native: run commands as written
+# venv: source the virtualenv from VENV_PYTHON_EXECUTABLE before running jobs
+# singularity: wrap each job with singularity exec <flags> <image> ...
+RUNTIME_MODE = "native"  # native | venv | singularity
+
+VENV_PYTHON_EXECUTABLE: str | None = None
+SINGULARITY_IMAGE_PATH: str | None = None
+SINGULARITY_EXEC_FLAGS: list[str] = []  # Example: ["--nv"]
+
+# ---------------------------------------------------------------------------
+# MN5 defaults
+# ---------------------------------------------------------------------------
+
+MN5_ACCOUNT = "your_mn5_account"
+MAIL_USER: str | None = None
+MAIL_TYPE = "END,FAIL"
+
+
+def mn5_accel_sbatch(
+    *,
+    gpus: int = 1,
+    qos: str = "acc_debug",
+    job_time: str = "00-00:30:00",
+) -> dict[str, Any]:
+    cpus_per_task = max(1, 20 * max(1, gpus))
+    return {
+        "account": MN5_ACCOUNT,
+        "qos": qos,
+        "time": job_time,
+        "ntasks": 1,
+        "cpus-per-task": cpus_per_task,
+        "gres": f"gpu:{max(1, gpus)}",
+    }
+
+
+def mn5_cpu_sbatch(
+    *,
+    qos: str = "gp_debug",
+    job_time: str = "00-01:00:00",
+) -> dict[str, Any]:
+    return {
+        "account": MN5_ACCOUNT,
+        "qos": qos,
+        "time": job_time,
+        "ntasks": 1,
+        "cpus-per-task": 1,
+        "nodes": 1,
+        "ntasks-per-node": 1,
+    }
+
+
+DEFAULT_ENV = {
+    "PYTHONUNBUFFERED": "1",
+}
+DEFAULT_SBATCH = mn5_accel_sbatch(gpus=1)
+
+if MAIL_USER:
+    DEFAULT_SBATCH["mail-type"] = MAIL_TYPE
+    DEFAULT_SBATCH["mail-user"] = MAIL_USER
+
+EXTRA_RSYNC_EXCLUDES = [
+    "data/",
+    "outputs/",
+    "*.pt",
+    "*.pth",
+]
+EXTRA_RSYNC_ARGS: list[str] = []
+VERBOSE = False
+
+# Leave empty to run all jobs, or set a subset of names.
+RUN_JOBS: list[str] = []
+
+JOBS = [
+    # Explicit Python command (works well with Hydra/OmegaConf overrides).
+    {
+        "name": "train",
+        "command": "python3 scripts/train.py --config-name=train +trainer.max_epochs=5",
+        "env": {"EXPERIMENT_NAME": "train"},
+        "sbatch": {},
+    },
+    # Explicit shell script command.
+    {
+        "name": "prepare_data",
+        "command": "bash scripts/prepare_data.sh data/raw data/processed",
+        "sbatch": {
+            **mn5_cpu_sbatch(job_time="00-00:20:00"),
+            "cpus-per-task": 4,
+        },
+    },
+    # Explicit command with srun.
+    {
+        "name": "eval_command",
+        "command": "srun python scripts/eval.py --config-name=eval",
+        "sbatch": mn5_cpu_sbatch(job_time="00-00:15:00"),
+    },
+]
