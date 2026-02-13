@@ -12,7 +12,9 @@ CONFIG_DIR = Path(__file__).resolve().parent
 LOCAL_ROOT = CONFIG_DIR.parent
 
 CLUSTER_LOGIN = "your_user@transfer1.bsc.es"
+CODE_SOURCE_MODE = "sync"  # sync | remote
 REMOTE_BASE_PATH = "/absolute/path/on/cluster/slurm-launcher"
+REMOTE_CODE_DIR: str | None = None
 REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
 REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = "/absolute/path/on/cluster/slurm-dashboard/logs"
 REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = "/absolute/path/on/cluster/slurm-dashboard/projects"

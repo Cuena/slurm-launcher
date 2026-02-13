@@ -10,10 +10,12 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 CONFIG_DIR = Path(__file__).resolve().parent
-LOCAL_ROOT = CONFIG_DIR  # Folder that gets rsynced to the cluster
+LOCAL_ROOT = CONFIG_DIR  # Folder synced when CODE_SOURCE_MODE == "sync"
 
 CLUSTER_LOGIN = "your_user@mn5.bsc.es"
+CODE_SOURCE_MODE = "sync"  # sync | remote
 REMOTE_BASE_PATH = "/absolute/path/on/cluster/my_project"
+REMOTE_CODE_DIR: str | None = None
 REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
 # Set to an absolute shared archive directory if you use slurm-dashboard.
 # Example: "/absolute/path/on/cluster/slurm-dashboard/logs"

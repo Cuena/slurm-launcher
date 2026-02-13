@@ -97,9 +97,13 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Print commands without running SSH/rsync/sbatch",
     )
     parser.add_argument(
-        "--no-sync",
-        action="store_true",
-        help="Skip the rsync step",
+        "--code-source",
+        choices=["sync", "remote"],
+        help=(
+            "Where job commands run. "
+            "'sync' creates a per-run folder and syncs local files with rsync. "
+            "'remote' reuses REMOTE_CODE_DIR and rsyncs into it."
+        ),
     )
 
 
@@ -153,15 +157,41 @@ def load_config(config_path: Path) -> ModuleType:
     return module
 
 
-def build_settings(config: ModuleType, config_path: Path) -> LauncherSettings:
+def build_settings(
+    config: ModuleType,
+    config_path: Path,
+    *,
+    code_source_mode_override: str | None = None,
+) -> LauncherSettings:
     cluster_login = getattr(config, "CLUSTER_LOGIN", None)
     remote_base_path = getattr(config, "REMOTE_BASE_PATH", None)
-    if not cluster_login or not remote_base_path:
+    remote_code_dir = getattr(config, "REMOTE_CODE_DIR", None)
+    code_source_mode = str(
+        code_source_mode_override or getattr(config, "CODE_SOURCE_MODE", "sync")
+    ).lower()
+    allowed_code_source_modes = {"sync", "remote"}
+    if code_source_mode not in allowed_code_source_modes:
+        raise SystemExit("ERROR: CODE_SOURCE_MODE must be one of: sync, remote.")
+
+    if not cluster_login:
+        raise SystemExit("ERROR: Config must define CLUSTER_LOGIN.")
+
+    remote_log_base_path = getattr(config, "REMOTE_LOG_BASE_PATH", None)
+    if not remote_log_base_path:
+        remote_log_base_path = remote_base_path or remote_code_dir
+    if not remote_log_base_path:
         raise SystemExit(
-            "ERROR: Config must define CLUSTER_LOGIN and REMOTE_BASE_PATH."
+            "ERROR: Config must define REMOTE_LOG_BASE_PATH, REMOTE_BASE_PATH, or REMOTE_CODE_DIR."
+        )
+    if code_source_mode == "sync" and not remote_base_path:
+        raise SystemExit(
+            "ERROR: REMOTE_BASE_PATH is required for CODE_SOURCE_MODE='sync'."
+        )
+    if code_source_mode == "remote" and not remote_code_dir:
+        raise SystemExit(
+            "ERROR: REMOTE_CODE_DIR is required for CODE_SOURCE_MODE='remote'."
         )
 
-    remote_log_base_path = getattr(config, "REMOTE_LOG_BASE_PATH", remote_base_path)
     remote_slurm_dashboard_log_archive_dir = getattr(
         config, "REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR", None
     )
@@ -213,8 +243,10 @@ def build_settings(config: ModuleType, config_path: Path) -> LauncherSettings:
 
     return LauncherSettings(
         cluster_login=cluster_login,
-        remote_base_path=remote_base_path,
-        remote_log_base_path=remote_log_base_path,
+        remote_base_path=(str(remote_base_path) if remote_base_path else None),
+        remote_log_base_path=str(remote_log_base_path),
+        code_source_mode=code_source_mode,
+        remote_code_dir=(str(remote_code_dir) if remote_code_dir else None),
         project_root=local_root,
         project_prefix=project_prefix,
         venv_python_executable=(str(venv_python) if venv_python else None),
@@ -344,7 +376,11 @@ def do_run(args: argparse.Namespace) -> int:
         return 1
 
     config = load_config(config_path)
-    settings = build_settings(config, config_path)
+    settings = build_settings(
+        config,
+        config_path,
+        code_source_mode_override=args.code_source,
+    )
 
     run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
     jobs = prepare_jobs(config, run_jobs, settings.default_env)
@@ -358,6 +394,7 @@ def do_run(args: argparse.Namespace) -> int:
             "\n".join(
                 [
                     f"[bold]Cluster:[/bold] {settings.cluster_login}",
+                    f"[bold]Code source:[/bold] {settings.code_source_mode}",
                     f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
                 ]
             ),
@@ -366,10 +403,12 @@ def do_run(args: argparse.Namespace) -> int:
         )
     )
 
-    if args.no_sync:
-        console.print("Skipping rsync (--no-sync)", style="yellow")
-    else:
-        sync_project(settings, remote_paths, dry_run=args.dry_run)
+    if settings.code_source_mode == "remote":
+        console.print(
+            "Using REMOTE_CODE_DIR as the execution directory.",
+            style="yellow",
+        )
+    sync_project(settings, remote_paths, dry_run=args.dry_run)
 
     job_records: list[dict[str, Any]] = []
     for job in jobs:
@@ -399,6 +438,7 @@ def do_run(args: argparse.Namespace) -> int:
         )
 
     details_table = Table.grid(padding=(0, 1))
+    details_table.add_row("Code source", settings.code_source_mode)
     details_table.add_row("Remote workdir", remote_paths.workdir)
     details_table.add_row("Remote logdir", remote_paths.logdir)
     if settings.remote_slurm_dashboard_log_archive_dir:

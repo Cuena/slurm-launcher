@@ -58,8 +58,10 @@ class JobSpec:
 @dataclass(frozen=True)
 class LauncherSettings:
     cluster_login: str
-    remote_base_path: str
+    remote_base_path: str | None
     remote_log_base_path: str
+    code_source_mode: str
+    remote_code_dir: str | None
     project_root: Path
     project_prefix: str
     venv_python_executable: str | None
@@ -528,12 +530,24 @@ def query_git_hash(repo_root: Path) -> str:
 
 def resolve_remote_paths(settings: LauncherSettings) -> RemotePaths:
     job_folder = create_job_folder_name(settings.project_prefix, settings.project_root)
-    remote_base = settings.remote_base_path.rstrip("/")
     remote_log_base = settings.remote_log_base_path.rstrip("/")
+    if settings.code_source_mode == "remote":
+        if not settings.remote_code_dir:
+            raise SystemExit(
+                "ERROR: REMOTE_CODE_DIR is required when CODE_SOURCE_MODE='remote'."
+            )
+        workdir = settings.remote_code_dir.rstrip("/")
+    else:
+        if not settings.remote_base_path:
+            raise SystemExit(
+                "ERROR: REMOTE_BASE_PATH is required when CODE_SOURCE_MODE='sync'."
+            )
+        remote_base = settings.remote_base_path.rstrip("/")
+        workdir = f"{remote_base}/{job_folder}"
     logdir = f"{remote_log_base}/{job_folder}"
     return RemotePaths(
         job_folder=job_folder,
-        workdir=f"{remote_base}/{job_folder}",
+        workdir=workdir,
         logdir=logdir,
         slurm_output_dir=f"{logdir}/slurm_output",
     )

@@ -8,8 +8,8 @@ This repo is infrastructure for running another codebase (for example, an AI tra
 
 It automates the repetitive workflow:
 
-- sync project files to the cluster (`rsync`)
-- create per-run remote work/log folders
+- sync project files to the cluster (`rsync`, `CODE_SOURCE_MODE=sync`)
+- choose execution directory: per-run folder or fixed remote project folder
 - generate and submit `sbatch` scripts over SSH
 - track submitted job IDs and log paths locally
 - inspect logs, monitor queue state, and download `.out/.err` files
@@ -18,7 +18,7 @@ The launcher is SLURM-cluster agnostic, but the bundled examples are MN5-oriente
 
 ## Repository layout
 
-- `launcher/`: launcher package (`uv run slurm-launcher ...` or `uv run -m launcher ...`)
+- `launcher/`: launcher package (`slurm-launcher ...` after tool install, or `uv run slurm-launcher ...`)
 - `launcher/templates/config.py.template`: starter config copied by `init`
 - `examples/remote_launcher_config.demo.py`: minimal dry-run example
 - `examples/remote_launcher_config.mn5.example.py`: MN5-oriented example
@@ -27,44 +27,63 @@ The launcher is SLURM-cluster agnostic, but the bundled examples are MN5-oriente
 
 - `uv`
 - `ssh` access to a SLURM cluster
-- `rsync` available locally
+- `rsync` available locally (required for `CODE_SOURCE_MODE=sync`)
 - `git` optional (used only to include commit hash in job folder names)
+
+## Install once (recommended)
+
+For day-to-day use across multiple repos, install launcher once as a uv tool:
+
+1. Clone launcher once:
+   - `git clone https://github.com/<you-or-org>/slurm-launcher.git`
+2. Install the CLI in editable mode:
+   - `uv tool install --editable /path/to/slurm-launcher`
+3. Ensure your shell PATH is updated for uv tools:
+   - `uv tool update-shell`
+4. Verify:
+   - `slurm-launcher --help`
+
+If you prefer not to install as a tool, you can still run commands as
+`uv run slurm-launcher ...` from an environment that has launcher available.
 
 ## Quick start
 
 1. Create a config:
-   - `uv run slurm-launcher init`
+   - `slurm-launcher init`
 2. Edit config:
    - repo-local mode: `remote_launcher_config.py`
    - wrapper mode: `.slurm/remote_launcher_config.mn5.py`
    - set `CLUSTER_LOGIN`
-   - set `REMOTE_BASE_PATH`
+   - set `CODE_SOURCE_MODE` (`sync` or `remote`)
+   - set `REMOTE_BASE_PATH` for `CODE_SOURCE_MODE=sync`
+   - set `REMOTE_CODE_DIR` for `CODE_SOURCE_MODE=remote`
    - if you are not on MN5/BSC, replace MN5-specific account/QoS/path defaults
    - optional (for slurm-dashboard): set `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
    - optional (for slurm-dashboard organization): set `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
    - define `JOBS`
 3. Validate commands without submission:
-   - `uv run slurm-launcher --dry-run`
+   - `slurm-launcher --dry-run`
 4. Submit jobs:
-   - `uv run slurm-launcher`
+   - `slurm-launcher`
 
 ## Use from another repo (wrapper mode)
 
 If your project code lives in a different repo, keep launcher code separate and keep
 config local to each project repo.
 
-1. Clone launcher once (outside your project repo):
-   - `git clone https://github.com/<you-or-org>/slurm-launcher.git`
-2. In the project repo, install launcher once (editable for fast iteration):
-   - `uv add --editable /path/to/slurm-launcher`
-3. Bootstrap `.slurm` config files and ignore rules:
+1. Bootstrap `.slurm` config files and ignore rules:
    - `bash /path/to/slurm-launcher/scripts/init_wrapper_repo.sh .`
-4. Edit your private config:
+2. Edit your private config:
    - `.slurm/remote_launcher_config.mn5.py`
-5. Run dry-run:
-   - `uv run slurm-launcher --dry-run`
-6. Submit:
-   - `uv run slurm-launcher`
+3. Run dry-run:
+   - `slurm-launcher --dry-run`
+4. Submit:
+   - `slurm-launcher`
+
+Project-managed alternative (reproducible dependency per repo):
+
+- `uv add --editable /path/to/slurm-launcher`
+- run via `uv run slurm-launcher ...`
 
 No-install fallback (longer command each time):
 
@@ -80,31 +99,32 @@ What the init script creates in the project repo:
 
 ## Common commands
 
-- `uv run slurm-launcher init --force`: overwrite existing config
-- `uv run slurm-launcher --only train eval`: run a subset of jobs
-- `uv run slurm-launcher --no-sync`: skip rsync
-- `uv run slurm-launcher --config path/to/config.py`: custom config path
+- `slurm-launcher init --force`: overwrite existing config
+- `slurm-launcher --only train eval`: run a subset of jobs
+- `slurm-launcher --code-source sync`: run from a new per-run folder (rsync)
+- `slurm-launcher --code-source remote`: run from `REMOTE_CODE_DIR` (rsync into fixed folder)
+- `slurm-launcher --config path/to/config.py`: custom config path
 - default config lookup for `run`: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py`
-- `uv run slurm-launcher logs`: show tracked `.out/.err` paths from latest run
-- `uv run slurm-launcher logs --json`: print full tracking payload
-- `uv run slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
-- `uv run slurm-launcher monitor`: run `squeue` for tracked job IDs from the latest run
-- `uv run slurm-launcher monitor --dry-run`: print the monitoring command only
+- `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
+- `slurm-launcher logs --json`: print full tracking payload
+- `slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
+- `slurm-launcher monitor`: run `squeue` for tracked job IDs from the latest run
+- `slurm-launcher monitor --dry-run`: print the monitoring command only
 
 ## Download logs locally
 
 Use `download-logs` to fetch remote `.out/.err` files recorded in a tracking file.
 
 - Download logs for all jobs in latest project run:
-  - `uv run slurm-launcher download-logs`
+  - `slurm-launcher download-logs`
 - Download only one job by name:
-  - `uv run slurm-launcher download-logs --job-name train_gpu`
+  - `slurm-launcher download-logs --job-name train_gpu`
 - Download only one job by id:
-  - `uv run slurm-launcher download-logs --job-id 36114735`
+  - `slurm-launcher download-logs --job-id 36114735`
 - Use a specific tracking file:
-  - `uv run slurm-launcher download-logs --tracking-file slurm_output/<job_folder>/jobs.json`
+  - `slurm-launcher download-logs --tracking-file slurm_output/<job_folder>/jobs.json`
 - Preview rsync commands without downloading:
-  - `uv run slurm-launcher download-logs --dry-run`
+  - `slurm-launcher download-logs --dry-run`
 
 Script compatibility:
 
@@ -118,17 +138,33 @@ Script compatibility:
   - set `SINGULARITY_IMAGE_PATH`
   - optional `SINGULARITY_EXEC_FLAGS` (for example `["--nv"]`)
 
+## Code source modes
+
+- `CODE_SOURCE_MODE=sync` (default):
+  - launcher creates a unique remote workdir under `REMOTE_BASE_PATH`
+  - launcher rsyncs `LOCAL_ROOT` to that folder before submission
+- `CODE_SOURCE_MODE=remote`:
+  - launcher runs jobs from `REMOTE_CODE_DIR` (fixed folder)
+  - launcher rsyncs `LOCAL_ROOT` into that fixed folder before submission
+
+CLI `--code-source` overrides `CODE_SOURCE_MODE` for one run.
+
 ## Config contract
 
 Required top-level settings:
 
 - `CLUSTER_LOGIN`: remote SSH login (`user@host`)
-- `REMOTE_BASE_PATH`: remote directory where each run workdir is created
 - `JOBS`: list of job dictionaries
+
+Required settings by code source mode:
+
+- `CODE_SOURCE_MODE=sync`: `REMOTE_BASE_PATH`
+- `CODE_SOURCE_MODE=remote`: `REMOTE_CODE_DIR`
+- If neither `REMOTE_BASE_PATH` nor `REMOTE_CODE_DIR` is set, define `REMOTE_LOG_BASE_PATH` explicitly.
 
 Optional top-level settings:
 
-- `LOCAL_ROOT`, `PROJECT_NAME`
+- `LOCAL_ROOT`, `PROJECT_NAME`, `CODE_SOURCE_MODE`, `REMOTE_CODE_DIR`
 - `REMOTE_LOG_BASE_PATH`
 - `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
 - `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
@@ -166,8 +202,8 @@ Use `examples/remote_launcher_config.mn5.py` for personal MN5 credentials; it is
 
 Dry-run examples:
 
-- `uv run slurm-launcher --config examples/remote_launcher_config.mn5.example.py --dry-run`
-- `uv run slurm-launcher --config examples/remote_launcher_config.demo.py --dry-run`
+- `slurm-launcher --config examples/remote_launcher_config.mn5.example.py --dry-run`
+- `slurm-launcher --config examples/remote_launcher_config.demo.py --dry-run`
 
 ## Outputs
 
