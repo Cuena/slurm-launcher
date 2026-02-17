@@ -16,15 +16,17 @@ CODE_SOURCE_MODE = "sync"  # sync | remote
 REMOTE_BASE_PATH = "/absolute/path/on/cluster/slurm-launcher"
 REMOTE_CODE_DIR: str | None = None
 REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
-REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = "/absolute/path/on/cluster/slurm-dashboard/logs"
-REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = "/absolute/path/on/cluster/slurm-dashboard/projects"
+REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = (
+    "/absolute/path/on/cluster/slurm-dashboard/logs"
+)
+REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = (
+    "/absolute/path/on/cluster/slurm-dashboard/projects"
+)
 
 PROJECT_NAME = "slurm-launcher"
 
 RUNTIME_MODE = "venv"  # native | venv | singularity
-VENV_PYTHON_EXECUTABLE: str | None = (
-    "/absolute/path/to/venv/bin/python"
-)
+VENV_PYTHON_EXECUTABLE: str | None = "/absolute/path/to/venv/bin/python"
 SINGULARITY_IMAGE_PATH: str | None = None
 SINGULARITY_EXEC_FLAGS: list[str] = []
 

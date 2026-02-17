@@ -49,7 +49,7 @@ If you prefer not to install as a tool, you can still run commands as
 ## Quick start
 
 1. Create a config:
-   - `slurm-launcher init`
+   - `slurm-launcher init` (creates `remote_launcher_config.py` and adds it to `.gitignore`)
 2. Edit config:
    - repo-local mode: `remote_launcher_config.py`
    - wrapper mode: `.slurm/remote_launcher_config.mn5.py`

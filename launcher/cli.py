@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +26,7 @@ from .core import (
     write_job_tracking_file,
 )
 from .download_logs import add_download_logs_args, run_download_logs
+from .init_wizard import init_config
 from .tracking import resolve_tracking_file
 
 console = Console()
@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     )
     init_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing config file"
+    )
+    init_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Copy the template without prompting (still updates .gitignore).",
     )
 
     logs_parser = subparsers.add_parser(
@@ -338,22 +343,38 @@ def do_init(args: argparse.Namespace) -> int:
     template_path = Path(__file__).parent / "templates" / "config.py.template"
     dest_path = Path.cwd() / "remote_launcher_config.py"
 
-    if dest_path.exists() and not args.force:
+    interactive = sys.stdin.isatty() and not args.non_interactive
+    try:
+        created_path, answers = init_config(
+            cwd=Path.cwd(),
+            template_path=template_path,
+            dest_path=dest_path,
+            force=bool(args.force),
+            interactive=interactive,
+        )
+    except FileExistsError:
         err_console.print(
             f"Config file already exists at {dest_path}. Use --force to overwrite.",
             style="bold red",
         )
         return 1
-
-    if not template_path.exists():
+    except FileNotFoundError:
         err_console.print(
             f"Template file not found at {template_path}", style="bold red"
         )
         return 1
+    except RuntimeError as exc:
+        err_console.print(f"ERROR: {exc}", style="bold red")
+        return 1
 
-    shutil.copy2(template_path, dest_path)
-    console.print(f"Created {dest_path}", style="bold green")
-    console.print("Please edit this file to configure your cluster settings.")
+    console.print(f"Created {created_path}", style="bold green")
+    console.print("Added remote_launcher_config.py to .gitignore", style="green")
+    if answers is None and not interactive:
+        console.print(
+            "Non-interactive mode used; please edit the config.", style="yellow"
+        )
+    else:
+        console.print("Please review and adjust values as needed.", style="yellow")
     return 0
 
 
