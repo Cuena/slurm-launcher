@@ -13,13 +13,18 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
 from .core import (
     JobSpec,
     LauncherSettings,
     build_job_record,
+    build_job_script,
+    build_sbatch_script,
+    format_sbatch_options,
     resolve_remote_paths,
+    ssh_script,
     submit_job,
     sync_project,
     test_ssh_connection,
@@ -67,6 +72,18 @@ def parse_args() -> argparse.Namespace:
     )
     _add_monitor_args(monitor_parser)
 
+    validate_parser = subparsers.add_parser(
+        "validate",
+        help="Validate the launcher config without submitting jobs",
+    )
+    _add_validate_args(validate_parser)
+
+    render_parser = subparsers.add_parser(
+        "render",
+        help="Render generated sbatch scripts without submitting jobs",
+    )
+    _add_render_args(render_parser)
+
     run_parser = subparsers.add_parser(
         "run", help="Run jobs (default if no command provided)"
     )
@@ -75,14 +92,22 @@ def parse_args() -> argparse.Namespace:
     raw_args = sys.argv[1:]
     if not raw_args:
         return run_parser.parse_args([])
-    if raw_args[0] in {"init", "logs", "download-logs", "monitor", "run"}:
+    if raw_args[0] in {
+        "init",
+        "logs",
+        "download-logs",
+        "monitor",
+        "validate",
+        "render",
+        "run",
+    }:
         return parser.parse_args(raw_args)
     if raw_args[0] in {"-h", "--help"}:
         return parser.parse_args(raw_args)
     return run_parser.parse_args(raw_args)
 
 
-def _add_run_args(parser: argparse.ArgumentParser) -> None:
+def _add_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
         help=(
@@ -97,11 +122,6 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
         help="Run only the specified job names (overrides RUN_JOBS)",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print commands without running SSH/rsync/sbatch",
-    )
-    parser.add_argument(
         "--code-source",
         choices=["sync", "remote"],
         help=(
@@ -109,6 +129,38 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
             "'sync' creates a per-run folder and syncs local files with rsync. "
             "'remote' reuses REMOTE_CODE_DIR and rsyncs into it."
         ),
+    )
+
+
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without running SSH/rsync/sbatch",
+    )
+
+
+def _add_validate_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    parser.add_argument(
+        "--ssh",
+        action="store_true",
+        help="Also test SSH connectivity.",
+    )
+    parser.add_argument(
+        "--check-remote-paths",
+        action="store_true",
+        help="With --ssh, check remote runtime paths (no writes).",
+    )
+
+
+def _add_render_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    parser.add_argument(
+        "--job-script",
+        action="store_true",
+        help="Also print the per-job script (without #SBATCH directives).",
     )
 
 
@@ -484,6 +536,180 @@ def do_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _fail_duplicate_jobs(jobs: list[JobSpec]) -> None:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for job in jobs:
+        if job.name in seen:
+            duplicates.add(job.name)
+        seen.add(job.name)
+    if duplicates:
+        raise SystemExit(f"ERROR: Duplicate job names found: {sorted(duplicates)}")
+
+
+def _fail_if_not_absolute(label: str, value: str | None) -> None:
+    if value is None:
+        return
+    if not str(value).startswith("/"):
+        raise SystemExit(f"ERROR: {label} must be an absolute path. Got: {value!r}")
+
+
+def _remote_runtime_checks(settings: LauncherSettings) -> list[str]:
+    commands: list[str] = []
+    if settings.runtime_mode == "venv" and settings.venv_python_executable:
+        venv_python = settings.venv_python_executable
+        activate = str(Path(venv_python).parent / "activate")
+        commands.extend(
+            [
+                f"test -f {activate}",
+                f"test -x {venv_python}",
+            ]
+        )
+    if settings.runtime_mode == "singularity" and settings.singularity_image_path:
+        commands.extend(
+            [
+                "command -v singularity >/dev/null 2>&1",
+                f"test -f {settings.singularity_image_path}",
+            ]
+        )
+    return commands
+
+
+def do_validate(args: argparse.Namespace) -> int:
+    if args.check_remote_paths and not args.ssh:
+        err_console.print(
+            "ERROR: --check-remote-paths requires --ssh.", style="bold red"
+        )
+        return 1
+
+    config_arg = str(args.config) if args.config else None
+    config_path = _resolve_run_config_path(config_arg)
+    if config_path is None:
+        err_console.print(
+            "Config file not found. Pass --config PATH.", style="bold red"
+        )
+        return 1
+
+    config = load_config(config_path)
+    settings = build_settings(
+        config,
+        config_path,
+        code_source_mode_override=args.code_source,
+    )
+
+    run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
+    jobs = prepare_jobs(config, run_jobs, settings.default_env)
+    _fail_duplicate_jobs(jobs)
+
+    _fail_if_not_absolute("REMOTE_LOG_BASE_PATH", settings.remote_log_base_path)
+    if settings.code_source_mode == "sync":
+        _fail_if_not_absolute("REMOTE_BASE_PATH", settings.remote_base_path)
+    if settings.code_source_mode == "remote":
+        _fail_if_not_absolute("REMOTE_CODE_DIR", settings.remote_code_dir)
+    if settings.runtime_mode == "venv":
+        _fail_if_not_absolute("VENV_PYTHON_EXECUTABLE", settings.venv_python_executable)
+    if settings.runtime_mode == "singularity":
+        _fail_if_not_absolute("SINGULARITY_IMAGE_PATH", settings.singularity_image_path)
+
+    remote_paths = resolve_remote_paths(settings)
+    for job in jobs:
+        format_sbatch_options(job, settings, remote_paths)
+
+    console.print()
+    console.print(Panel.fit("Config OK", border_style="green"))
+    summary = Table.grid(padding=(0, 1))
+    summary.add_row("Config", str(config_path))
+    summary.add_row("Cluster", settings.cluster_login)
+    summary.add_row("Code source", settings.code_source_mode)
+    summary.add_row("Runtime mode", settings.runtime_mode)
+    summary.add_row("Job folder", remote_paths.job_folder)
+    summary.add_row("Remote workdir", remote_paths.workdir)
+    summary.add_row("Remote logdir", remote_paths.logdir)
+    summary.add_row("Remote slurm_output", remote_paths.slurm_output_dir)
+    summary.add_row("Jobs", ", ".join(job.name for job in jobs))
+    console.print(summary)
+
+    if args.ssh:
+        try:
+            test_ssh_connection(settings.cluster_login, dry_run=False)
+        except SystemExit as exc:
+            err_console.print(str(exc), style="bold red")
+            return 1
+
+        if args.check_remote_paths:
+            checks = _remote_runtime_checks(settings)
+            if checks:
+                script = "set -euo pipefail\n" + "\n".join(checks) + "\necho OK\n"
+                try:
+                    stdout, _ = ssh_script(
+                        settings.cluster_login, script, dry_run=False
+                    )
+                except RuntimeError as exc:
+                    err_console.print(
+                        f"ERROR: Remote checks failed: {exc}", style="bold red"
+                    )
+                    return 1
+                if "OK" not in stdout:
+                    err_console.print(
+                        "ERROR: Remote checks did not return OK.", style="bold red"
+                    )
+                    return 1
+                console.print("Remote checks OK", style="green")
+    return 0
+
+
+def do_render(args: argparse.Namespace) -> int:
+    config_arg = str(args.config) if args.config else None
+    config_path = _resolve_run_config_path(config_arg)
+    if config_path is None:
+        err_console.print(
+            "Config file not found. Pass --config PATH.", style="bold red"
+        )
+        return 1
+
+    config = load_config(config_path)
+    settings = build_settings(
+        config,
+        config_path,
+        code_source_mode_override=args.code_source,
+    )
+
+    run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
+    jobs = prepare_jobs(config, run_jobs, settings.default_env)
+    _fail_duplicate_jobs(jobs)
+
+    remote_paths = resolve_remote_paths(settings)
+    console.print()
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"[bold]Config:[/bold] {config_path}",
+                    f"[bold]Cluster:[/bold] {settings.cluster_login}",
+                    f"[bold]Code source:[/bold] {settings.code_source_mode}",
+                    f"[bold]Runtime:[/bold] {settings.runtime_mode}",
+                    f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
+                ]
+            ),
+            title="Render",
+            border_style="cyan",
+        )
+    )
+
+    for job in jobs:
+        sbatch_options = format_sbatch_options(job, settings, remote_paths)
+        job_script = build_job_script(job, settings, remote_paths)
+        sbatch_script = build_sbatch_script(job_script, sbatch_options)
+        console.print()
+        console.rule(f"[cyan]{job.name} sbatch")
+        console.print(Syntax(sbatch_script.rstrip(), "bash"))
+        if args.job_script:
+            console.print()
+            console.rule(f"[cyan]{job.name} job script")
+            console.print(Syntax(job_script.rstrip(), "bash"))
+    return 0
+
+
 def _resolve_run_config_path(path_arg: str | None) -> Path | None:
     if path_arg:
         candidate = Path(path_arg)
@@ -654,4 +880,8 @@ def main() -> int:
         return do_download_logs(args)
     if hasattr(args, "command") and args.command == "monitor":
         return do_monitor(args)
+    if hasattr(args, "command") and args.command == "validate":
+        return do_validate(args)
+    if hasattr(args, "command") and args.command == "render":
+        return do_render(args)
     return do_run(args)
