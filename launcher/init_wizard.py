@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,11 @@ class InitAnswers:
     remote_base_path: str | None
     remote_code_dir: str | None
     remote_log_base_path: str
+    runtime_mode: str
+    venv_python_executable: str | None
+    singularity_image_path: str | None
+    singularity_exec_flags: list[str]
+    mn5_account: str
 
 
 def _prompt(text: str, *, default: str | None = None) -> str:
@@ -41,6 +47,11 @@ def _prompt_choice(
         if value in choice_set:
             return value
         print(f"Please enter one of: {', '.join(choices)}", file=sys.stderr)
+
+
+def _normalize_optional(value: str) -> str | None:
+    value = value.strip()
+    return value or None
 
 
 def _infer_project_name(cwd: Path) -> str:
@@ -143,6 +154,27 @@ def _apply_answers_to_template(template: str, answers: InitAnswers) -> str:
     updated = _replace_assignment(
         updated, "REMOTE_LOG_BASE_PATH", repr(answers.remote_log_base_path)
     )
+    updated = _replace_assignment(updated, "RUNTIME_MODE", repr(answers.runtime_mode))
+    updated = _replace_assignment(
+        updated,
+        "VENV_PYTHON_EXECUTABLE",
+        "None"
+        if answers.venv_python_executable is None
+        else repr(answers.venv_python_executable),
+    )
+    updated = _replace_assignment(
+        updated,
+        "SINGULARITY_IMAGE_PATH",
+        "None"
+        if answers.singularity_image_path is None
+        else repr(answers.singularity_image_path),
+    )
+    updated = _replace_assignment(
+        updated,
+        "SINGULARITY_EXEC_FLAGS",
+        repr(answers.singularity_exec_flags),
+    )
+    updated = _replace_assignment(updated, "MN5_ACCOUNT", repr(answers.mn5_account))
     return updated
 
 
@@ -156,6 +188,12 @@ def run_init_wizard(*, cwd: Path, template_path: Path) -> tuple[InitAnswers, str
         "Code source mode (sync|remote)",
         choices=["sync", "remote"],
         default="sync",
+    )
+
+    runtime_mode = _prompt_choice(
+        "Runtime mode (native|venv|singularity)",
+        choices=["native", "venv", "singularity"],
+        default="native",
     )
 
     remote_home_dir = _prompt(
@@ -181,6 +219,28 @@ def run_init_wizard(*, cwd: Path, template_path: Path) -> tuple[InitAnswers, str
 
     remote_log_base_path = _prompt("REMOTE_LOG_BASE_PATH", default=suggested_log_base)
 
+    venv_python_executable: str | None = None
+    singularity_image_path: str | None = None
+    singularity_exec_flags: list[str] = []
+    if runtime_mode == "venv":
+        while venv_python_executable is None:
+            venv_python_executable = _normalize_optional(
+                _prompt("VENV_PYTHON_EXECUTABLE (absolute)", default=None)
+            )
+    elif runtime_mode == "singularity":
+        while singularity_image_path is None:
+            singularity_image_path = _normalize_optional(
+                _prompt("SINGULARITY_IMAGE_PATH (absolute)", default=None)
+            )
+        raw_flags = _prompt(
+            "SINGULARITY_EXEC_FLAGS (optional; shell-style, e.g. --nv --bind /a:/b)",
+            default="",
+        )
+        if raw_flags.strip():
+            singularity_exec_flags = shlex.split(raw_flags)
+
+    mn5_account = _prompt("MN5_ACCOUNT (slurm account)", default="your_mn5_account")
+
     answers = InitAnswers(
         project_name=project_name,
         cluster_login=cluster_login,
@@ -188,6 +248,11 @@ def run_init_wizard(*, cwd: Path, template_path: Path) -> tuple[InitAnswers, str
         remote_base_path=remote_base_path,
         remote_code_dir=remote_code_dir,
         remote_log_base_path=remote_log_base_path,
+        runtime_mode=runtime_mode,
+        venv_python_executable=venv_python_executable,
+        singularity_image_path=singularity_image_path,
+        singularity_exec_flags=singularity_exec_flags,
+        mn5_account=mn5_account,
     )
     template = template_path.read_text(encoding="utf-8")
     return answers, _apply_answers_to_template(template, answers)
