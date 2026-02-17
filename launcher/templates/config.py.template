@@ -17,8 +17,11 @@ CODE_SOURCE_MODE = "sync"  # sync | remote
 REMOTE_BASE_PATH = "/absolute/path/on/cluster/my_project"
 REMOTE_CODE_DIR: str | None = None
 REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
-# Set to an absolute shared archive directory if you use slurm-dashboard.
-# Example: "/absolute/path/on/cluster/slurm-dashboard/logs"
+# If you use slurm-dashboard, set this to an absolute archive directory.
+# This controls where SLURM writes stdout/stderr via #SBATCH --output/--error.
+# It can be private (under $HOME) or shared (for team access / quotas).
+# Tip: point slurm-dashboard to the same folder via SLURM_DASHBOARD_LOG_ARCHIVE_DIR.
+# Example: "/absolute/path/on/cluster/slurm-dashboard/logs" or "/home/<user>/.slurm-dashboard/logs"
 REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR: str | None = None
 # Optional human-friendly symlink view tree. If set with archive dir enabled,
 # launcher creates links like:

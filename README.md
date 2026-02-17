@@ -61,8 +61,10 @@ If you prefer not to install as a tool, you can still run commands as
    - optional (for slurm-dashboard): set `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
    - optional (for slurm-dashboard organization): set `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
    - define `JOBS`
-3. Validate commands without submission:
-   - `slurm-launcher --dry-run`
+3. Validate/preview without submission:
+   - `slurm-launcher validate` (local config sanity checks)
+   - `slurm-launcher render` (prints generated sbatch scripts)
+   - `slurm-launcher --dry-run` (prints SSH/rsync/sbatch commands without running them)
 4. Submit jobs:
    - `slurm-launcher`
 
@@ -75,7 +77,9 @@ config local to each project repo.
    - `bash /path/to/slurm-launcher/scripts/init_wrapper_repo.sh .`
 2. Edit your private config:
    - `.slurm/remote_launcher_config.mn5.py`
-3. Run dry-run:
+3. Validate/preview without submission:
+   - `slurm-launcher validate`
+   - `slurm-launcher render`
    - `slurm-launcher --dry-run`
 4. Submit:
    - `slurm-launcher`
@@ -105,6 +109,11 @@ What the init script creates in the project repo:
 - `slurm-launcher --code-source remote`: run from `REMOTE_CODE_DIR` (rsync into fixed folder)
 - `slurm-launcher --config path/to/config.py`: custom config path
 - default config lookup for `run`: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py`
+- `slurm-launcher validate`: validate config without submission
+- `slurm-launcher validate --ssh`: validate config and test SSH connectivity
+- `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
+- `slurm-launcher render`: print generated sbatch scripts without submission
+- `slurm-launcher render --only train`: render only a subset of jobs
 - `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
 - `slurm-launcher logs --json`: print full tracking payload
 - `slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
@@ -212,22 +221,29 @@ Each run creates a unique job folder (timestamp + git hash when available).
 - local artifacts: `slurm_output/<job_folder>/`
 - tracking file: `slurm_output/<job_folder>/jobs.json`
 - latest run index: `slurm_output/latest_jobs.json`
-- default remote logs (no archive dir configured): `<job-name>-<job-id>.out` and `<job-name>-<job-id>.err`
+- default remote logs (no archive dir configured): `REMOTE_LOG_BASE_PATH/<job_folder>/slurm_output/<job-name>-<job-id>.out|err`
 
 ## slurm-dashboard compatibility
 
-To make this launcher write logs in the convention used by `slurm-dashboard-static`,
-set an absolute shared archive directory in your config:
+To make this launcher write logs in the convention used by `slurm-dashboard`, set an
+absolute archive directory in your config. This can be private (default dashboard
+location under your home) or shared (if you want others to be able to read logs or
+to avoid home quota).
 
 ```python
-REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = "/home/bsc/<user>/.slurm-dashboard/logs"
-REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = "/home/bsc/<user>/.slurm-dashboard/projects"  # optional
+# Private (matches slurm-dashboard default if SLURM_DASHBOARD_LOG_ARCHIVE_DIR is unset):
+REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = "/home/<user>/.slurm-dashboard/logs"
+REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = "/home/<user>/.slurm-dashboard/projects"  # optional
+
+# Or shared:
+# REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = "/absolute/shared/path/slurm-dashboard/logs"
+# REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = "/absolute/shared/path/slurm-dashboard/projects"  # optional
 ```
 
 With this set, launcher defaults become:
 
-- `--output=/home/bsc/<user>/.slurm-dashboard/logs/%j.out`
-- `--error=/home/bsc/<user>/.slurm-dashboard/logs/%j.err`
+- `--output=<archive_dir>/%j.out`
+- `--error=<archive_dir>/%j.err`
 
 The launcher creates the archive directory automatically before submission.
 
@@ -238,3 +254,22 @@ human-friendly symlinks after each submit:
 - `<view_dir>/<project>/<YYYY-MM-DD>/<job-name>-<job-id>.err -> <archive_dir>/<job-id>.err`
 
 This keeps job-id based recovery for the TUI and adds browsable per-project views.
+
+Important: slurm-dashboard reads the archive dir from the environment variable
+`SLURM_DASHBOARD_LOG_ARCHIVE_DIR` (default: `~/.slurm-dashboard/logs`). To keep
+the dashboard fallback aligned with your launcher submissions, set it to the same
+directory as `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR` when running slurm-dashboard.
+(If you use the default `~/.slurm-dashboard/logs`, you don't need to set it.)
+
+In short:
+
+- `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR` (launcher config): where SLURM writes `.out/.err`
+- `SLURM_DASHBOARD_LOG_ARCHIVE_DIR` (dashboard env var): where the dashboard looks for archived logs
+
+Example setup on the cluster:
+
+```bash
+export SLURM_DASHBOARD_LOG_ARCHIVE_DIR="/absolute/shared/path/slurm-dashboard/logs"
+mkdir -p "$SLURM_DASHBOARD_LOG_ARCHIVE_DIR"
+slurm-dashboard
+```
