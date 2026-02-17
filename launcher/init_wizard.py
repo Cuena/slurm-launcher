@@ -271,6 +271,8 @@ def init_config(
     if not template_path.exists():
         raise FileNotFoundError(template_path)
 
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
     answers: InitAnswers | None = None
     if interactive:
         answers, rendered = run_init_wizard(cwd=cwd, template_path=template_path)
@@ -280,5 +282,9 @@ def init_config(
             template_path.read_text(encoding="utf-8").rstrip() + "\n", encoding="utf-8"
         )
 
-    _ensure_gitignore_line(cwd, "remote_launcher_config.py")
+    if dest_path.parent.name == ".slurm":
+        _ensure_gitignore_line(cwd, ".slurm/*.py")
+        _ensure_gitignore_line(cwd, "!.slurm/*.example.py")
+    else:
+        _ensure_gitignore_line(cwd, dest_path.name)
     return dest_path, answers

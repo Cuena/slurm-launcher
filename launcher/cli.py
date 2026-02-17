@@ -393,7 +393,9 @@ def select_jobs(jobs: list[JobSpec], run_only: list[str] | None) -> list[JobSpec
 
 def do_init(args: argparse.Namespace) -> int:
     template_path = Path(__file__).parent / "templates" / "config.py.template"
-    dest_path = Path.cwd() / "remote_launcher_config.py"
+    slurm_dir = Path.cwd() / ".slurm"
+    dest_path = slurm_dir / "remote_launcher_config.mn5.py"
+    example_path = slurm_dir / "remote_launcher_config.mn5.example.py"
 
     interactive = sys.stdin.isatty() and not args.non_interactive
     try:
@@ -420,7 +422,15 @@ def do_init(args: argparse.Namespace) -> int:
         return 1
 
     console.print(f"Created {created_path}", style="bold green")
-    console.print("Added remote_launcher_config.py to .gitignore", style="green")
+    if args.force or not example_path.exists():
+        example_path.parent.mkdir(parents=True, exist_ok=True)
+        example_path.write_text(
+            template_path.read_text(encoding="utf-8").rstrip() + "\n",
+            encoding="utf-8",
+        )
+        console.print(f"Created {example_path}", style="green")
+    console.print("Added .slurm/*.py to .gitignore", style="green")
+    console.print("Added !.slurm/*.example.py to .gitignore", style="green")
     if answers is None and not interactive:
         console.print(
             "Non-interactive mode used; please edit the config.", style="yellow"

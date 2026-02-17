@@ -49,10 +49,10 @@ If you prefer not to install as a tool, you can still run commands as
 ## Quick start
 
 1. Create a config:
-   - `slurm-launcher init` (creates `remote_launcher_config.py` and adds it to `.gitignore`)
+   - `slurm-launcher init` (creates `.slurm/remote_launcher_config.mn5.py` + `.slurm/remote_launcher_config.mn5.example.py`)
 2. Edit config:
-   - repo-local mode: `remote_launcher_config.py`
-   - wrapper mode: `.slurm/remote_launcher_config.mn5.py`
+   - `.slurm/remote_launcher_config.mn5.py` (private, gitignored)
+   - optional: commit `.slurm/remote_launcher_config.mn5.example.py` as a sanitized reference
    - set `CLUSTER_LOGIN`
    - set `CODE_SOURCE_MODE` (`sync` or `remote`)
    - set `REMOTE_BASE_PATH` for `CODE_SOURCE_MODE=sync`
@@ -66,22 +66,6 @@ If you prefer not to install as a tool, you can still run commands as
    - `slurm-launcher render` (prints generated sbatch scripts)
    - `slurm-launcher --dry-run` (prints SSH/rsync/sbatch commands without running them)
 4. Submit jobs:
-   - `slurm-launcher`
-
-## Use from another repo (wrapper mode)
-
-If your project code lives in a different repo, keep launcher code separate and keep
-config local to each project repo.
-
-1. Bootstrap `.slurm` config files and ignore rules:
-   - `bash /path/to/slurm-launcher/scripts/init_wrapper_repo.sh .`
-2. Edit your private config:
-   - `.slurm/remote_launcher_config.mn5.py`
-3. Validate/preview without submission:
-   - `slurm-launcher validate`
-   - `slurm-launcher render`
-   - `slurm-launcher --dry-run`
-4. Submit:
    - `slurm-launcher`
 
 Project-managed alternative (reproducible dependency per repo):
@@ -108,7 +92,7 @@ What the init script creates in the project repo:
 - `slurm-launcher --code-source sync`: run from a new per-run folder (rsync)
 - `slurm-launcher --code-source remote`: run from `REMOTE_CODE_DIR` (rsync into fixed folder)
 - `slurm-launcher --config path/to/config.py`: custom config path
-- default config lookup for `run`: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py`
+- default config lookup for `run`: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py` (legacy)
 - `slurm-launcher validate`: validate config without submission
 - `slurm-launcher validate --ssh`: validate config and test SSH connectivity
 - `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
