@@ -12,10 +12,10 @@ CONFIG_DIR = Path(__file__).resolve().parent
 LOCAL_ROOT = CONFIG_DIR.parent
 
 CLUSTER_LOGIN = "your_user@mn5.bsc.es"
-CODE_SOURCE_MODE = "sync"  # sync | remote
-REMOTE_BASE_PATH = "/absolute/path/on/cluster/slurm-launcher-demo"
-REMOTE_CODE_DIR: str | None = None
-REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
+WORKSPACE_MODE = "per-run"  # per-run | fixed
+REMOTE_WORKSPACE_BASE = "/absolute/path/on/cluster/slurm-launcher-demo/work"
+REMOTE_WORKSPACE_DIR: str | None = None
+REMOTE_LOG_BASE_PATH = "/absolute/path/on/cluster/slurm-launcher-demo/logs"
 REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR: str | None = None
 REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 

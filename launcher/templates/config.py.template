@@ -10,13 +10,15 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 CONFIG_DIR = Path(__file__).resolve().parent
-LOCAL_ROOT = CONFIG_DIR  # Folder synced when CODE_SOURCE_MODE == "sync"
+LOCAL_ROOT = (
+    CONFIG_DIR.parent if CONFIG_DIR.name == ".slurm" else CONFIG_DIR
+)  # Folder synced to cluster
 
 CLUSTER_LOGIN = "your_user@mn5.bsc.es"
-CODE_SOURCE_MODE = "sync"  # sync | remote
-REMOTE_BASE_PATH = "/absolute/path/on/cluster/my_project"
-REMOTE_CODE_DIR: str | None = None
-REMOTE_LOG_BASE_PATH = REMOTE_BASE_PATH
+WORKSPACE_MODE = "per-run"  # per-run | fixed
+REMOTE_WORKSPACE_BASE = "/absolute/path/on/cluster/my_project/work"
+REMOTE_WORKSPACE_DIR: str | None = None
+REMOTE_LOG_BASE_PATH = "/absolute/path/on/cluster/my_project/logs"
 # If you use slurm-dashboard, set this to an absolute archive directory.
 # This controls where SLURM writes stdout/stderr via #SBATCH --output/--error.
 # It can be private (under $HOME) or shared (for team access / quotas).

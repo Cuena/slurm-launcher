@@ -8,8 +8,8 @@ This repo is infrastructure for running another codebase (for example, an AI tra
 
 It automates the repetitive workflow:
 
-- sync project files to the cluster (`rsync`, `CODE_SOURCE_MODE=sync`)
-- choose execution directory: per-run folder or fixed remote project folder
+- stage project files to the cluster (`rsync`)
+- choose remote workspace strategy: per-run folder or fixed remote project folder
 - generate and submit `sbatch` scripts over SSH
 - track submitted job IDs and log paths locally
 - inspect logs, monitor queue state, and download `.out/.err` files
@@ -27,7 +27,7 @@ The launcher is SLURM-cluster agnostic, but the bundled examples are MN5-oriente
 
 - `uv`
 - `ssh` access to a SLURM cluster
-- `rsync` available locally (required for `CODE_SOURCE_MODE=sync`)
+- `rsync` available locally (required for `stage` and `run`)
 - `git` optional (used only to include commit hash in job folder names)
 
 ## Install once (recommended)
@@ -54,9 +54,9 @@ If you prefer not to install as a tool, you can still run commands as
    - `.slurm/remote_launcher_config.mn5.py` (private, gitignored)
    - optional: commit `.slurm/remote_launcher_config.mn5.example.py` as a sanitized reference
    - set `CLUSTER_LOGIN`
-   - set `CODE_SOURCE_MODE` (`sync` or `remote`)
-   - set `REMOTE_BASE_PATH` for `CODE_SOURCE_MODE=sync`
-   - set `REMOTE_CODE_DIR` for `CODE_SOURCE_MODE=remote`
+   - set `WORKSPACE_MODE` (`per-run` or `fixed`)
+   - set `REMOTE_WORKSPACE_BASE` for `WORKSPACE_MODE=per-run`
+   - set `REMOTE_WORKSPACE_DIR` for `WORKSPACE_MODE=fixed`
    - if you are not on MN5/BSC, replace MN5-specific account/QoS/path defaults
    - optional (for slurm-dashboard): set `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
    - optional (for slurm-dashboard organization): set `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
@@ -64,9 +64,11 @@ If you prefer not to install as a tool, you can still run commands as
 3. Validate/preview without submission:
    - `slurm-launcher validate` (local config sanity checks)
    - `slurm-launcher render` (prints generated sbatch scripts)
-   - `slurm-launcher --dry-run` (prints SSH/rsync/sbatch commands without running them)
-4. Submit jobs:
-   - `slurm-launcher`
+   - `slurm-launcher stage --dry-run` (prints SSH/rsync commands)
+   - `slurm-launcher submit --dry-run --job-folder <existing_folder>` (prints SSH/sbatch commands)
+   - `slurm-launcher run --dry-run` (prints full stage + submit flow)
+4. Run:
+   - `slurm-launcher run`
 
 Project-managed alternative (reproducible dependency per repo):
 
@@ -88,16 +90,20 @@ What the init script creates in the project repo:
 ## Common commands
 
 - `slurm-launcher init --force`: overwrite existing config
-- `slurm-launcher --only train eval`: run a subset of jobs
-- `slurm-launcher --code-source sync`: run from a new per-run folder (rsync)
-- `slurm-launcher --code-source remote`: run from `REMOTE_CODE_DIR` (rsync into fixed folder)
+- `slurm-launcher run --only train eval`: run a subset of jobs
+- `slurm-launcher run --workspace per-run`: run from a new per-run folder (stage + submit)
+- `slurm-launcher run --workspace fixed`: run from `REMOTE_WORKSPACE_DIR` (stage + submit)
 - `slurm-launcher --config path/to/config.py`: custom config path
-- default config lookup for `run`: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py` (legacy)
+- default config lookup for commands using config: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py`
 - `slurm-launcher validate`: validate config without submission
 - `slurm-launcher validate --ssh`: validate config and test SSH connectivity
 - `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
 - `slurm-launcher render`: print generated sbatch scripts without submission
 - `slurm-launcher render --only train`: render only a subset of jobs
+- `slurm-launcher stage`: run only the SSH + rsync stage phase (no job submission)
+- `slurm-launcher stage --workspace fixed --dry-run`: print stage commands only
+- `slurm-launcher submit --workspace per-run --job-folder <folder>`: submit only (no rsync)
+- `slurm-launcher submit --workspace fixed`: submit only against fixed workspace
 - `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
 - `slurm-launcher logs --json`: print full tracking payload
 - `slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
@@ -131,16 +137,16 @@ Script compatibility:
   - set `SINGULARITY_IMAGE_PATH`
   - optional `SINGULARITY_EXEC_FLAGS` (for example `["--nv"]`)
 
-## Code source modes
+## Workspace modes
 
-- `CODE_SOURCE_MODE=sync` (default):
-  - launcher creates a unique remote workdir under `REMOTE_BASE_PATH`
+- `WORKSPACE_MODE=per-run` (default):
+  - launcher creates a unique remote workdir under `REMOTE_WORKSPACE_BASE`
   - launcher rsyncs `LOCAL_ROOT` to that folder before submission
-- `CODE_SOURCE_MODE=remote`:
-  - launcher runs jobs from `REMOTE_CODE_DIR` (fixed folder)
+- `WORKSPACE_MODE=fixed`:
+  - launcher runs jobs from `REMOTE_WORKSPACE_DIR` (fixed folder)
   - launcher rsyncs `LOCAL_ROOT` into that fixed folder before submission
 
-CLI `--code-source` overrides `CODE_SOURCE_MODE` for one run.
+CLI `--workspace` overrides `WORKSPACE_MODE` for one command.
 
 ## Config contract
 
@@ -149,15 +155,15 @@ Required top-level settings:
 - `CLUSTER_LOGIN`: remote SSH login (`user@host`)
 - `JOBS`: list of job dictionaries
 
-Required settings by code source mode:
+Required settings by workspace mode:
 
-- `CODE_SOURCE_MODE=sync`: `REMOTE_BASE_PATH`
-- `CODE_SOURCE_MODE=remote`: `REMOTE_CODE_DIR`
-- If neither `REMOTE_BASE_PATH` nor `REMOTE_CODE_DIR` is set, define `REMOTE_LOG_BASE_PATH` explicitly.
+- `WORKSPACE_MODE=per-run`: `REMOTE_WORKSPACE_BASE`
+- `WORKSPACE_MODE=fixed`: `REMOTE_WORKSPACE_DIR`
+- `REMOTE_LOG_BASE_PATH` is optional; when omitted it defaults to the selected workspace path.
 
 Optional top-level settings:
 
-- `LOCAL_ROOT`, `PROJECT_NAME`, `CODE_SOURCE_MODE`, `REMOTE_CODE_DIR`
+- `LOCAL_ROOT`, `PROJECT_NAME`, `WORKSPACE_MODE`, `REMOTE_WORKSPACE_DIR`
 - `REMOTE_LOG_BASE_PATH`
 - `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
 - `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
