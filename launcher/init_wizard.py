@@ -11,14 +11,20 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from rich.console import Console
+from rich.table import Table
+
+console = Console()
+err_console = Console(stderr=True)
+
 
 @dataclass(frozen=True)
 class InitAnswers:
     project_name: str
     cluster_login: str
-    code_source_mode: str
-    remote_base_path: str | None
-    remote_code_dir: str | None
+    workspace_mode: str
+    remote_workspace_base: str | None
+    remote_workspace_dir: str | None
     remote_log_base_path: str
     runtime_mode: str
     venv_python_executable: str | None
@@ -28,8 +34,12 @@ class InitAnswers:
 
 
 def _prompt(text: str, *, default: str | None = None) -> str:
-    suffix = f" [{default}]" if default is not None else ""
-    value = input(f"{text}{suffix}: ").strip()
+    suffix = f" (default: {default})" if default is not None else ""
+    if sys.stdin.isatty():
+        prompt_text = f"[bold cyan]{text}[/bold cyan]{suffix}: "
+    else:
+        prompt_text = f"{text}{suffix}: "
+    value = console.input(prompt_text).strip()
     if not value and default is not None:
         return default
     return value
@@ -46,12 +56,43 @@ def _prompt_choice(
         value = _prompt(text, default=default).strip().lower()
         if value in choice_set:
             return value
-        print(f"Please enter one of: {', '.join(choices)}", file=sys.stderr)
+        err_console.print(f"Please enter one of: {', '.join(choices)}", style="red")
+
+
+def _print_section(title: str) -> None:
+    console.print()
+    console.print(f"[bold]{title}[/bold]")
+
+
+def _print_choice_help(choices: list[str], descriptions: dict[str, str]) -> None:
+    table = Table(show_header=False, box=None, pad_edge=False, expand=False)
+    table.add_column(style="bold cyan", no_wrap=True)
+    table.add_column(style="dim")
+    for choice in choices:
+        table.add_row(choice, descriptions[choice])
+    console.print(table)
 
 
 def _normalize_optional(value: str) -> str | None:
     value = value.strip()
     return value or None
+
+
+def _cluster_user_from_login(cluster_login: str) -> str | None:
+    user = cluster_login.strip().partition("@")[0].strip()
+    return user or None
+
+
+def _prompt_required_absolute_path(text: str, *, default: str | None = None) -> str:
+    while True:
+        value = _normalize_optional(_prompt(text, default=default))
+        if value is None:
+            continue
+        if value.startswith("/"):
+            return value
+        err_console.print(
+            "Please enter an absolute path starting with '/'.", style="red"
+        )
 
 
 def _infer_project_name(cwd: Path) -> str:
@@ -139,17 +180,21 @@ def _apply_answers_to_template(template: str, answers: InitAnswers) -> str:
     updated = _replace_assignment(updated, "PROJECT_NAME", repr(answers.project_name))
     updated = _replace_assignment(updated, "CLUSTER_LOGIN", repr(answers.cluster_login))
     updated = _replace_assignment(
-        updated, "CODE_SOURCE_MODE", repr(answers.code_source_mode)
+        updated, "WORKSPACE_MODE", repr(answers.workspace_mode)
     )
     updated = _replace_assignment(
         updated,
-        "REMOTE_BASE_PATH",
-        repr(answers.remote_base_path or "/absolute/path/on/cluster/my_project"),
+        "REMOTE_WORKSPACE_BASE",
+        repr(
+            answers.remote_workspace_base or "/absolute/path/on/cluster/my_project/work"
+        ),
     )
     updated = _replace_assignment(
         updated,
-        "REMOTE_CODE_DIR",
-        "None" if answers.remote_code_dir is None else repr(answers.remote_code_dir),
+        "REMOTE_WORKSPACE_DIR",
+        "None"
+        if answers.remote_workspace_dir is None
+        else repr(answers.remote_workspace_dir),
     )
     updated = _replace_assignment(
         updated, "REMOTE_LOG_BASE_PATH", repr(answers.remote_log_base_path)
@@ -179,59 +224,114 @@ def _apply_answers_to_template(template: str, answers: InitAnswers) -> str:
 
 
 def run_init_wizard(*, cwd: Path, template_path: Path) -> tuple[InitAnswers, str]:
+    console.print()
+    console.rule("[bold cyan]slurm-launcher init[/bold cyan]")
+    console.print(
+        "Interactive setup for `.slurm/remote_launcher_config.mn5.py`.",
+        style="dim",
+    )
+
+    _print_section("Project and Cluster")
     inferred_project_name = _infer_project_name(cwd)
     project_name = _prompt("Project name", default=inferred_project_name)
     project_name = _normalize_project_name(project_name)
 
     cluster_login = _prompt("Cluster login (user@host)", default="your_user@mn5.bsc.es")
-    code_source_mode = _prompt_choice(
-        "Code source mode (sync|remote)",
-        choices=["sync", "remote"],
-        default="sync",
+    cluster_user = _cluster_user_from_login(cluster_login)
+    mn5_account = _prompt("MN5_ACCOUNT (slurm account)", default="your_mn5_account")
+
+    _print_section("Workspace Mode")
+    _print_choice_help(
+        ["per-run", "fixed"],
+        {
+            "per-run": "Use a per-run remote workdir under REMOTE_WORKSPACE_BASE and rsync into it.",
+            "fixed": "Use a fixed REMOTE_WORKSPACE_DIR and rsync into that same folder each run.",
+        },
+    )
+    workspace_mode = _prompt_choice(
+        "Workspace mode (per-run|fixed)",
+        choices=["per-run", "fixed"],
+        default="per-run",
     )
 
+    _print_section("Runtime Mode")
+    _print_choice_help(
+        ["native", "venv", "singularity"],
+        {
+            "native": "Run each job command exactly as written.",
+            "venv": "Activate the virtualenv from VENV_PYTHON_EXECUTABLE before jobs.",
+            "singularity": "Run each job with singularity exec <flags> <image> ...",
+        },
+    )
     runtime_mode = _prompt_choice(
         "Runtime mode (native|venv|singularity)",
         choices=["native", "venv", "singularity"],
         default="native",
     )
 
-    remote_home_dir = _prompt(
-        "Remote home dir (absolute; used only for suggestions)",
-        default="/home/bsc/<bsc_user>",
+    _print_section("Remote Paths")
+    console.print(
+        "Defaults are inferred from cluster user and MN5 account. "
+        "You can override each REMOTE_* path directly.",
+        style="dim",
     )
-    scratch_pipelines_dir = _prompt(
-        "Scratch pipelines root (absolute; used only for suggestions)",
-        default="/gpfs/scratch/<group>/users/<scratch_user>/pipelines",
+    scratch_group = mn5_account or "<group>"
+    scratch_user = cluster_user or "<scratch_user>"
+    scratch_pipelines_base = (
+        f"/gpfs/scratch/{scratch_group}/users/{scratch_user}/pipelines"
     )
 
-    base = f"{scratch_pipelines_dir.rstrip('/')}/{project_name}"
+    base = f"{scratch_pipelines_base.rstrip('/')}/{project_name}"
     suggested_log_base = f"{base}/logs"
 
-    if code_source_mode == "sync":
+    if workspace_mode == "per-run":
         suggested_remote_base = f"{base}/work"
-        remote_base_path = _prompt("REMOTE_BASE_PATH", default=suggested_remote_base)
-        remote_code_dir = None
+        remote_workspace_base = _prompt_required_absolute_path(
+            "REMOTE_WORKSPACE_BASE", default=suggested_remote_base
+        )
+        remote_workspace_dir = None
     else:
-        suggested_code_dir = f"{remote_home_dir.rstrip('/')}/code/{project_name}"
-        remote_code_dir = _prompt("REMOTE_CODE_DIR", default=suggested_code_dir)
-        remote_base_path = None
+        suggested_code_dir = f"{base}/code"
+        remote_workspace_dir = _prompt_required_absolute_path(
+            "REMOTE_WORKSPACE_DIR", default=suggested_code_dir
+        )
+        remote_workspace_base = None
 
-    remote_log_base_path = _prompt("REMOTE_LOG_BASE_PATH", default=suggested_log_base)
+    remote_log_base_path = _prompt_required_absolute_path(
+        "REMOTE_LOG_BASE_PATH", default=suggested_log_base
+    )
+    suggested_venv_python = (
+        f"{(remote_workspace_base or remote_workspace_dir or '').rstrip('/')}/.venv/bin/python"
+        if (remote_workspace_base or remote_workspace_dir)
+        else None
+    )
 
     venv_python_executable: str | None = None
     singularity_image_path: str | None = None
     singularity_exec_flags: list[str] = []
     if runtime_mode == "venv":
-        while venv_python_executable is None:
-            venv_python_executable = _normalize_optional(
-                _prompt("VENV_PYTHON_EXECUTABLE (absolute)", default=None)
-            )
+        console.print()
+        console.print(
+            "[bold]Runtime details[/bold] [dim](venv)[/dim]: "
+            "set the absolute python inside your remote virtualenv, "
+            "for example `/path/to/.venv/bin/python`.",
+            style="dim",
+        )
+        venv_python_executable = _prompt_required_absolute_path(
+            "VENV_PYTHON_EXECUTABLE (absolute)",
+            default=suggested_venv_python,
+        )
     elif runtime_mode == "singularity":
-        while singularity_image_path is None:
-            singularity_image_path = _normalize_optional(
-                _prompt("SINGULARITY_IMAGE_PATH (absolute)", default=None)
-            )
+        console.print()
+        console.print(
+            "[bold]Runtime details[/bold] [dim](singularity)[/dim]: "
+            "set the container image path, then optional extra flags.",
+            style="dim",
+        )
+        singularity_image_path = _prompt_required_absolute_path(
+            "SINGULARITY_IMAGE_PATH (absolute)",
+            default=None,
+        )
         raw_flags = _prompt(
             "SINGULARITY_EXEC_FLAGS (optional; shell-style, e.g. --nv --bind /a:/b)",
             default="",
@@ -239,14 +339,12 @@ def run_init_wizard(*, cwd: Path, template_path: Path) -> tuple[InitAnswers, str
         if raw_flags.strip():
             singularity_exec_flags = shlex.split(raw_flags)
 
-    mn5_account = _prompt("MN5_ACCOUNT (slurm account)", default="your_mn5_account")
-
     answers = InitAnswers(
         project_name=project_name,
         cluster_login=cluster_login,
-        code_source_mode=code_source_mode,
-        remote_base_path=remote_base_path,
-        remote_code_dir=remote_code_dir,
+        workspace_mode=workspace_mode,
+        remote_workspace_base=remote_workspace_base,
+        remote_workspace_dir=remote_workspace_dir,
         remote_log_base_path=remote_log_base_path,
         runtime_mode=runtime_mode,
         venv_python_executable=venv_python_executable,

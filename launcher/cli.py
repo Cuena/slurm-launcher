@@ -24,6 +24,7 @@ from .core import (
     build_sbatch_script,
     format_sbatch_options,
     resolve_remote_paths,
+    resolve_remote_paths_for_job_folder,
     ssh_script,
     submit_job,
     sync_project,
@@ -36,6 +37,7 @@ from .tracking import resolve_tracking_file
 
 console = Console()
 err_console = Console(stderr=True)
+WORKSPACE_MODES = {"per-run", "fixed"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,8 +86,20 @@ def parse_args() -> argparse.Namespace:
     )
     _add_render_args(render_parser)
 
+    stage_parser = subparsers.add_parser(
+        "stage",
+        help="Sync project files to the remote cluster without submitting jobs",
+    )
+    _add_stage_args(stage_parser)
+
+    submit_parser = subparsers.add_parser(
+        "submit",
+        help="Submit jobs without syncing code first",
+    )
+    _add_submit_args(submit_parser)
+
     run_parser = subparsers.add_parser(
-        "run", help="Run jobs (default if no command provided)"
+        "run", help="Stage code and submit jobs (default if no command provided)"
     )
     _add_run_args(run_parser)
 
@@ -99,6 +113,8 @@ def parse_args() -> argparse.Namespace:
         "monitor",
         "validate",
         "render",
+        "stage",
+        "submit",
         "run",
     }:
         return parser.parse_args(raw_args)
@@ -117,23 +133,27 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--workspace",
+        choices=["per-run", "fixed"],
+        help=(
+            "Remote workspace strategy. "
+            "'per-run' creates a unique workdir under REMOTE_WORKSPACE_BASE. "
+            "'fixed' reuses REMOTE_WORKSPACE_DIR."
+        ),
+    )
+
+
+def _add_job_selection_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--only",
         nargs="+",
         help="Run only the specified job names (overrides RUN_JOBS)",
-    )
-    parser.add_argument(
-        "--code-source",
-        choices=["sync", "remote"],
-        help=(
-            "Where job commands run. "
-            "'sync' creates a per-run folder and syncs local files with rsync. "
-            "'remote' reuses REMOTE_CODE_DIR and rsyncs into it."
-        ),
     )
 
 
 def _add_run_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    _add_job_selection_arg(parser)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -141,8 +161,35 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_stage_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without running SSH/rsync",
+    )
+
+
+def _add_submit_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    _add_job_selection_arg(parser)
+    parser.add_argument(
+        "--job-folder",
+        help=(
+            "Existing job folder to submit from when --workspace per-run. "
+            "Required for per-run submit-only."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print commands without running SSH/sbatch",
+    )
+
+
 def _add_validate_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    _add_job_selection_arg(parser)
     parser.add_argument(
         "--ssh",
         action="store_true",
@@ -157,6 +204,7 @@ def _add_validate_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_render_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    _add_job_selection_arg(parser)
     parser.add_argument(
         "--job-script",
         action="store_true",
@@ -214,39 +262,53 @@ def load_config(config_path: Path) -> ModuleType:
     return module
 
 
+def _normalize_workspace_mode(value: Any, *, setting_name: str) -> str:
+    mode = str(value).strip().lower()
+    if mode in WORKSPACE_MODES:
+        return mode
+    raise SystemExit(f"ERROR: {setting_name} must be one of: per-run, fixed.")
+
+
+def _workspace_mode_from_args(args: argparse.Namespace) -> str | None:
+    workspace = getattr(args, "workspace", None)
+    if workspace:
+        return _normalize_workspace_mode(workspace, setting_name="--workspace")
+    return None
+
+
 def build_settings(
     config: ModuleType,
     config_path: Path,
     *,
-    code_source_mode_override: str | None = None,
+    workspace_mode_override: str | None = None,
 ) -> LauncherSettings:
     cluster_login = getattr(config, "CLUSTER_LOGIN", None)
-    remote_base_path = getattr(config, "REMOTE_BASE_PATH", None)
-    remote_code_dir = getattr(config, "REMOTE_CODE_DIR", None)
-    code_source_mode = str(
-        code_source_mode_override or getattr(config, "CODE_SOURCE_MODE", "sync")
-    ).lower()
-    allowed_code_source_modes = {"sync", "remote"}
-    if code_source_mode not in allowed_code_source_modes:
-        raise SystemExit("ERROR: CODE_SOURCE_MODE must be one of: sync, remote.")
+    remote_workspace_base = getattr(config, "REMOTE_WORKSPACE_BASE", None)
+    remote_workspace_dir = getattr(config, "REMOTE_WORKSPACE_DIR", None)
+    configured_workspace_mode = getattr(config, "WORKSPACE_MODE", "per-run")
+    workspace_mode = _normalize_workspace_mode(
+        workspace_mode_override or configured_workspace_mode,
+        setting_name="WORKSPACE_MODE",
+    )
 
     if not cluster_login:
         raise SystemExit("ERROR: Config must define CLUSTER_LOGIN.")
 
     remote_log_base_path = getattr(config, "REMOTE_LOG_BASE_PATH", None)
     if not remote_log_base_path:
-        remote_log_base_path = remote_base_path or remote_code_dir
+        remote_log_base_path = remote_workspace_base or remote_workspace_dir
     if not remote_log_base_path:
         raise SystemExit(
-            "ERROR: Config must define REMOTE_LOG_BASE_PATH, REMOTE_BASE_PATH, or REMOTE_CODE_DIR."
+            "ERROR: Config must define REMOTE_LOG_BASE_PATH and one workspace path "
+            "(REMOTE_WORKSPACE_BASE/REMOTE_WORKSPACE_DIR)."
         )
-    if code_source_mode == "sync" and not remote_base_path:
+    if workspace_mode == "per-run" and not remote_workspace_base:
         raise SystemExit(
-            "ERROR: REMOTE_BASE_PATH is required for CODE_SOURCE_MODE='sync'."
+            "ERROR: REMOTE_WORKSPACE_BASE is required for WORKSPACE_MODE='per-run'."
         )
-    if code_source_mode == "remote" and not remote_code_dir:
+    if workspace_mode == "fixed" and not remote_workspace_dir:
         raise SystemExit(
-            "ERROR: REMOTE_CODE_DIR is required for CODE_SOURCE_MODE='remote'."
+            "ERROR: REMOTE_WORKSPACE_DIR is required for WORKSPACE_MODE='fixed'."
         )
 
     remote_slurm_dashboard_log_archive_dir = getattr(
@@ -300,10 +362,14 @@ def build_settings(
 
     return LauncherSettings(
         cluster_login=cluster_login,
-        remote_base_path=(str(remote_base_path) if remote_base_path else None),
+        remote_workspace_base=(
+            str(remote_workspace_base) if remote_workspace_base else None
+        ),
         remote_log_base_path=str(remote_log_base_path),
-        code_source_mode=code_source_mode,
-        remote_code_dir=(str(remote_code_dir) if remote_code_dir else None),
+        workspace_mode=workspace_mode,
+        remote_workspace_dir=(
+            str(remote_workspace_dir) if remote_workspace_dir else None
+        ),
         project_root=local_root,
         project_prefix=project_prefix,
         venv_python_executable=(str(venv_python) if venv_python else None),
@@ -429,6 +495,12 @@ def do_init(args: argparse.Namespace) -> int:
             encoding="utf-8",
         )
         console.print(f"Created {example_path}", style="green")
+    if answers is not None and interactive:
+        console.print(
+            f"Applied wizard answers to {created_path}. "
+            f"{example_path.name} keeps template defaults for reference.",
+            style="dim",
+        )
     console.print("Added .slurm/*.py to .gitignore", style="green")
     console.print("Added !.slurm/*.example.py to .gitignore", style="green")
     if answers is None and not interactive:
@@ -440,7 +512,7 @@ def do_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def do_run(args: argparse.Namespace) -> int:
+def _load_run_config(args: argparse.Namespace) -> tuple[ModuleType, Path] | None:
     config_arg = str(args.config) if args.config else None
     config_path = _resolve_run_config_path(config_arg)
     if config_path is None:
@@ -456,13 +528,19 @@ def do_run(args: argparse.Namespace) -> int:
             err_console.print(
                 "Pass --config PATH or run 'uv run slurm-launcher init' to create one."
             )
-        return 1
+        return None
+    return load_config(config_path), config_path
 
-    config = load_config(config_path)
+
+def do_run(args: argparse.Namespace) -> int:
+    loaded = _load_run_config(args)
+    if loaded is None:
+        return 1
+    config, config_path = loaded
     settings = build_settings(
         config,
         config_path,
-        code_source_mode_override=args.code_source,
+        workspace_mode_override=_workspace_mode_from_args(args),
     )
 
     run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
@@ -477,7 +555,7 @@ def do_run(args: argparse.Namespace) -> int:
             "\n".join(
                 [
                     f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                    f"[bold]Code source:[/bold] {settings.code_source_mode}",
+                    f"[bold]Workspace:[/bold] {settings.workspace_mode}",
                     f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
                 ]
             ),
@@ -486,9 +564,9 @@ def do_run(args: argparse.Namespace) -> int:
         )
     )
 
-    if settings.code_source_mode == "remote":
+    if settings.workspace_mode == "fixed":
         console.print(
-            "Using REMOTE_CODE_DIR as the execution directory.",
+            "Using REMOTE_WORKSPACE_DIR as the execution directory.",
             style="yellow",
         )
     sync_project(settings, remote_paths, dry_run=args.dry_run)
@@ -521,7 +599,7 @@ def do_run(args: argparse.Namespace) -> int:
         )
 
     details_table = Table.grid(padding=(0, 1))
-    details_table.add_row("Code source", settings.code_source_mode)
+    details_table.add_row("Workspace", settings.workspace_mode)
     details_table.add_row("Remote workdir", remote_paths.workdir)
     details_table.add_row("Remote logdir", remote_paths.logdir)
     if settings.remote_slurm_dashboard_log_archive_dir:
@@ -534,6 +612,146 @@ def do_run(args: argparse.Namespace) -> int:
             "Remote slurm-dashboard view dir",
             settings.remote_slurm_dashboard_log_view_dir,
         )
+    console.print()
+    console.print(details_table)
+    job_ids = _collect_job_ids(job_records)
+    if job_ids:
+        monitor_cmd = f"ssh {settings.cluster_login} 'squeue -j {','.join(job_ids)}'"
+    else:
+        monitor_cmd = f"ssh {settings.cluster_login} 'squeue -u $USER'"
+    console.print("Monitor jobs with:")
+    console.print(monitor_cmd, style="bold")
+    return 0
+
+
+def do_stage(args: argparse.Namespace) -> int:
+    loaded = _load_run_config(args)
+    if loaded is None:
+        return 1
+    config, config_path = loaded
+    settings = build_settings(
+        config,
+        config_path,
+        workspace_mode_override=_workspace_mode_from_args(args),
+    )
+
+    test_ssh_connection(settings.cluster_login, dry_run=args.dry_run)
+    remote_paths = resolve_remote_paths(settings)
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"[bold]Cluster:[/bold] {settings.cluster_login}",
+                    f"[bold]Workspace:[/bold] {settings.workspace_mode}",
+                    f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
+                ]
+            ),
+            title="Stage",
+            border_style="cyan",
+        )
+    )
+
+    if settings.workspace_mode == "fixed":
+        console.print(
+            "Using REMOTE_WORKSPACE_DIR as the execution directory.",
+            style="yellow",
+        )
+    sync_project(
+        settings,
+        remote_paths,
+        dry_run=args.dry_run,
+        include_logging_dirs=False,
+    )
+
+    details_table = Table.grid(padding=(0, 1))
+    details_table.add_row("Workspace", settings.workspace_mode)
+    details_table.add_row("Remote workdir", remote_paths.workdir)
+    if settings.workspace_mode == "per-run":
+        details_table.add_row("Job folder", remote_paths.job_folder)
+    console.print()
+    console.print(details_table)
+    return 0
+
+
+def do_submit(args: argparse.Namespace) -> int:
+    loaded = _load_run_config(args)
+    if loaded is None:
+        return 1
+    config, config_path = loaded
+    settings = build_settings(
+        config,
+        config_path,
+        workspace_mode_override=_workspace_mode_from_args(args),
+    )
+
+    if settings.workspace_mode == "per-run" and not args.job_folder:
+        err_console.print(
+            "ERROR: --job-folder is required for submit-only when --workspace per-run.",
+            style="bold red",
+        )
+        return 1
+
+    run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
+    jobs = prepare_jobs(config, run_jobs, settings.default_env)
+
+    test_ssh_connection(settings.cluster_login, dry_run=args.dry_run)
+    remote_paths = resolve_remote_paths_for_job_folder(
+        settings,
+        job_folder=args.job_folder,
+    )
+
+    console.print()
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"[bold]Cluster:[/bold] {settings.cluster_login}",
+                    f"[bold]Workspace:[/bold] {settings.workspace_mode}",
+                    f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
+                ]
+            ),
+            title="Submit",
+            border_style="cyan",
+        )
+    )
+    console.print(
+        "Skipping stage step. Assuming code is already present on the remote workdir.",
+        style="yellow",
+    )
+
+    job_records: list[dict[str, Any]] = []
+    for job in jobs:
+        submission = submit_job(settings, remote_paths, job, dry_run=args.dry_run)
+        if not args.dry_run:
+            job_records.append(build_job_record(job, submission))
+
+    if job_records:
+        tracking_file = write_job_tracking_file(settings, remote_paths, job_records)
+        console.print()
+        console.print(f"Saved job metadata to {tracking_file}", style="green")
+        submitted_table = Table(title="Submitted Jobs")
+        submitted_table.add_column("Job")
+        submitted_table.add_column("Job ID")
+        for record in job_records:
+            submitted_table.add_row(
+                str(record.get("job_name", "")),
+                str(record.get("job_id", "")),
+            )
+        console.print(submitted_table)
+        _print_job_logs(job_records)
+    elif args.dry_run:
+        console.print()
+        console.print(
+            "Skipped job metadata tracking because --dry-run was used.",
+            style="yellow",
+        )
+
+    details_table = Table.grid(padding=(0, 1))
+    details_table.add_row("Workspace", settings.workspace_mode)
+    details_table.add_row("Remote workdir", remote_paths.workdir)
+    details_table.add_row("Remote logdir", remote_paths.logdir)
     console.print()
     console.print(details_table)
     job_ids = _collect_job_ids(job_records)
@@ -604,7 +822,7 @@ def do_validate(args: argparse.Namespace) -> int:
     settings = build_settings(
         config,
         config_path,
-        code_source_mode_override=args.code_source,
+        workspace_mode_override=_workspace_mode_from_args(args),
     )
 
     run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
@@ -612,10 +830,12 @@ def do_validate(args: argparse.Namespace) -> int:
     _fail_duplicate_jobs(jobs)
 
     _fail_if_not_absolute("REMOTE_LOG_BASE_PATH", settings.remote_log_base_path)
-    if settings.code_source_mode == "sync":
-        _fail_if_not_absolute("REMOTE_BASE_PATH", settings.remote_base_path)
-    if settings.code_source_mode == "remote":
-        _fail_if_not_absolute("REMOTE_CODE_DIR", settings.remote_code_dir)
+    if settings.workspace_mode == "per-run":
+        _fail_if_not_absolute(
+            "REMOTE_WORKSPACE_BASE", settings.remote_workspace_base
+        )
+    if settings.workspace_mode == "fixed":
+        _fail_if_not_absolute("REMOTE_WORKSPACE_DIR", settings.remote_workspace_dir)
     if settings.runtime_mode == "venv":
         _fail_if_not_absolute("VENV_PYTHON_EXECUTABLE", settings.venv_python_executable)
     if settings.runtime_mode == "singularity":
@@ -630,7 +850,7 @@ def do_validate(args: argparse.Namespace) -> int:
     summary = Table.grid(padding=(0, 1))
     summary.add_row("Config", str(config_path))
     summary.add_row("Cluster", settings.cluster_login)
-    summary.add_row("Code source", settings.code_source_mode)
+    summary.add_row("Workspace", settings.workspace_mode)
     summary.add_row("Runtime mode", settings.runtime_mode)
     summary.add_row("Job folder", remote_paths.job_folder)
     summary.add_row("Remote workdir", remote_paths.workdir)
@@ -681,7 +901,7 @@ def do_render(args: argparse.Namespace) -> int:
     settings = build_settings(
         config,
         config_path,
-        code_source_mode_override=args.code_source,
+        workspace_mode_override=_workspace_mode_from_args(args),
     )
 
     run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
@@ -696,7 +916,7 @@ def do_render(args: argparse.Namespace) -> int:
                 [
                     f"[bold]Config:[/bold] {config_path}",
                     f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                    f"[bold]Code source:[/bold] {settings.code_source_mode}",
+                    f"[bold]Workspace:[/bold] {settings.workspace_mode}",
                     f"[bold]Runtime:[/bold] {settings.runtime_mode}",
                     f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
                 ]
@@ -861,23 +1081,20 @@ def do_download_logs(args: argparse.Namespace) -> int:
 def _print_job_logs(records: list[dict[str, Any]]) -> None:
     console.print()
     console.print(Panel.fit("Remote Logs", border_style="cyan"))
-    logs_table = Table(show_header=True)
-    logs_table.add_column("Job")
-    logs_table.add_column("ID")
-    logs_table.add_column("stdout")
-    logs_table.add_column("stderr")
-    for record in records:
+    for index, record in enumerate(records):
         job_name = str(record.get("job_name", "") or "")
         job_id = str(record.get("job_id", "") or "")
         stdout_path = str(record.get("stdout", "") or "")
         stderr_path = str(record.get("stderr", "") or "")
-        logs_table.add_row(
-            job_name,
-            job_id,
-            stdout_path or "-",
-            stderr_path if stderr_path and stderr_path != stdout_path else "-",
+        job_label = f"{job_name} ({job_id})" if job_id else job_name
+        console.print(f"[bold]{job_label}[/bold]")
+        console.print(f"stdout: {stdout_path or '-'}", soft_wrap=True)
+        console.print(
+            f"stderr: {stderr_path if stderr_path and stderr_path != stdout_path else '-'}",
+            soft_wrap=True,
         )
-    console.print(logs_table)
+        if index < len(records) - 1:
+            console.print()
 
 
 def main() -> int:
@@ -894,4 +1111,8 @@ def main() -> int:
         return do_validate(args)
     if hasattr(args, "command") and args.command == "render":
         return do_render(args)
+    if hasattr(args, "command") and args.command == "stage":
+        return do_stage(args)
+    if hasattr(args, "command") and args.command == "submit":
+        return do_submit(args)
     return do_run(args)

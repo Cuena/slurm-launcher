@@ -58,10 +58,10 @@ class JobSpec:
 @dataclass(frozen=True)
 class LauncherSettings:
     cluster_login: str
-    remote_base_path: str | None
+    remote_workspace_base: str | None
     remote_log_base_path: str
-    code_source_mode: str
-    remote_code_dir: str | None
+    workspace_mode: str
+    remote_workspace_dir: str | None
     project_root: Path
     project_prefix: str
     venv_python_executable: str | None
@@ -144,17 +144,21 @@ def ensure_remote_directories(
 
 
 def sync_project(
-    settings: LauncherSettings, remote_paths: RemotePaths, dry_run: bool
+    settings: LauncherSettings,
+    remote_paths: RemotePaths,
+    dry_run: bool,
+    *,
+    include_logging_dirs: bool = True,
 ) -> None:
-    remote_directories = [
-        remote_paths.workdir,
-        remote_paths.logdir,
-        remote_paths.slurm_output_dir,
-    ]
-    if settings.remote_slurm_dashboard_log_archive_dir:
-        remote_directories.append(settings.remote_slurm_dashboard_log_archive_dir)
-    if settings.remote_slurm_dashboard_log_view_dir:
-        remote_directories.append(settings.remote_slurm_dashboard_log_view_dir)
+    remote_directories = [remote_paths.workdir]
+    if include_logging_dirs:
+        remote_directories.extend(
+            [remote_paths.logdir, remote_paths.slurm_output_dir]
+        )
+        if settings.remote_slurm_dashboard_log_archive_dir:
+            remote_directories.append(settings.remote_slurm_dashboard_log_archive_dir)
+        if settings.remote_slurm_dashboard_log_view_dir:
+            remote_directories.append(settings.remote_slurm_dashboard_log_view_dir)
 
     ensure_remote_directories(
         settings,
@@ -529,24 +533,33 @@ def query_git_hash(repo_root: Path) -> str:
 
 
 def resolve_remote_paths(settings: LauncherSettings) -> RemotePaths:
-    job_folder = create_job_folder_name(settings.project_prefix, settings.project_root)
+    return resolve_remote_paths_for_job_folder(settings, job_folder=None)
+
+
+def resolve_remote_paths_for_job_folder(
+    settings: LauncherSettings,
+    job_folder: str | None,
+) -> RemotePaths:
+    effective_job_folder = job_folder or create_job_folder_name(
+        settings.project_prefix, settings.project_root
+    )
     remote_log_base = settings.remote_log_base_path.rstrip("/")
-    if settings.code_source_mode == "remote":
-        if not settings.remote_code_dir:
+    if settings.workspace_mode == "fixed":
+        if not settings.remote_workspace_dir:
             raise SystemExit(
-                "ERROR: REMOTE_CODE_DIR is required when CODE_SOURCE_MODE='remote'."
+                "ERROR: REMOTE_WORKSPACE_DIR is required when WORKSPACE_MODE='fixed'."
             )
-        workdir = settings.remote_code_dir.rstrip("/")
+        workdir = settings.remote_workspace_dir.rstrip("/")
     else:
-        if not settings.remote_base_path:
+        if not settings.remote_workspace_base:
             raise SystemExit(
-                "ERROR: REMOTE_BASE_PATH is required when CODE_SOURCE_MODE='sync'."
+                "ERROR: REMOTE_WORKSPACE_BASE is required when WORKSPACE_MODE='per-run'."
             )
-        remote_base = settings.remote_base_path.rstrip("/")
-        workdir = f"{remote_base}/{job_folder}"
-    logdir = f"{remote_log_base}/{job_folder}"
+        remote_base = settings.remote_workspace_base.rstrip("/")
+        workdir = f"{remote_base}/{effective_job_folder}"
+    logdir = f"{remote_log_base}/{effective_job_folder}"
     return RemotePaths(
-        job_folder=job_folder,
+        job_folder=effective_job_folder,
         workdir=workdir,
         logdir=logdir,
         slurm_output_dir=f"{logdir}/slurm_output",
