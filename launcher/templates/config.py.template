@@ -15,6 +15,11 @@ LOCAL_ROOT = (
 )  # Folder synced to cluster
 
 CLUSTER_LOGIN = "your_user@mn5.bsc.es"
+# Optional SSH overrides for machine-specific issues.
+# SSH_CONFIG_FILE maps to: ssh -F <path>
+# SSH_OPTIONS are appended to every launcher-managed ssh invocation.
+SSH_CONFIG_FILE: str | None = None
+SSH_OPTIONS: list[str] = []
 WORKSPACE_MODE = "per-run"  # per-run | fixed
 REMOTE_WORKSPACE_BASE = "/absolute/path/on/cluster/my_project/work"
 REMOTE_WORKSPACE_DIR: str | None = None
@@ -32,6 +37,7 @@ REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR: str | None = None
 REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 
 PROJECT_NAME = LOCAL_ROOT.name.replace(" ", "_")
+ARTIFACT_PATHS: list[str] = ["outputs"]
 
 # ---------------------------------------------------------------------------
 # Runtime mode
@@ -69,6 +75,26 @@ def mn5_accel_sbatch(
         "ntasks": 1,
         "cpus-per-task": cpus_per_task,
         "gres": f"gpu:{max(1, gpus)}",
+    }
+
+
+def mn5_multinode_accel_sbatch(
+    *,
+    nodes: int,
+    gpus_per_node: int = 4,
+    cpus_per_task: int = 80,
+    qos: str = "acc_debug",
+    job_time: str = "02:00:00",
+) -> dict[str, Any]:
+    return {
+        "account": MN5_ACCOUNT,
+        "partition": "acc",
+        "qos": qos,
+        "time": job_time,
+        "nodes": max(1, nodes),
+        "ntasks-per-node": 1,
+        "cpus-per-task": max(1, cpus_per_task),
+        "gres": f"gpu:{max(1, gpus_per_node)}",
     }
 
 
@@ -132,4 +158,33 @@ JOBS = [
         "command": "srun python scripts/eval.py --config-name=eval",
         "sbatch": mn5_cpu_sbatch(job_time="00-00:15:00"),
     },
+    # Minimal multi-node torchrun example.
+    # Keep RUNTIME_MODE="native" for this pattern.
+    {
+        "name": "multinode_torchrun",
+        "command": (
+            "srun torchrun "
+            "--nnodes=$SLURM_NNODES "
+            "--nproc-per-node=$GPUS_PER_NODE "
+            "--node-rank=$SLURM_NODEID "
+            "--rdzv-backend=c10d "
+            "--rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT "
+            "scripts/train_distributed.py --config configs/train.yaml"
+        ),
+        "setup": [
+            "export GPUS_PER_NODE=4",
+            "export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
+            "export MASTER_PORT=6000",
+        ],
+        "sbatch": {
+            **mn5_multinode_accel_sbatch(nodes=4, gpus_per_node=4, cpus_per_task=80),
+        },
+    },
+    # Submit an existing/shared sbatch file from the staged workdir:
+    # {
+    #     "name": "shared_sbatch",
+    #     "sbatch_file": "slurm/shared_train.sbatch",
+    #     # Optional extra args forwarded to sbatch.
+    #     # "sbatch_args": ["--export=ALL,SEED=1"],
+    # },
 ]

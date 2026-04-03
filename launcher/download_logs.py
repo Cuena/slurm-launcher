@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .core import build_rsync_ssh_command
 from .tracking import resolve_tracking_file
 
 
@@ -87,13 +88,20 @@ def _run_downloads(
     output_dir: Path,
     *,
     dry_run: bool,
+    ssh_config_file: str | None = None,
+    ssh_options: list[str] | None = None,
 ) -> int:
     failures = 0
     for job_name, stream, remote_path in downloads:
         destination_dir = output_dir / job_name
         destination_file = destination_dir / Path(remote_path).name
         source = f"{cluster_login}:{remote_path}"
-        cmd = ["rsync", "-az"]
+        cmd = [
+            "rsync",
+            "-az",
+            "-e",
+            build_rsync_ssh_command(ssh_config_file, ssh_options),
+        ]
         if dry_run:
             cmd.append("--dry-run")
         cmd.extend([source, str(destination_file)])
@@ -131,6 +139,13 @@ def run_download_logs(args: argparse.Namespace) -> int:
     if not cluster_login:
         print(f"ERROR: Missing cluster_login in {tracking_file}", file=sys.stderr)
         return 1
+    ssh_config_file = str(payload.get("ssh_config_file", "") or "").strip() or None
+    ssh_options_value = payload.get("ssh_options", [])
+    ssh_options = (
+        [str(item) for item in ssh_options_value if str(item).strip()]
+        if isinstance(ssh_options_value, list)
+        else []
+    )
 
     records = payload.get("jobs", [])
     if not isinstance(records, list):
@@ -169,7 +184,12 @@ def run_download_logs(args: argparse.Namespace) -> int:
         print("Dry-run mode: commands will not be executed.")
 
     failures = _run_downloads(
-        cluster_login, downloads, output_dir, dry_run=args.dry_run
+        cluster_login,
+        downloads,
+        output_dir,
+        dry_run=args.dry_run,
+        ssh_config_file=ssh_config_file,
+        ssh_options=ssh_options,
     )
     if failures:
         print(f"Completed with {failures} failed download(s).", file=sys.stderr)

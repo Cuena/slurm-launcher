@@ -87,6 +87,57 @@ What the init script creates in the project repo:
   - `.slurm/*.py`
   - `!.slurm/*.example.py`
 
+## Command groups
+
+Use these command groups consistently:
+
+- Global cluster inspection:
+  - `slurm-launcher doctor`
+  - `slurm-launcher jobs`
+  - `slurm-launcher job-show <job_id>`
+  - `slurm-launcher job-log <job_id>`
+- Project execution:
+  - `slurm-launcher init`
+  - `slurm-launcher validate`
+  - `slurm-launcher render`
+  - `slurm-launcher stage`
+  - `slurm-launcher submit`
+  - `slurm-launcher sbatch`
+  - `slurm-launcher run`
+- Project tracking and retrieval:
+  - `slurm-launcher logs`
+  - `slurm-launcher monitor`
+  - `slurm-launcher download-logs`
+  - `slurm-launcher download-artifacts`
+
+Only `doctor`, `jobs`, `job-show`, and `job-log` are intended to work as generic cluster tools from any directory.
+The execution commands above assume you are in the target project repo or passed the intended repo config.
+
+## Recommended workflow
+
+Recommended execution loop for humans and coding agents:
+
+1. Validate:
+   - `slurm-launcher validate`
+   - optional machine-readable contract: `slurm-launcher validate --json`
+2. Preview:
+   - `slurm-launcher render`
+   - `slurm-launcher render --json`
+   - `slurm-launcher stage --dry-run`
+   - `slurm-launcher stage --dry-run --json`
+   - `slurm-launcher submit --dry-run --job-folder <existing_folder> --json`
+   - `slurm-launcher run --dry-run --json`
+3. Execute:
+   - `slurm-launcher run`
+   - or split flow: `slurm-launcher stage`, then `slurm-launcher submit ...`
+4. Inspect and retrieve:
+   - `slurm-launcher logs`
+   - `slurm-launcher monitor`
+   - `slurm-launcher job-show <job_id>`
+   - `slurm-launcher job-log <job_id>`
+   - `slurm-launcher download-logs`
+   - `slurm-launcher download-artifacts`
+
 ## Common commands
 
 - `slurm-launcher init --force`: overwrite existing config
@@ -96,19 +147,36 @@ What the init script creates in the project repo:
 - `slurm-launcher --config path/to/config.py`: custom config path
 - default config lookup for commands using config: `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py`
 - `slurm-launcher validate`: validate config without submission
+- `slurm-launcher validate --json`: print validation results as one JSON object
 - `slurm-launcher validate --ssh`: validate config and test SSH connectivity
 - `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
 - `slurm-launcher render`: print generated sbatch scripts without submission
+- `slurm-launcher render --json`: print rendered job metadata and scripts as JSON
 - `slurm-launcher render --only train`: render only a subset of jobs
 - `slurm-launcher stage`: run only the SSH + rsync stage phase (no job submission)
+- `slurm-launcher stage --json`: print the stage result payload as JSON
 - `slurm-launcher stage --workspace fixed --dry-run`: print stage commands only
 - `slurm-launcher submit --workspace per-run --job-folder <folder>`: submit only (no rsync)
+- `slurm-launcher submit --json --workspace per-run --job-folder <folder>`: print submission result payload as JSON
 - `slurm-launcher submit --workspace fixed`: submit only against fixed workspace
+- `slurm-launcher sbatch slurm/train.sbatch`: stage + submit one existing sbatch file
+- `slurm-launcher sbatch slurm/train.sbatch --sbatch-arg --export=ALL,SEED=1`: pass extra sbatch args
+- `slurm-launcher run --json`: print run result payload as JSON
 - `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
 - `slurm-launcher logs --json`: print full tracking payload
 - `slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
+- `slurm-launcher download-artifacts`: download configured artifact paths from latest run
+- `slurm-launcher download-artifacts --path outputs --path checkpoints/best.pt`: override configured artifact paths
 - `slurm-launcher monitor`: run `squeue` for tracked job IDs from the latest run
 - `slurm-launcher monitor --dry-run`: print the monitoring command only
+- `slurm-launcher monitor --json`: print the monitor command contract as JSON
+- `slurm-launcher jobs`: show recent SLURM jobs directly from the cluster
+- `slurm-launcher job-show 12345678`: show generic SLURM details for one job id
+- `slurm-launcher job-show 12345678 --json`: print generic job details as JSON
+- `slurm-launcher job-log 12345678`: tail stdout for a SLURM job id directly from the cluster
+- `slurm-launcher job-log 12345678 --json`: print structured log resolution as JSON
+- `slurm-launcher job-log 12345678 --stream stderr --follow`: follow stderr for a job id
+- `slurm-launcher doctor`: show effective generic config and optional SSH checks
 
 ## Download logs locally
 
@@ -128,6 +196,92 @@ Use `download-logs` to fetch remote `.out/.err` files recorded in a tracking fil
 Script compatibility:
 
 - `uv run python scripts/download_logs.py ...` still works from the launcher repository root.
+
+## Download artifacts locally
+
+Use `download-artifacts` to fetch outputs or checkpoints from the tracked remote workdir.
+
+- Set `ARTIFACT_PATHS` in your config to make common downloads one-command:
+  - `ARTIFACT_PATHS = ["outputs", "checkpoints/best.ckpt"]`
+- Download configured artifact paths for the latest project run:
+  - `slurm-launcher download-artifacts`
+- Override configured paths for one download:
+  - `slurm-launcher download-artifacts --path outputs --path reports/metrics.json`
+- Use a specific tracking file:
+  - `slurm-launcher download-artifacts --tracking-file slurm_output/<job_folder>/jobs.json`
+- Preview rsync commands without downloading:
+  - `slurm-launcher download-artifacts --dry-run`
+
+Path rules:
+
+- Relative paths are resolved from the tracked `remote_workdir`.
+- Absolute paths are allowed, but relative paths are the intended default.
+
+Script compatibility:
+
+- `uv run python scripts/download_artifacts.py ...` still works from the launcher repository root.
+
+## General SLURM utilities
+
+These commands do not use `slurm_output/.../jobs.json`. They query the cluster
+directly over SSH, which makes them useful even for jobs not launched by this repo.
+
+- List recent jobs on the cluster:
+  - `slurm-launcher jobs`
+- Use a specific config or SSH target:
+  - `slurm-launcher jobs --config .slurm/remote_launcher_config.mn5.py`
+  - `slurm-launcher jobs --cluster-login user@cluster`
+- Change query window or output shape:
+  - `slurm-launcher jobs --hours 72 --limit 50`
+  - `slurm-launcher jobs --json`
+- Show generic details for one job id:
+  - `slurm-launcher job-show 36114735`
+  - `slurm-launcher job-show 36114735 --json`
+- Read stdout for a job id:
+  - `slurm-launcher job-log 36114735`
+- Print structured log resolution without reading the file:
+  - `slurm-launcher job-log 36114735 --json`
+- Read stderr instead:
+  - `slurm-launcher job-log 36114735 --stream stderr`
+- Print the resolved remote log path only:
+  - `slurm-launcher job-log 36114735 --path-only`
+- Follow the live log:
+  - `slurm-launcher job-log 36114735 --follow`
+- Check the effective generic config:
+  - `slurm-launcher doctor`
+- Also test SSH plus remote tool availability:
+  - `slurm-launcher doctor --ssh`
+
+Resolution rules:
+
+- `jobs`, `job-show`, `job-log`, and `doctor` use `--cluster-login` when provided.
+- Otherwise they try `--config`, then `.slurm/remote_launcher_config.mn5.py`, then
+  `remote_launcher_config.py`, then `~/.config/slurm-launcher/config.py`.
+- `job-log` first asks SLURM for `StdOut`/`StdErr` paths and falls back to an
+  archive convention.
+- If `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR` is configured, that directory is used.
+- Otherwise the default fallback is `~/.slurm-dashboard/logs/<job-id>.out|err`.
+
+Recommended user-level default config for generic commands:
+
+```python
+CLUSTER_LOGIN = "your_user@cluster"
+SSH_CONFIG_FILE = "/dev/null"  # optional
+SSH_OPTIONS = ["-o", "BatchMode=yes"]  # optional
+REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR = "/home/your_user/.slurm-dashboard/logs"  # optional
+```
+
+This file is only used by `jobs`, `job-show`, `job-log`, and `doctor`. Project execution commands still
+use the repo-local config lookup.
+
+SSH notes:
+
+- `CLUSTER_LOGIN` is required.
+- `SSH_CONFIG_FILE` is optional and maps to `ssh -F <path>`.
+- `SSH_OPTIONS` is optional and is appended to every launcher-managed `ssh`
+  invocation. Example: `["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]`
+- Use these only when you need to override machine-specific SSH behavior; most
+  users should rely on their normal `ssh` setup.
 
 ## Runtime modes
 
@@ -165,8 +319,10 @@ Optional top-level settings:
 
 - `LOCAL_ROOT`, `PROJECT_NAME`, `WORKSPACE_MODE`, `REMOTE_WORKSPACE_DIR`
 - `REMOTE_LOG_BASE_PATH`
+- `SSH_CONFIG_FILE`, `SSH_OPTIONS`
 - `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
 - `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
+- `ARTIFACT_PATHS`
 - `RUNTIME_MODE`, `VENV_PYTHON_EXECUTABLE`, `SINGULARITY_IMAGE_PATH`, `SINGULARITY_EXEC_FLAGS`
 - `DEFAULT_ENV`, `DEFAULT_SBATCH`, `RUN_JOBS`
 - `EXTRA_RSYNC_EXCLUDES`, `EXTRA_RSYNC_ARGS`, `VERBOSE`
@@ -175,14 +331,56 @@ Optional top-level settings:
 
 Each job in `JOBS` is a dictionary with:
 
-- required: `name`, `command`
-- optional: `setup`, `env`, `sbatch`
+- required: `name` and exactly one of:
+  - `command` (launcher-managed sbatch generation)
+  - `sbatch_file` (submit an existing/shared sbatch file)
+- optional for `command` jobs: `setup`, `env`, `sbatch`
+- optional for `sbatch_file` jobs: `sbatch_args` (extra args forwarded to `sbatch`)
 
 Examples:
 
 - `{"name": "train", "command": "python3 scripts/train.py --config-name=train"}`
 - `{"name": "prep", "command": "bash scripts/prep.sh"}`
 - `{"name": "eval", "command": "srun python3 scripts/eval.py"}`
+- `{"name": "shared_train", "sbatch_file": "slurm/train_shared.sbatch"}`
+- `{"name": "shared_train_seed1", "sbatch_file": "slurm/train_shared.sbatch", "sbatch_args": ["--export=ALL,SEED=1"]}`
+
+Minimal multi-node pattern (maps to `#SBATCH --nodes=...` + `srun torchrun`):
+
+```python
+{
+    "name": "multinode_torchrun",
+    "command": (
+        "srun torchrun "
+        "--nnodes=$SLURM_NNODES "
+        "--nproc-per-node=$GPUS_PER_NODE "
+        "--node-rank=$SLURM_NODEID "
+        "--rdzv-backend=c10d "
+        "--rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT "
+        "scripts/train_distributed.py --config configs/train.yaml"
+    ),
+    "setup": [
+        "export GPUS_PER_NODE=4",
+        "export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
+        "export MASTER_PORT=6000",
+    ],
+    "sbatch": {
+        "account": "bsc70",
+        "partition": "acc",
+        "qos": "acc_debug",
+        "time": "2:00:00",
+        "nodes": 4,
+        "ntasks-per-node": 1,
+        "cpus-per-task": 80,
+        "gres": "gpu:4",
+    },
+}
+```
+
+Notes:
+
+- For shell-variable expansion in exports (for example `${SLURM_NNODES}`), use `setup` lines instead of `env`.
+- Keep `RUNTIME_MODE="native"` when your `command` already includes `srun torchrun ...`.
 
 Global defaults:
 
@@ -211,6 +409,7 @@ Each run creates a unique job folder (timestamp + git hash when available).
 - local artifacts: `slurm_output/<job_folder>/`
 - tracking file: `slurm_output/<job_folder>/jobs.json`
 - latest run index: `slurm_output/latest_jobs.json`
+- downloaded artifact destination: `slurm_output/downloaded_artifacts/<job_folder>/`
 - default remote logs (no archive dir configured): `REMOTE_LOG_BASE_PATH/<job_folder>/slurm_output/<job-name>-<job-id>.out|err`
 
 ## slurm-dashboard compatibility

@@ -12,6 +12,8 @@ CONFIG_DIR = Path(__file__).resolve().parent
 LOCAL_ROOT = CONFIG_DIR.parent
 
 CLUSTER_LOGIN = "your_user@transfer1.bsc.es"
+SSH_CONFIG_FILE: str | None = None
+SSH_OPTIONS: list[str] = []
 WORKSPACE_MODE = "per-run"  # per-run | fixed
 REMOTE_WORKSPACE_BASE = "/absolute/path/on/cluster/slurm-launcher/work"
 REMOTE_WORKSPACE_DIR: str | None = None
@@ -24,9 +26,10 @@ REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR = (
 )
 
 PROJECT_NAME = "slurm-launcher"
+ARTIFACT_PATHS = ["outputs"]
 
-RUNTIME_MODE = "venv"  # native | venv | singularity
-VENV_PYTHON_EXECUTABLE: str | None = "/absolute/path/to/venv/bin/python"
+RUNTIME_MODE = "native"  # native | venv | singularity
+VENV_PYTHON_EXECUTABLE: str | None = None
 SINGULARITY_IMAGE_PATH: str | None = None
 SINGULARITY_EXEC_FLAGS: list[str] = []
 
@@ -47,6 +50,26 @@ def mn5_accel_sbatch(
         "ntasks": 1,
         "cpus-per-task": cpus_per_task,
         "gres": f"gpu:{max(1, gpus)}",
+    }
+
+
+def mn5_multinode_accel_sbatch(
+    *,
+    nodes: int,
+    gpus_per_node: int = 4,
+    cpus_per_task: int = 80,
+    qos: str = "acc_debug",
+    job_time: str = "02:00:00",
+) -> dict[str, Any]:
+    return {
+        "account": MN5_ACCOUNT,
+        "partition": "acc",
+        "qos": qos,
+        "time": job_time,
+        "nodes": max(1, nodes),
+        "ntasks-per-node": 1,
+        "cpus-per-task": max(1, cpus_per_task),
+        "gres": f"gpu:{max(1, gpus_per_node)}",
     }
 
 
@@ -110,6 +133,33 @@ JOBS = [
         "sbatch": {
             **mn5_cpu_sbatch(qos="gp_debug", job_time="00-00:15:00"),
             "job-name": "mn5_shell_command",
+        },
+    },
+    {
+        "name": "multinode_torchrun",
+        "command": (
+            "srun torchrun "
+            "--nnodes=$SLURM_NNODES "
+            "--nproc-per-node=$GPUS_PER_NODE "
+            "--node-rank=$SLURM_NODEID "
+            "--rdzv-backend=c10d "
+            "--rdzv-endpoint=$MASTER_ADDR:$MASTER_PORT "
+            "scripts/train_distributed.py --config configs/train.yaml"
+        ),
+        "setup": [
+            "export GPUS_PER_NODE=4",
+            "export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
+            "export MASTER_PORT=6000",
+        ],
+        "sbatch": {
+            **mn5_multinode_accel_sbatch(
+                nodes=4,
+                gpus_per_node=4,
+                cpus_per_task=80,
+                qos="acc_debug",
+                job_time="2:00:00",
+            ),
+            "job-name": "mn5_multinode_torchrun",
         },
     },
 ]
