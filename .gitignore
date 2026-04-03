@@ -12,3 +12,9 @@ remote_launcher_config.py
 examples/remote_launcher_config.mn5.py
 
 AGENTS.md
+
+.desloppify/
+.codex
+CODEX_IMPLEMENTATION_PLAN.md
+SKILL_backup.md
+scorecard.png
