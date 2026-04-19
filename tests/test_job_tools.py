@@ -1,8 +1,3 @@
-# tests/test_job_tools.py
-# What: Covers generic job inspection helpers for SSH propagation, per-job details, and log path resolution.
-# Why: Protects the global jobs/job-log workflows that agents should run from any directory.
-# RELEVANT FILES: launcher/job_tools.py, launcher/cli.py, launcher/core.py, README.md
-
 from __future__ import annotations
 
 import os

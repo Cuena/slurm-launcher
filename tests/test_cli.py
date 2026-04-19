@@ -1,8 +1,3 @@
-# tests/test_cli.py
-# What: Covers CLI-level generic doctor behavior and config handling.
-# Why: Keeps the global slurm-launcher workflows stable for agent use outside project repos.
-# RELEVANT FILES: launcher/cli.py, launcher/job_tools.py, launcher/core.py, SKILL.md
-
 from __future__ import annotations
 
 import argparse
@@ -13,37 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from launcher import cli
-from launcher.core import JobSpec, LauncherSettings, RemotePaths
+from launcher.core import JobSpec, RemotePaths
+from tests.helpers import make_settings
 
 
 class CliTests(unittest.TestCase):
-    def _settings(self, **overrides: object) -> LauncherSettings:
-        defaults: dict[str, object] = {
-            "cluster_login": "user@cluster",
-            "ssh_config_file": None,
-            "ssh_options": [],
-            "remote_workspace_base": "/remote/workspaces",
-            "remote_log_base_path": "/remote/logs",
-            "workspace_mode": "per-run",
-            "remote_workspace_dir": None,
-            "project_root": Path("/tmp/project"),
-            "project_prefix": "project",
-            "venv_python_executable": None,
-            "default_env": {},
-            "default_sbatch": {},
-            "extra_rsync_excludes": [],
-            "extra_rsync_args": [],
-            "remote_slurm_dashboard_log_archive_dir": None,
-            "remote_slurm_dashboard_log_view_dir": None,
-            "runtime_mode": "native",
-            "singularity_image_path": None,
-            "singularity_exec_flags": [],
-            "artifact_paths": [],
-            "verbose": False,
-        }
-        defaults.update(overrides)
-        return LauncherSettings(**defaults)
-
     def test_parse_args_supports_json_for_agent_facing_commands(self) -> None:
         commands = [
             "validate",
@@ -73,7 +42,7 @@ class CliTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            settings = self._settings(project_root=Path(tmpdir))
+            settings = make_settings(project_root=Path(tmpdir))
             job = JobSpec(name="shared", sbatch_file="../shared/train.sbatch")
 
             with self.assertRaisesRegex(
@@ -116,7 +85,7 @@ class CliTests(unittest.TestCase):
     @patch("launcher.cli.prepare_jobs")
     @patch("launcher.cli.build_settings")
     @patch("launcher.cli.load_config")
-    @patch("launcher.cli._resolve_run_config_path")
+    @patch("launcher.cli._resolve_config_path")
     @patch("launcher.cli.console.print_json")
     def test_validate_json_success_payload(
         self,
@@ -130,7 +99,7 @@ class CliTests(unittest.TestCase):
         mock_ssh_script,
         mock_test_ssh_connection,
     ) -> None:
-        settings = self._settings(
+        settings = make_settings(
             ssh_config_file="/dev/null",
             ssh_options=["-o", "BatchMode=yes"],
         )
@@ -205,7 +174,7 @@ class CliTests(unittest.TestCase):
     @patch("launcher.cli.prepare_jobs")
     @patch("launcher.cli.build_settings")
     @patch("launcher.cli.load_config")
-    @patch("launcher.cli._resolve_run_config_path")
+    @patch("launcher.cli._resolve_config_path")
     @patch("launcher.cli.console.print_json")
     def test_render_json_payload(
         self,
@@ -221,7 +190,7 @@ class CliTests(unittest.TestCase):
         mock_build_job_script,
         mock_build_sbatch_script,
     ) -> None:
-        settings = self._settings()
+        settings = make_settings()
         config_path = Path("/tmp/config.py")
         jobs = [
             JobSpec(name="train", command="python train.py"),
@@ -281,7 +250,7 @@ class CliTests(unittest.TestCase):
         mock_test_ssh_connection,
         mock_sync_project,
     ) -> None:
-        settings = self._settings()
+        settings = make_settings()
         remote_paths = RemotePaths(
             job_folder="project_001",
             workdir="/remote/workspaces/project_001",
@@ -328,7 +297,7 @@ class CliTests(unittest.TestCase):
         mock_collect_submission_results,
         mock_write_job_tracking_file,
     ) -> None:
-        settings = self._settings(
+        settings = make_settings(
             ssh_config_file="/dev/null",
             ssh_options=["-o", "BatchMode=yes"],
         )
@@ -401,7 +370,7 @@ class CliTests(unittest.TestCase):
         mock_sync_project,
         mock_collect_submission_results,
     ) -> None:
-        settings = self._settings()
+        settings = make_settings()
         job = JobSpec(name="train", command="python train.py")
         remote_paths = RemotePaths(
             job_folder="project_001",

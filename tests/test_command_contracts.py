@@ -1,8 +1,3 @@
-# tests/test_command_contracts.py
-# What: Covers exact dry-run command rendering for staging, submission, and tracked downloads.
-# Why: Locks down the machine-readable command contract that agents rely on to preview or replay actions safely.
-# RELEVANT FILES: launcher/core.py, launcher/download_logs.py, launcher/download_artifacts.py, launcher/cli.py
-
 from __future__ import annotations
 
 import unittest
@@ -11,7 +6,6 @@ from unittest.mock import patch
 
 from launcher.core import (
     JobSpec,
-    LauncherSettings,
     RemotePaths,
     build_predefined_sbatch_command,
     submit_job,
@@ -19,36 +13,12 @@ from launcher.core import (
 )
 from launcher.download_artifacts import _run_downloads as run_artifact_downloads
 from launcher.download_logs import _run_downloads as run_log_downloads
+from tests.helpers import make_settings
+
+_SSH_DEFAULTS = {"ssh_config_file": "/dev/null", "ssh_options": ["-o", "BatchMode=yes"]}
 
 
 class CommandContractTests(unittest.TestCase):
-    def _settings(self, **overrides: object) -> LauncherSettings:
-        defaults: dict[str, object] = {
-            "cluster_login": "user@cluster",
-            "ssh_config_file": "/dev/null",
-            "ssh_options": ["-o", "BatchMode=yes"],
-            "remote_workspace_base": "/remote/workspaces",
-            "remote_log_base_path": "/remote/logs",
-            "workspace_mode": "per-run",
-            "remote_workspace_dir": None,
-            "project_root": Path("/tmp/project"),
-            "project_prefix": "project",
-            "venv_python_executable": None,
-            "default_env": {},
-            "default_sbatch": {},
-            "extra_rsync_excludes": [],
-            "extra_rsync_args": [],
-            "remote_slurm_dashboard_log_archive_dir": None,
-            "remote_slurm_dashboard_log_view_dir": None,
-            "runtime_mode": "native",
-            "singularity_image_path": None,
-            "singularity_exec_flags": [],
-            "artifact_paths": [],
-            "verbose": False,
-        }
-        defaults.update(overrides)
-        return LauncherSettings(**defaults)
-
     def _remote_paths(self) -> RemotePaths:
         return RemotePaths(
             job_folder="project_001",
@@ -58,7 +28,7 @@ class CommandContractTests(unittest.TestCase):
         )
 
     def test_sync_project_dry_run_returns_exact_commands(self) -> None:
-        settings = self._settings()
+        settings = make_settings(**_SSH_DEFAULTS)
         commands = sync_project(
             settings,
             self._remote_paths(),
@@ -79,7 +49,7 @@ class CommandContractTests(unittest.TestCase):
     def test_submit_job_dry_run_returns_exact_generated_submission_command(
         self,
     ) -> None:
-        settings = self._settings(default_sbatch={"time": "00:10:00"})
+        settings = make_settings(**_SSH_DEFAULTS, default_sbatch={"time": "00:10:00"})
         job = JobSpec(name="train", command="python train.py")
 
         submission = submit_job(
@@ -99,7 +69,7 @@ class CommandContractTests(unittest.TestCase):
         )
 
     def test_submit_job_dry_run_returns_exact_predefined_sbatch_command(self) -> None:
-        settings = self._settings()
+        settings = make_settings(**_SSH_DEFAULTS)
         job = JobSpec(
             name="shared",
             sbatch_file="slurm/train.sbatch",
@@ -124,7 +94,7 @@ class CommandContractTests(unittest.TestCase):
     def test_build_predefined_sbatch_command_rejects_path_outside_local_root(
         self,
     ) -> None:
-        settings = self._settings(project_root=Path("/tmp/project"))
+        settings = make_settings(**_SSH_DEFAULTS, project_root=Path("/tmp/project"))
         job = JobSpec(name="shared", sbatch_file="../shared/train.sbatch")
 
         with self.assertRaisesRegex(
@@ -140,7 +110,8 @@ class CommandContractTests(unittest.TestCase):
         mock_ssh_script,
         mock_create_log_view_symlinks,
     ) -> None:
-        settings = self._settings(
+        settings = make_settings(
+            **_SSH_DEFAULTS,
             remote_slurm_dashboard_log_archive_dir="/archive/logs",
             remote_slurm_dashboard_log_view_dir="/archive/view",
         )

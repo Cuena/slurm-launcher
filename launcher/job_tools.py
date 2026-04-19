@@ -1,12 +1,6 @@
-# launcher/job_tools.py
-# What: Generic remote SLURM inspection helpers for recent jobs, per-job inspection, and log access.
-# Why: Adds cluster-wide utilities that work without launcher tracking files while allowing additive launcher enrichment.
-# RELEVANT FILES: launcher/cli.py, launcher/core.py, launcher/tracking.py, README.md
-
 from __future__ import annotations
 
 import json
-import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -17,7 +11,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .core import build_ssh_command
+from .core import build_ssh_command, resolve_log_path
+from .tracking import all_tracking_files, load_tracking_payload
 
 console = Console()
 err_console = Console(stderr=True)
@@ -76,12 +71,6 @@ class JobDetails:
     launcher: LauncherInfo | None = None
 
 
-def _expand_job_id_placeholders(path: str | None, job_id: str) -> str | None:
-    if not path:
-        return None
-    return path.replace("%j", job_id).replace("%J", job_id)
-
-
 def _normalized_text(value: Any) -> str | None:
     if value is None:
         return None
@@ -120,11 +109,11 @@ def _job_details_from_scontrol(output: str, job_id: str) -> JobDetails | None:
         partition=_normalized_text(fields.get("Partition")),
         command=_normalized_text(fields.get("Command")),
         work_dir=_normalized_text(fields.get("WorkDir")),
-        stdout=_expand_job_id_placeholders(
+        stdout=resolve_log_path(
             _normalized_text(fields.get("StdOut")),
             job_id,
         ),
-        stderr=_expand_job_id_placeholders(
+        stderr=resolve_log_path(
             _normalized_text(fields.get("StdErr")),
             job_id,
         ),
@@ -155,8 +144,8 @@ def _job_details_from_sacct(output: str, job_id: str) -> JobDetails | None:
             partition=_normalized_text(parts[3]),
             command=_normalized_text(parts[13]),
             work_dir=_normalized_text(parts[10]),
-            stdout=_expand_job_id_placeholders(_normalized_text(parts[11]), job_id),
-            stderr=_expand_job_id_placeholders(_normalized_text(parts[12]), job_id),
+            stdout=resolve_log_path(_normalized_text(parts[11]), job_id),
+            stderr=resolve_log_path(_normalized_text(parts[12]), job_id),
             node_list=_normalized_text(parts[7]),
             num_nodes=_normalized_text(parts[8]),
             gres=_normalized_text(parts[9]),
@@ -207,49 +196,25 @@ def _launcher_info_from_payload(payload: dict[str, Any]) -> LauncherInfo | None:
     )
 
 
-def _tracking_files() -> list[Path]:
-    tracking_root = Path("slurm_output")
-    files: list[Path] = []
-    latest = tracking_root / "latest_jobs.json"
-    if latest.exists():
-        files.append(latest)
-    if tracking_root.exists():
-        candidates = sorted(
-            tracking_root.glob("*/jobs.json"),
-            key=lambda path: path.stat().st_mtime,
-            reverse=True,
-        )
-        for candidate in candidates:
-            if candidate not in files:
-                files.append(candidate)
-    return files
-
-
 def _launcher_info_from_tracking(job_id: str) -> LauncherInfo | None:
-    for tracking_file in _tracking_files():
+    for tracking_file in all_tracking_files():
         try:
-            payload = json.loads(tracking_file.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = load_tracking_payload(tracking_file)
+        except Exception:
             continue
-        records = payload.get("jobs")
-        if not isinstance(records, list):
-            continue
-        for record in records:
-            if str(record.get("job_id", "")).strip() != job_id:
+        for job in payload.jobs:
+            if job.job_id.strip() != job_id:
                 continue
-            launcher = record.get("launcher")
-            if isinstance(launcher, dict):
-                parsed = _launcher_info_from_payload(launcher)
+            if job.launcher:
+                parsed = _launcher_info_from_payload(job.launcher)
                 if parsed is not None:
                     return parsed
-            runtime_artifact = _normalized_text(payload.get("singularity_image_path"))
-            if runtime_artifact is None:
-                runtime_artifact = _normalized_text(
-                    payload.get("venv_python_executable")
-                )
+            runtime_artifact = _normalized_text(
+                payload.singularity_image_path
+            ) or _normalized_text(payload.venv_python_executable)
             return LauncherInfo(
                 managed=True,
-                runtime_kind=_normalized_text(payload.get("runtime_mode")),
+                runtime_kind=_normalized_text(payload.runtime_mode),
                 runtime_artifact=runtime_artifact,
                 entry_command=None,
             )
@@ -643,20 +608,15 @@ def show_job_details(
 
 
 def _job_log_info_from_scontrol(output: str, job_id: str) -> JobLogInfo | None:
-    text = output.strip()
-    if not text:
+    fields = _parse_one_line_fields(output)
+    if not fields:
         return None
-
-    def read_field(name: str) -> str:
-        match = re.search(rf"(?:^|\\s){name}=([^\\s]+)", text)
-        return match.group(1) if match else ""
-
     return JobLogInfo(
         job_id=job_id,
-        job_name=read_field("JobName"),
-        state=read_field("JobState"),
-        stdout=_expand_job_id_placeholders(read_field("StdOut") or None, job_id),
-        stderr=_expand_job_id_placeholders(read_field("StdErr") or None, job_id),
+        job_name=_normalized_text(fields.get("JobName")) or "",
+        state=_normalized_text(fields.get("JobState")) or "",
+        stdout=resolve_log_path(_normalized_text(fields.get("StdOut")), job_id),
+        stderr=resolve_log_path(_normalized_text(fields.get("StdErr")), job_id),
         source="scontrol",
     )
 
@@ -676,8 +636,8 @@ def _job_log_info_from_sacct(output: str, job_id: str) -> JobLogInfo | None:
             job_id=record_job_id,
             job_name=parts[1],
             state=parts[2],
-            stdout=_expand_job_id_placeholders(parts[3] or None, job_id),
-            stderr=_expand_job_id_placeholders(parts[4] or None, job_id),
+            stdout=resolve_log_path(parts[3] or None, job_id),
+            stderr=resolve_log_path(parts[4] or None, job_id),
             source="sacct",
         )
     return None
@@ -691,6 +651,8 @@ def resolve_job_log_info(
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
 ) -> JobLogInfo | None:
+    probe_errors: list[str] = []
+
     scontrol_result = _run_ssh_capture(
         cluster_login,
         f"scontrol show job -o {shlex.quote(job_id)}",
@@ -701,6 +663,9 @@ def resolve_job_log_info(
         info = _job_log_info_from_scontrol(scontrol_result.stdout, job_id)
         if info and (info.stdout or info.stderr):
             return info
+        probe_errors.append("scontrol returned no log paths")
+    else:
+        probe_errors.append(f"scontrol failed (rc={scontrol_result.returncode})")
 
     sacct_result = _run_ssh_capture(
         cluster_login,
@@ -716,16 +681,20 @@ def resolve_job_log_info(
         info = _job_log_info_from_sacct(sacct_result.stdout, job_id)
         if info and (info.stdout or info.stderr):
             return info
+        probe_errors.append("sacct returned no log paths")
+    else:
+        probe_errors.append(f"sacct failed (rc={sacct_result.returncode})")
 
     archive_root, archive_source = effective_archive_dir(archive_dir)
     archive_root = archive_root.rstrip("/")
+    fallback_detail = "; ".join(probe_errors)
     return JobLogInfo(
         job_id=job_id,
         job_name="",
         state="",
         stdout=f"{archive_root}/{job_id}.out",
         stderr=f"{archive_root}/{job_id}.err",
-        source=f"archive:{archive_source}",
+        source=f"archive:{archive_source} (fallback: {fallback_detail})",
     )
 
 
@@ -785,6 +754,7 @@ def show_job_log(
         console.print(target_path)
         return 0
 
+    is_fallback = info.source.startswith("archive:")
     console.print(
         Panel.fit(
             "\n".join(
@@ -802,6 +772,12 @@ def show_job_log(
             border_style="cyan",
         )
     )
+    if is_fallback:
+        err_console.print(
+            f"WARNING: Log path for job {job_id} is a best-guess archive fallback. "
+            "scontrol/sacct could not resolve the actual path.",
+            style="yellow",
+        )
 
     if full:
         remote_command = f"cat {shlex.quote(target_path)}"

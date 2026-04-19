@@ -1,20 +1,18 @@
-# launcher/download_logs.py
-# What: Provides download-logs CLI helpers to fetch tracked remote SLURM stdout/stderr files.
-# Why: Enables a first-class launcher subcommand without requiring script-path execution.
-# RELEVANT FILES: launcher/cli.py, scripts/download_logs.py, launcher/tracking.py, README.md
-
 from __future__ import annotations
 
 import argparse
-import json
 import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 from .core import build_rsync_ssh_command
-from .tracking import resolve_tracking_file
+from .tracking import (
+    JobRecord,
+    TrackingError,
+    load_tracking_payload,
+    resolve_tracking_file,
+)
 
 
 def add_download_logs_args(parser: argparse.ArgumentParser) -> None:
@@ -51,34 +49,14 @@ def add_download_logs_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _select_records(
-    records: list[dict[str, Any]], job_names: set[str], job_ids: set[str]
-) -> list[dict[str, Any]]:
-    if not job_names and not job_ids:
-        return records
-
-    selected: list[dict[str, Any]] = []
-    for record in records:
-        record_name = str(record.get("job_name", ""))
-        record_id = str(record.get("job_id", ""))
-        if job_names and record_name in job_names:
-            selected.append(record)
-            continue
-        if job_ids and record_id in job_ids:
-            selected.append(record)
-    return selected
-
-
-def _collect_downloads(records: list[dict[str, Any]]) -> list[tuple[str, str, str]]:
+def _collect_downloads(jobs: list[JobRecord]) -> list[tuple[str, str, str]]:
     downloads: list[tuple[str, str, str]] = []
-    for record in records:
-        job_name = str(record.get("job_name", "") or "unknown_job")
-        stdout_path = str(record.get("stdout", "") or "")
-        stderr_path = str(record.get("stderr", "") or "")
-        if stdout_path:
-            downloads.append((job_name, "stdout", stdout_path))
-        if stderr_path and stderr_path != stdout_path:
-            downloads.append((job_name, "stderr", stderr_path))
+    for job in jobs:
+        name = job.job_name or "unknown_job"
+        if job.stdout:
+            downloads.append((name, "stdout", job.stdout))
+        if job.stderr and job.stderr != job.stdout:
+            downloads.append((name, "stderr", job.stderr))
     return downloads
 
 
@@ -125,8 +103,8 @@ def _run_downloads(
 
 
 def run_download_logs(args: argparse.Namespace) -> int:
-    tracking_file = resolve_tracking_file(args.tracking_file)
-    if tracking_file is None:
+    tracking_path = resolve_tracking_file(args.tracking_file)
+    if tracking_path is None:
         print(
             "ERROR: No tracking file found. "
             "Run a non-dry submission first or pass --tracking-file.",
@@ -134,62 +112,50 @@ def run_download_logs(args: argparse.Namespace) -> int:
         )
         return 1
 
-    payload = json.loads(tracking_file.read_text(encoding="utf-8"))
-    cluster_login = str(payload.get("cluster_login", "") or "")
-    if not cluster_login:
-        print(f"ERROR: Missing cluster_login in {tracking_file}", file=sys.stderr)
-        return 1
-    ssh_config_file = str(payload.get("ssh_config_file", "") or "").strip() or None
-    ssh_options_value = payload.get("ssh_options", [])
-    ssh_options = (
-        [str(item) for item in ssh_options_value if str(item).strip()]
-        if isinstance(ssh_options_value, list)
-        else []
-    )
-
-    records = payload.get("jobs", [])
-    if not isinstance(records, list):
-        print(f"ERROR: Invalid tracking file format: {tracking_file}", file=sys.stderr)
+    try:
+        payload = load_tracking_payload(tracking_path)
+    except TrackingError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    selected_records = _select_records(
-        [record for record in records if isinstance(record, dict)],
-        set(args.job_name),
-        set(args.job_id),
+    if not payload.cluster_login:
+        print(f"ERROR: Missing cluster_login in {tracking_path}", file=sys.stderr)
+        return 1
+
+    selected = payload.filter_jobs(
+        names=set(args.job_name) or None,
+        ids=set(args.job_id) or None,
     )
-    if not selected_records:
+    if not selected:
         print("No matching jobs in tracking file.")
         return 0
 
-    downloads = _collect_downloads(selected_records)
+    downloads = _collect_downloads(selected)
     if not downloads:
         print("No log paths found in selected jobs.")
         return 0
 
-    job_folder = str(
-        payload.get("job_folder", "unknown_job_folder") or "unknown_job_folder"
-    )
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else Path("slurm_output") / "downloaded_logs" / job_folder
+        else Path("slurm_output") / "downloaded_logs" / payload.job_folder
     )
 
-    print(f"Tracking file: {tracking_file}")
-    print(f"Cluster: {cluster_login}")
-    print(f"Jobs selected: {len(selected_records)}")
+    print(f"Tracking file: {tracking_path}")
+    print(f"Cluster: {payload.cluster_login}")
+    print(f"Jobs selected: {len(selected)}")
     print(f"Log files to download: {len(downloads)}")
     print(f"Local destination: {output_dir}")
     if args.dry_run:
         print("Dry-run mode: commands will not be executed.")
 
     failures = _run_downloads(
-        cluster_login,
+        payload.cluster_login,
         downloads,
         output_dir,
         dry_run=args.dry_run,
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
+        ssh_config_file=payload.ssh_config_file,
+        ssh_options=payload.ssh_options,
     )
     if failures:
         print(f"Completed with {failures} failed download(s).", file=sys.stderr)

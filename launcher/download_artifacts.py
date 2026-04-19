@@ -1,20 +1,18 @@
-# launcher/download_artifacts.py
-# What: Provides download-artifacts CLI helpers to fetch tracked remote artifact paths from a launcher run.
-# Why: Makes it easy to pull outputs or checkpoints from the tracked remote workdir without manual rsync commands.
-# RELEVANT FILES: launcher/cli.py, launcher/core.py, launcher/tracking.py, README.md
-
 from __future__ import annotations
 
 import argparse
-import json
 import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 
 from .core import build_rsync_ssh_command
-from .tracking import resolve_tracking_file
+from .tracking import (
+    TrackingError,
+    TrackingPayload,
+    load_tracking_payload,
+    resolve_tracking_file,
+)
 
 
 def add_download_artifacts_args(parser: argparse.ArgumentParser) -> None:
@@ -48,22 +46,11 @@ def add_download_artifacts_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _artifact_paths_from_payload(payload: dict[str, Any]) -> list[str]:
-    value = payload.get("artifact_paths", [])
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item).strip()]
-    if value is None:
-        return []
-    text = str(value).strip()
-    return [text] if text else []
-
-
 def _selected_artifact_paths(
-    args: argparse.Namespace, payload: dict[str, Any]
+    args: argparse.Namespace, payload: TrackingPayload
 ) -> list[str]:
-    configured_paths = _artifact_paths_from_payload(payload)
     requested_paths = [str(item).strip() for item in args.path if str(item).strip()]
-    paths = requested_paths or configured_paths
+    paths = requested_paths or payload.artifact_paths
     seen: set[str] = set()
     unique_paths: list[str] = []
     for path in paths:
@@ -132,8 +119,8 @@ def _run_downloads(
 
 
 def run_download_artifacts(args: argparse.Namespace) -> int:
-    tracking_file = resolve_tracking_file(args.tracking_file)
-    if tracking_file is None:
+    tracking_path = resolve_tracking_file(args.tracking_file)
+    if tracking_path is None:
         print(
             "ERROR: No tracking file found. "
             "Run a non-dry submission first or pass --tracking-file.",
@@ -141,22 +128,18 @@ def run_download_artifacts(args: argparse.Namespace) -> int:
         )
         return 1
 
-    payload = json.loads(tracking_file.read_text(encoding="utf-8"))
-    cluster_login = str(payload.get("cluster_login", "") or "")
-    if not cluster_login:
-        print(f"ERROR: Missing cluster_login in {tracking_file}", file=sys.stderr)
+    try:
+        payload = load_tracking_payload(tracking_path)
+    except TrackingError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    ssh_config_file = str(payload.get("ssh_config_file", "") or "").strip() or None
-    ssh_options_value = payload.get("ssh_options", [])
-    ssh_options = (
-        [str(item) for item in ssh_options_value if str(item).strip()]
-        if isinstance(ssh_options_value, list)
-        else []
-    )
 
-    remote_workdir = str(payload.get("remote_workdir", "") or "")
-    if not remote_workdir:
-        print(f"ERROR: Missing remote_workdir in {tracking_file}", file=sys.stderr)
+    if not payload.cluster_login:
+        print(f"ERROR: Missing cluster_login in {tracking_path}", file=sys.stderr)
+        return 1
+
+    if not payload.remote_workdir:
+        print(f"ERROR: Missing remote_workdir in {tracking_path}", file=sys.stderr)
         return 1
 
     artifact_paths = _selected_artifact_paths(args, payload)
@@ -168,31 +151,28 @@ def run_download_artifacts(args: argparse.Namespace) -> int:
         )
         return 1
 
-    job_folder = str(
-        payload.get("job_folder", "unknown_job_folder") or "unknown_job_folder"
-    )
     output_dir = (
         Path(args.output_dir)
         if args.output_dir
-        else Path("slurm_output") / "downloaded_artifacts" / job_folder
+        else Path("slurm_output") / "downloaded_artifacts" / payload.job_folder
     )
 
-    print(f"Tracking file: {tracking_file}")
-    print(f"Cluster: {cluster_login}")
-    print(f"Remote workdir: {remote_workdir}")
+    print(f"Tracking file: {tracking_path}")
+    print(f"Cluster: {payload.cluster_login}")
+    print(f"Remote workdir: {payload.remote_workdir}")
     print(f"Artifact paths to download: {len(artifact_paths)}")
     print(f"Local destination: {output_dir}")
     if args.dry_run:
         print("Dry-run mode: commands will not be executed.")
 
     failures = _run_downloads(
-        cluster_login,
-        remote_workdir,
+        payload.cluster_login,
+        payload.remote_workdir,
         artifact_paths,
         output_dir,
         dry_run=args.dry_run,
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
+        ssh_config_file=payload.ssh_config_file,
+        ssh_options=payload.ssh_options,
     )
     if failures:
         print(f"Completed with {failures} failed download(s).", file=sys.stderr)

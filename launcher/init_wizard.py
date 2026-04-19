@@ -1,8 +1,3 @@
-# launcher/init_wizard.py
-# What: Interactive initializer that writes a repo-local launcher config with inferred path defaults.
-# Why: Makes adopting slurm-launcher in new repos quick while keeping config private and gitignored.
-# RELEVANT FILES: launcher/cli.py, launcher/templates/config.py.template, README.md, scripts/init_wrapper_repo.sh
-
 from __future__ import annotations
 
 import re

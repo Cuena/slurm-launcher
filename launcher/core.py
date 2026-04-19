@@ -438,7 +438,7 @@ def build_sbatch_script(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _parse_int(value: Any) -> int | None:
+def _parse_int(value: object) -> int | None:
     if value is None:
         return None
     try:
@@ -801,7 +801,7 @@ def resolve_submitted_job_log_paths(
     return stdout_path, stderr_path
 
 
-def resolve_log_path(template: Any, job_id: str) -> str | None:
+def resolve_log_path(template: str | None, job_id: str) -> str | None:
     if not template:
         return None
     path = str(template)

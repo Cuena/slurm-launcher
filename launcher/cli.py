@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
-import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -19,6 +19,7 @@ from rich.table import Table
 from .core import (
     JobSpec,
     LauncherSettings,
+    RemotePaths,
     build_ssh_command,
     build_predefined_sbatch_command,
     build_job_record,
@@ -45,7 +46,13 @@ from .job_tools import (
     show_job_details,
     show_job_log,
 )
-from .tracking import resolve_tracking_file
+from .tracking import (
+    JobRecord,
+    TrackingError,
+    TrackingPayload,
+    load_tracking_payload,
+    resolve_tracking_file,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -742,7 +749,7 @@ def _load_run_config(
     args: argparse.Namespace, *, quiet_errors: bool = False
 ) -> tuple[ModuleType, Path] | None:
     config_arg = str(args.config) if args.config else None
-    config_path = _resolve_run_config_path(config_arg)
+    config_path = _resolve_config_path(config_arg)
     if config_path is None:
         if not quiet_errors:
             if config_arg:
@@ -767,7 +774,9 @@ def _resolve_cluster_context(
     args: argparse.Namespace,
 ) -> tuple[str, str | None, str | None, list[str], Path | None] | None:
     config_arg = str(args.config) if getattr(args, "config", None) else None
-    config_path = _resolve_generic_config_path(config_arg)
+    config_path = _resolve_config_path(
+        config_arg, extra_candidates=[GENERIC_CONFIG_PATH]
+    )
     config = None
     if config_arg and config_path is None:
         err_console.print(f"Config file not found: {config_arg}", style="bold red")
@@ -840,7 +849,7 @@ def _monitor_command(
 
 def _collect_submission_results(
     settings: LauncherSettings,
-    remote_paths: Any,
+    remote_paths: RemotePaths,
     jobs: list[JobSpec],
     *,
     dry_run: bool,
@@ -983,7 +992,7 @@ def do_run(args: argparse.Namespace) -> int:
                 str(record.get("job_id", "")),
             )
         console.print(submitted_table)
-        _print_job_logs(job_records)
+        _print_job_logs_from_records(job_records)
     elif args.dry_run:
         console.print()
         console.print(
@@ -1211,7 +1220,7 @@ def do_submit(args: argparse.Namespace) -> int:
                 str(record.get("job_id", "")),
             )
         console.print(submitted_table)
-        _print_job_logs(job_records)
+        _print_job_logs_from_records(job_records)
     elif args.dry_run:
         console.print()
         console.print(
@@ -1235,55 +1244,62 @@ def do_sbatch(args: argparse.Namespace) -> int:
     if loaded is None:
         return 1
     config, config_path = loaded
-    settings = build_settings(
-        config,
-        config_path,
-        workspace_mode_override=_workspace_mode_from_args(args),
-    )
 
-    job_name = (args.name or Path(str(args.sbatch_file)).stem or "sbatch_job").strip()
-    if not job_name:
-        err_console.print("ERROR: --name cannot be empty.", style="bold red")
-        return 1
-    job = JobSpec(
-        name=job_name,
-        sbatch_file=str(args.sbatch_file),
-        sbatch_args=ensure_list(args.sbatch_arg),
-    )
-    _validate_predefined_sbatch_file_job(settings, job)
-
-    test_ssh_connection(
-        settings.cluster_login,
-        dry_run=args.dry_run,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
-    )
-    remote_paths = resolve_remote_paths(settings)
-
-    console.print()
-    console.print(
-        Panel.fit(
-            "\n".join(
-                [
-                    f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                    f"[bold]Workspace:[/bold] {settings.workspace_mode}",
-                    f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
-                    f"[bold]Sbatch file:[/bold] {job.sbatch_file}",
-                ]
-            ),
-            title="Sbatch",
-            border_style="cyan",
+    try:
+        settings = build_settings(
+            config,
+            config_path,
+            workspace_mode_override=_workspace_mode_from_args(args),
         )
-    )
 
-    if settings.workspace_mode == "fixed":
+        job_name = (
+            args.name or Path(str(args.sbatch_file)).stem or "sbatch_job"
+        ).strip()
+        if not job_name:
+            raise ValueError("--name cannot be empty.")
+        job = JobSpec(
+            name=job_name,
+            sbatch_file=str(args.sbatch_file),
+            sbatch_args=ensure_list(args.sbatch_arg),
+        )
+        _validate_predefined_sbatch_file_job(settings, job)
+
+        test_ssh_connection(
+            settings.cluster_login,
+            dry_run=args.dry_run,
+            ssh_config_file=settings.ssh_config_file,
+            ssh_options=settings.ssh_options,
+        )
+        remote_paths = resolve_remote_paths(settings)
+
+        console.print()
         console.print(
-            "Using REMOTE_WORKSPACE_DIR as the execution directory.",
-            style="yellow",
+            Panel.fit(
+                "\n".join(
+                    [
+                        f"[bold]Cluster:[/bold] {settings.cluster_login}",
+                        f"[bold]Workspace:[/bold] {settings.workspace_mode}",
+                        f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
+                        f"[bold]Sbatch file:[/bold] {job.sbatch_file}",
+                    ]
+                ),
+                title="Sbatch",
+                border_style="cyan",
+            )
         )
-    sync_project(settings, remote_paths, dry_run=args.dry_run)
 
-    submission = submit_job(settings, remote_paths, job, dry_run=args.dry_run)
+        if settings.workspace_mode == "fixed":
+            console.print(
+                "Using REMOTE_WORKSPACE_DIR as the execution directory.",
+                style="yellow",
+            )
+        sync_project(settings, remote_paths, dry_run=args.dry_run)
+
+        submission = submit_job(settings, remote_paths, job, dry_run=args.dry_run)
+    except (RuntimeError, SystemExit, ValueError) as exc:
+        err_console.print(str(exc), style="bold red")
+        return 1
+
     job_records: list[dict[str, Any]] = []
     if not args.dry_run:
         job_records.append(build_job_record(job, submission, settings))
@@ -1301,7 +1317,7 @@ def do_sbatch(args: argparse.Namespace) -> int:
                 str(record.get("job_id", "")),
             )
         console.print(submitted_table)
-        _print_job_logs(job_records)
+        _print_job_logs_from_records(job_records)
     elif args.dry_run:
         console.print()
         console.print(
@@ -1316,20 +1332,12 @@ def do_sbatch(args: argparse.Namespace) -> int:
     console.print()
     console.print(details_table)
     job_ids = _collect_job_ids(job_records)
-    if job_ids:
-        monitor_cmd = format_ssh_command(
-            settings.cluster_login,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
-            remote_command=f"squeue -j {','.join(job_ids)}",
-        )
-    else:
-        monitor_cmd = format_ssh_command(
-            settings.cluster_login,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
-            remote_command="squeue -u $USER",
-        )
+    monitor_cmd = _monitor_command(
+        settings.cluster_login,
+        job_ids,
+        ssh_config_file=settings.ssh_config_file,
+        ssh_options=settings.ssh_options,
+    )
     console.print("Monitor jobs with:")
     console.print(monitor_cmd, style="bold")
     return 0
@@ -1427,7 +1435,7 @@ def do_validate(args: argparse.Namespace) -> int:
         )
 
     config_arg = str(args.config) if args.config else None
-    config_path = _resolve_run_config_path(config_arg)
+    config_path = _resolve_config_path(config_arg)
     if config_path is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH.",
@@ -1569,7 +1577,7 @@ def do_validate(args: argparse.Namespace) -> int:
 def do_render(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
     config_arg = str(args.config) if args.config else None
-    config_path = _resolve_run_config_path(config_arg)
+    config_path = _resolve_config_path(config_arg)
     if config_path is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH.",
@@ -1702,31 +1710,21 @@ def do_render(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_run_config_path(path_arg: str | None) -> Path | None:
+_RUN_CONFIG_CANDIDATES = [
+    Path(".slurm/remote_launcher_config.mn5.py"),
+    Path("remote_launcher_config.py"),
+]
+
+
+def _resolve_config_path(
+    path_arg: str | None,
+    extra_candidates: list[Path] | None = None,
+) -> Path | None:
     if path_arg:
         candidate = Path(path_arg)
         return candidate if candidate.exists() else None
 
-    candidates = [
-        Path(".slurm/remote_launcher_config.mn5.py"),
-        Path("remote_launcher_config.py"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _resolve_generic_config_path(path_arg: str | None) -> Path | None:
-    if path_arg:
-        candidate = Path(path_arg)
-        return candidate if candidate.exists() else None
-
-    candidates = [
-        Path(".slurm/remote_launcher_config.mn5.py"),
-        Path("remote_launcher_config.py"),
-        GENERIC_CONFIG_PATH,
-    ]
+    candidates = _RUN_CONFIG_CANDIDATES + (extra_candidates or [])
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -1734,8 +1732,8 @@ def _resolve_generic_config_path(path_arg: str | None) -> Path | None:
 
 
 def do_logs(args: argparse.Namespace) -> int:
-    tracking_file = resolve_tracking_file(args.tracking_file)
-    if tracking_file is None:
+    tracking_path = resolve_tracking_file(args.tracking_file)
+    if tracking_path is None:
         err_console.print(
             "No tracking file found. Run a non-dry submission first "
             "or pass --tracking-file.",
@@ -1743,34 +1741,25 @@ def do_logs(args: argparse.Namespace) -> int:
         )
         return 1
 
-    payload = json.loads(tracking_file.read_text(encoding="utf-8"))
-    records = payload.get("jobs", [])
-    if not isinstance(records, list):
-        err_console.print(
-            f"Invalid tracking file format: {tracking_file}",
-            style="bold red",
-        )
+    try:
+        payload = load_tracking_payload(tracking_path)
+    except TrackingError as exc:
+        err_console.print(str(exc), style="bold red")
         return 1
 
-    if args.only:
-        wanted = set(args.only)
-        records = [
-            record for record in records if str(record.get("job_name", "")) in wanted
-        ]
+    selected = payload.filter_jobs(names=set(args.only) if args.only else None)
 
     if args.json:
-        filtered_payload = dict(payload)
-        filtered_payload["jobs"] = records
-        console.print_json(data=filtered_payload)
+        console.print_json(data=_tracking_payload_to_dict(payload, selected))
         return 0
 
     console.print(
         Panel.fit(
             "\n".join(
                 [
-                    f"[bold]Tracking file:[/bold] {tracking_file}",
-                    f"[bold]Cluster:[/bold] {payload.get('cluster_login', 'unknown')}",
-                    f"[bold]Job folder:[/bold] {payload.get('job_folder', 'unknown')}",
+                    f"[bold]Tracking file:[/bold] {tracking_path}",
+                    f"[bold]Cluster:[/bold] {payload.cluster_login}",
+                    f"[bold]Job folder:[/bold] {payload.job_folder}",
                 ]
             ),
             title="Tracked Submission",
@@ -1778,21 +1767,12 @@ def do_logs(args: argparse.Namespace) -> int:
         )
     )
 
-    if not records:
+    if not selected:
         console.print("No matching jobs.", style="yellow")
         return 0
 
-    _print_job_logs(records)
+    _print_job_logs_from_records(selected)
     return 0
-
-
-def _filter_records_by_name(
-    records: list[dict[str, Any]], only: list[str] | None
-) -> list[dict[str, Any]]:
-    if not only:
-        return records
-    wanted = set(only)
-    return [record for record in records if str(record.get("job_name", "")) in wanted]
 
 
 def _collect_job_ids(records: list[dict[str, Any]]) -> list[str]:
@@ -1803,10 +1783,72 @@ def _collect_job_ids(records: list[dict[str, Any]]) -> list[str]:
     ]
 
 
+def _tracking_payload_to_dict(
+    payload: TrackingPayload,
+    jobs: list[JobRecord | dict[str, object]],
+) -> dict[str, Any]:
+    job_dicts = []
+    for job in jobs:
+        if isinstance(job, JobRecord):
+            entry: dict[str, Any] = {
+                "job_name": job.job_name,
+                "job_id": job.job_id,
+                "stdout": job.stdout,
+                "stderr": job.stderr,
+            }
+            if job.sbatch_command:
+                entry["sbatch_command"] = job.sbatch_command
+            if job.remote_sbatch:
+                entry["remote_sbatch"] = job.remote_sbatch
+            if job.submitted_at:
+                entry["submitted_at"] = job.submitted_at
+            if job.launcher:
+                entry["launcher"] = job.launcher
+            job_dicts.append(entry)
+        else:
+            job_dicts.append(job)
+    return {
+        "created_at": payload.created_at,
+        "cluster_login": payload.cluster_login,
+        "ssh_config_file": payload.ssh_config_file,
+        "ssh_options": payload.ssh_options,
+        "job_folder": payload.job_folder,
+        "remote_workdir": payload.remote_workdir,
+        "remote_logdir": payload.remote_logdir,
+        "remote_slurm_output_dir": payload.remote_slurm_output_dir,
+        "jobs": job_dicts,
+    }
+
+
+def _print_job_logs_from_records(jobs: list[JobRecord | dict[str, object]]) -> None:
+    console.print()
+    console.print(Panel.fit("Remote Logs", border_style="cyan"))
+    for index, job in enumerate(jobs):
+        if isinstance(job, JobRecord):
+            job_name = job.job_name
+            job_id = job.job_id
+            stdout_path = job.stdout or ""
+            stderr_path = job.stderr or ""
+        else:
+            job_name = str(job.get("job_name", "") or "")
+            job_id = str(job.get("job_id", "") or "")
+            stdout_path = str(job.get("stdout", "") or "")
+            stderr_path = str(job.get("stderr", "") or "")
+        job_label = f"{job_name} ({job_id})" if job_id else job_name
+        console.print(f"[bold]{job_label}[/bold]")
+        console.print(f"stdout: {stdout_path or '-'}", soft_wrap=True)
+        console.print(
+            f"stderr: {stderr_path if stderr_path and stderr_path != stdout_path else '-'}",
+            soft_wrap=True,
+        )
+        if index < len(jobs) - 1:
+            console.print()
+
+
 def do_monitor(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
-    tracking_file = resolve_tracking_file(args.tracking_file)
-    if tracking_file is None:
+    tracking_path = resolve_tracking_file(args.tracking_file)
+    if tracking_path is None:
         return _emit_command_error(
             "No tracking file found. Run a non-dry submission first or pass --tracking-file.",
             json_output=json_output,
@@ -1818,44 +1860,40 @@ def do_monitor(args: argparse.Namespace) -> int:
             },
         )
 
-    payload = json.loads(tracking_file.read_text(encoding="utf-8"))
-    cluster_login = str(payload.get("cluster_login", "") or "")
-    if not cluster_login:
+    try:
+        payload = load_tracking_payload(tracking_path)
+    except TrackingError as exc:
         return _emit_command_error(
-            f"Missing cluster_login in tracking file: {tracking_file}",
+            str(exc),
             json_output=json_output,
             payload={
-                "tracking_file": str(tracking_file),
+                "tracking_file": str(tracking_path),
                 "job_ids": [],
                 "command": None,
                 "dry_run": bool(args.dry_run),
             },
         )
 
-    raw_records = payload.get("jobs", [])
-    if not isinstance(raw_records, list):
+    if not payload.cluster_login:
         return _emit_command_error(
-            f"Invalid tracking file format: {tracking_file}",
+            f"Missing cluster_login in tracking file: {tracking_path}",
             json_output=json_output,
             payload={
-                "tracking_file": str(tracking_file),
+                "tracking_file": str(tracking_path),
                 "job_ids": [],
                 "command": None,
                 "dry_run": bool(args.dry_run),
             },
         )
 
-    records = _filter_records_by_name(
-        [record for record in raw_records if isinstance(record, dict)],
-        args.only,
-    )
-    job_ids = _collect_job_ids(records)
+    selected = payload.filter_jobs(names=set(args.only) if args.only else None)
+    job_ids = payload.runnable_job_ids(selected)
     if not job_ids:
         return _emit_command_error(
             "No runnable job IDs found in tracking file selection.",
             json_output=json_output,
             payload={
-                "tracking_file": str(tracking_file),
+                "tracking_file": str(tracking_path),
                 "job_ids": [],
                 "command": None,
                 "dry_run": bool(args.dry_run),
@@ -1863,26 +1901,18 @@ def do_monitor(args: argparse.Namespace) -> int:
         )
 
     remote_command = f"squeue -j {','.join(job_ids)}"
-    ssh_config_file = str(payload.get("ssh_config_file", "") or "").strip() or None
-    raw_ssh_options = payload.get("ssh_options", [])
-    ssh_options = ensure_list(raw_ssh_options)
     ssh_cmd = build_ssh_command(
-        cluster_login,
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
+        payload.cluster_login,
+        ssh_config_file=payload.ssh_config_file,
+        ssh_options=payload.ssh_options,
     )
     ssh_cmd.append(remote_command)
-    command = _monitor_command(
-        cluster_login,
-        job_ids,
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
-    )
+    command = shlex.join(ssh_cmd)
 
     if json_output:
         result_payload: dict[str, Any] = {
             "ok": True,
-            "tracking_file": str(tracking_file),
+            "tracking_file": str(tracking_path),
             "job_ids": job_ids,
             "command": command,
             "dry_run": bool(args.dry_run),
@@ -2065,25 +2095,6 @@ def do_download_logs(args: argparse.Namespace) -> int:
 
 def do_download_artifacts(args: argparse.Namespace) -> int:
     return run_download_artifacts(args)
-
-
-def _print_job_logs(records: list[dict[str, Any]]) -> None:
-    console.print()
-    console.print(Panel.fit("Remote Logs", border_style="cyan"))
-    for index, record in enumerate(records):
-        job_name = str(record.get("job_name", "") or "")
-        job_id = str(record.get("job_id", "") or "")
-        stdout_path = str(record.get("stdout", "") or "")
-        stderr_path = str(record.get("stderr", "") or "")
-        job_label = f"{job_name} ({job_id})" if job_id else job_name
-        console.print(f"[bold]{job_label}[/bold]")
-        console.print(f"stdout: {stdout_path or '-'}", soft_wrap=True)
-        console.print(
-            f"stderr: {stderr_path if stderr_path and stderr_path != stdout_path else '-'}",
-            soft_wrap=True,
-        )
-        if index < len(records) - 1:
-            console.print()
 
 
 def main() -> int:

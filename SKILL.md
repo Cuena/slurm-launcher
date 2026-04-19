@@ -1,9 +1,13 @@
 ---
 name: slurm-launcher-operator
-description: "Use when the user wants Codex to operate SLURM experiment workflows in the current project with slurm-launcher (or sl), including config init, validate, dry-run, launch, monitor, inspect recent jobs, read job logs, download logs or artifacts, diagnose failures, patch project/config files, and rerun until success criteria are met. Do not use for modifying slurm-launcher's source repository unless explicitly requested."
+description: "Use when the user needs an assistant to inspect or operate jobs on a remote SLURM cluster. `slurm-launcher` (also available as `sl` in some environments) is the command-line tool used both for generic cluster inspection, such as listing jobs or reading job logs, and for project-scoped workflows that turn a local project configuration into remote SLURM jobs, submit them over SSH, monitor them, and retrieve logs or artifacts. The goal may be either to answer cluster-level questions without any project context or to take a project from local configuration through validation, staging, submission, monitoring, failure diagnosis, and reruns until the remote job succeeds. This skill interacts with the remote scheduler environment and, when relevant, the local project files. Do not use for modifying slurm-launcher's source repository unless explicitly requested."
 ---
 
-Use this workflow to run and iterate remote SLURM jobs from the current project while covering the full launcher feature set.
+Use this workflow when the task is to inspect or operate jobs on a cluster that uses SLURM, a common batch scheduler for HPC and GPU systems.
+
+`slurm-launcher` is the CLI that bridges the user environment and that remote cluster. Some commands are global cluster tools that work without any project checkout, such as listing jobs, showing job details, or reading logs from recent jobs. Other commands are project-scoped: they read local job configuration, render or stage scripts and assets, submit jobs to SLURM through SSH, track the resulting job metadata locally, and later fetch logs or artifacts.
+
+Use this file as an execution guide for the full `slurm-launcher` feature set.
 
 Command model to keep straight:
 
@@ -35,9 +39,11 @@ Command model to keep straight:
 - `init`, `run`, `stage`, `submit`, `render`, and `validate` remain project-scoped commands and should be run in the intended repo.
 - Do not introduce wrappers, PATH shims, or repo code changes unless the current execution environment is the thing preventing normal tool use.
 - If the current runtime already documents a repo-local launcher checkout fallback, use that runtime's documented invocation rather than inventing a new wrapper.
-- If `slurm-launcher` fails because the local `ssh` command is broken in the current agent environment, explain that this is an environment issue, not a launcher usage issue.
+- If an SSH-backed `slurm-launcher` command fails inside the agent sandbox, retry it with escalated permissions before diagnosing the failure as a cluster or project issue.
+- If `slurm-launcher` fails because the local `ssh` command is broken in the current agent environment even after escalation, explain that this is an environment issue, not a launcher usage issue.
 - Only use an `ssh` wrapper or override as a temporary execution workaround when needed to unblock the task; prefer fixes to machine `ssh` config or explicit launcher support for custom SSH options as the long-term solution.
 - If network or DNS access is blocked by the sandbox, request escalation rather than replacing tool usage with ad hoc non-tool flows.
+- When a repo already contains `.slurm/remote_launcher_config*.py`, inspect and extend that config before proposing a parallel launcher structure.
 - If the needed tool is unavailable, stop and report missing installation.
 
 2. Cover config lifecycle features
@@ -77,7 +83,7 @@ Command model to keep straight:
 - Validate local config:
   - `slurm-launcher validate`
   - `slurm-launcher validate --only <job...>`
-  - `slurm-launcher validate --json`
+  - Prefer `slurm-launcher validate --json` for agent use
 - Validate connectivity/prereqs:
   - `slurm-launcher validate --ssh`
   - `slurm-launcher validate --ssh --check-remote-paths`
@@ -86,7 +92,7 @@ Command model to keep straight:
   - `slurm-launcher render`
   - `slurm-launcher render --only <job...>`
   - `slurm-launcher render --job-script`
-  - `slurm-launcher render --json`
+  - Prefer `slurm-launcher render --json` for agent use
 
 5. Cover tracking, monitoring, and retrieval features
 - Tracking files:
@@ -96,14 +102,14 @@ Command model to keep straight:
 - Inspect tracking:
   - `slurm-launcher logs`
   - `slurm-launcher logs --only <job...>`
-  - `slurm-launcher logs --json`
+  - Prefer `slurm-launcher logs --json` for agent use
   - `slurm-launcher logs --tracking-file <jobs.json>`
 - Monitor queue:
   - `slurm-launcher monitor`
   - `slurm-launcher monitor --only <job...>`
   - `slurm-launcher monitor --tracking-file <jobs.json>`
   - `slurm-launcher monitor --dry-run`
-  - `slurm-launcher monitor --json`
+  - Prefer `slurm-launcher monitor --json` for agent use
 - Download `.out/.err`:
   - `slurm-launcher download-logs`
   - `--job-name <name>` repeatable
@@ -119,6 +125,7 @@ Command model to keep straight:
   - `--dry-run`
 - Generic cluster inspection without tracking files:
   - `slurm-launcher jobs`
+  - Prefer `slurm-launcher jobs --json` for agent use
   - `slurm-launcher doctor`
   - `slurm-launcher doctor --ssh`
   - `slurm-launcher jobs --cluster-login <user@host>`
@@ -126,10 +133,9 @@ Command model to keep straight:
   - default generic config lookup also checks `~/.config/slurm-launcher/config.py`
   - these generic commands are intended to work from any directory, not only from inside a project repo
   - `slurm-launcher jobs --hours <n> --limit <n>`
-  - `slurm-launcher jobs --json`
   - keep `jobs --json` list-shaped; if more detail is needed for one job, use `job-show`
   - `slurm-launcher job-show <job_id>`
-  - `slurm-launcher job-show <job_id> --json`
+  - Prefer `slurm-launcher job-show <job_id> --json` for agent use
   - `job-show` should resolve generic SLURM fields from `scontrol show job -o` and optionally `sacct`
   - `job-show` may add launcher enrichment when available, but that enrichment is additive and must not be required for generic inspection
   - `slurm-launcher job-log <job_id>`
@@ -172,7 +178,8 @@ Command model to keep straight:
 
 7. Standard operation loop
 - Start with `validate`, preferably `validate --json` when another agent step needs a stable payload.
-- Then use `render --json` and/or dry-runs before submission.
+- If a command will cross SSH boundaries (`validate --ssh`, `jobs`, `job-show`, `job-log`, `run`, `stage`, `submit`), be ready to retry with escalation if the sandbox interferes.
+- Then use `render --json` and/or dry-runs before submission, especially after edits to quoting, runtime mode, or staged paths.
 - Submit via `run` or split `stage` + `submit`/`sbatch` as requested.
 - Prefer `stage --dry-run --json`, `submit --dry-run --json`, or `run --dry-run --json` before costly remote actions.
 - Use `logs`, `monitor`, `download-logs`, `download-artifacts`, `doctor`, `jobs`, `job-show`, and `job-log` to inspect failures and recover outputs.
