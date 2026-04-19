@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from launcher import cli
-from launcher.core import JobSpec, RemotePaths
+from launcher.core import JobSpec, RemotePaths, SubmissionResult
 from tests.helpers import make_settings
 
 
@@ -19,6 +19,7 @@ class CliTests(unittest.TestCase):
             "render",
             "stage",
             "submit",
+            "sbatch",
             "run",
             "monitor",
             "doctor",
@@ -30,6 +31,8 @@ class CliTests(unittest.TestCase):
             argv = ["slurm-launcher", command, "--json"]
             if command == "submit":
                 argv.extend(["--job-folder", "run_001"])
+            if command == "sbatch":
+                argv.append("slurm/train.sbatch")
             if command in {"job-show", "job-log"}:
                 argv.append("12345")
             with self.subTest(command=command):
@@ -275,6 +278,68 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["job_folder"], "project_001")
         self.assertEqual(len(payload["commands"]), 2)
         self.assertEqual(payload["dry_run"], True)
+
+    @patch("launcher.cli.submit_job")
+    @patch("launcher.cli.sync_project")
+    @patch("launcher.cli.test_ssh_connection")
+    @patch("launcher.cli.resolve_remote_paths")
+    @patch("launcher.cli.build_settings")
+    @patch("launcher.cli._load_run_config")
+    @patch("launcher.cli.console.print_json")
+    def test_sbatch_json_payload(
+        self,
+        mock_print_json,
+        mock_load_run_config,
+        mock_build_settings,
+        mock_resolve_remote_paths,
+        mock_test_ssh_connection,
+        mock_sync_project,
+        mock_submit_job,
+    ) -> None:
+        settings = make_settings()
+        remote_paths = RemotePaths(
+            job_folder="project_001",
+            workdir="/remote/workspaces/project_001",
+            logdir="/remote/logs/project_001",
+            slurm_output_dir="/remote/logs/project_001/slurm_output",
+        )
+        submission = SubmissionResult(
+            job_id="dry-run",
+            sbatch_command="sbatch /remote/workspaces/project_001/slurm/train.sbatch",
+            sbatch_options={},
+            remote_sbatch_path="/remote/workspaces/project_001/slurm/train.sbatch",
+            commands=["ssh user@cluster 'sbatch /remote/workspaces/project_001/slurm/train.sbatch'"],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sbatch_file = Path(tmpdir) / "train.sbatch"
+            sbatch_file.write_text("#!/bin/bash\necho train\n", encoding="utf-8")
+            settings = make_settings(project_root=Path(tmpdir))
+            mock_load_run_config.return_value = (object(), Path("/tmp/config.py"))
+            mock_build_settings.return_value = settings
+            mock_resolve_remote_paths.return_value = remote_paths
+            mock_sync_project.return_value = ["rsync dry-run"]
+            mock_submit_job.return_value = submission
+            args = argparse.Namespace(
+                config=None,
+                workspace=None,
+                sbatch_file=str(sbatch_file),
+                name="train",
+                sbatch_arg=[],
+                dry_run=True,
+                json=True,
+            )
+
+            exit_code = cli.do_sbatch(args)
+
+        self.assertEqual(exit_code, 0)
+        mock_test_ssh_connection.assert_called_once()
+        payload = mock_print_json.call_args.kwargs["data"]
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["selected_jobs"], ["train"])
+        self.assertEqual(payload["tracking_file"], None)
+        self.assertEqual(len(payload["commands"]), 2)
+        self.assertIn("squeue -u $USER", payload["monitor_command"])
 
     @patch("launcher.cli.write_job_tracking_file")
     @patch("launcher.cli._collect_submission_results")

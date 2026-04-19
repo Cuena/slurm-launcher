@@ -879,7 +879,6 @@ def write_job_tracking_file(
         "venv_python_executable": settings.venv_python_executable,
         "singularity_image_path": settings.singularity_image_path,
         "artifact_paths": settings.artifact_paths,
-        "local_project_root": str(settings.project_root),
         "jobs": job_records,
     }
     output_path = tracking_dir / "jobs.json"

@@ -42,7 +42,6 @@ class TrackingPayload:
     venv_python_executable: str | None
     singularity_image_path: str | None
     artifact_paths: list[str]
-    local_project_root: str | None
     jobs: list[JobRecord] = field(default_factory=list)
 
     def filter_jobs(
@@ -169,7 +168,6 @@ def load_tracking_payload(path: Path) -> TrackingPayload:
         venv_python_executable=_str_or_none(raw.get("venv_python_executable")),
         singularity_image_path=_str_or_none(raw.get("singularity_image_path")),
         artifact_paths=_str_list(raw.get("artifact_paths")),
-        local_project_root=_str_or_none(raw.get("local_project_root")),
         jobs=jobs,
     )
 

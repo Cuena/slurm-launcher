@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from launcher.command_specs import COMMAND_NAMES, COMMAND_SPECS
 from launcher.core import (
     JobSpec,
     RemotePaths,
@@ -45,6 +46,36 @@ class CommandContractTests(unittest.TestCase):
         self.assertIn("rsync -az --info=progress2", commands[1])
         self.assertIn("--dry-run", commands[1])
         self.assertIn("-e 'ssh -F /dev/null -o BatchMode=yes'", commands[1])
+
+    def test_command_specs_cover_public_commands(self) -> None:
+        self.assertEqual(
+            set(COMMAND_NAMES),
+            {
+                "doctor",
+                "download-artifacts",
+                "download-logs",
+                "init",
+                "job-log",
+                "job-show",
+                "jobs",
+                "logs",
+                "monitor",
+                "render",
+                "run",
+                "sbatch",
+                "stage",
+                "submit",
+                "validate",
+            },
+        )
+
+    def test_json_capable_commands_declare_examples_and_fields(self) -> None:
+        for name, spec in COMMAND_SPECS.items():
+            with self.subTest(command=name):
+                self.assertTrue(spec.examples)
+                self.assertTrue(spec.agent_recommendation)
+                if spec.supports_json:
+                    self.assertTrue(spec.json_fields)
 
     def test_submit_job_dry_run_returns_exact_generated_submission_command(
         self,

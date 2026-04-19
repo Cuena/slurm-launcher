@@ -1,196 +1,429 @@
 ---
 name: slurm-launcher-operator
-description: "Use when the user needs an assistant to inspect or operate jobs on a remote SLURM cluster. `slurm-launcher` (also available as `sl` in some environments) is the command-line tool used both for generic cluster inspection, such as listing jobs or reading job logs, and for project-scoped workflows that turn a local project configuration into remote SLURM jobs, submit them over SSH, monitor them, and retrieve logs or artifacts. The goal may be either to answer cluster-level questions without any project context or to take a project from local configuration through validation, staging, submission, monitoring, failure diagnosis, and reruns until the remote job succeeds. This skill interacts with the remote scheduler environment and, when relevant, the local project files. Do not use for modifying slurm-launcher's source repository unless explicitly requested."
+description: "Use when the user needs an assistant to inspect or operate jobs on a remote SLURM cluster. `slurm-launcher` is the CLI for both generic cluster inspection and project-scoped stage/submit/track/retrieve workflows. Use it to validate configs, render scripts, stage code, submit jobs, inspect logs, monitor tracked runs, and download artifacts. Do not use for modifying slurm-launcher's source repository unless explicitly requested."
 ---
 
-Use this workflow when the task is to inspect or operate jobs on a cluster that uses SLURM, a common batch scheduler for HPC and GPU systems.
+Use this skill when the task is about operating a SLURM cluster or a project that submits SLURM jobs through `slurm-launcher`.
 
-`slurm-launcher` is the CLI that bridges the user environment and that remote cluster. Some commands are global cluster tools that work without any project checkout, such as listing jobs, showing job details, or reading logs from recent jobs. Other commands are project-scoped: they read local job configuration, render or stage scripts and assets, submit jobs to SLURM through SSH, track the resulting job metadata locally, and later fetch logs or artifacts.
-
-Use this file as an execution guide for the full `slurm-launcher` feature set.
-
-Command model to keep straight:
+The CLI serves two distinct modes. Keep them separate.
 
 - Global cluster inspection:
-  - `slurm-launcher doctor`
-  - `slurm-launcher jobs`
-  - `slurm-launcher job-show`
-  - `slurm-launcher job-log`
+  `doctor`, `jobs`, `job-show`, `job-log`
 - Project execution:
-  - `slurm-launcher init`
-  - `slurm-launcher validate`
-  - `slurm-launcher render`
-  - `slurm-launcher stage`
-  - `slurm-launcher submit`
-  - `slurm-launcher sbatch`
-  - `slurm-launcher run`
+  `init`, `validate`, `render`, `stage`, `submit`, `sbatch`, `run`
 - Project tracking and retrieval:
-  - `slurm-launcher logs`
-  - `slurm-launcher monitor`
-  - `slurm-launcher download-logs`
-  - `slurm-launcher download-artifacts`
+  `logs`, `monitor`, `download-logs`, `download-artifacts`
 
-1. Resolve tool and execution context
-- Prefer calling `slurm-launcher` directly.
-- If unavailable, use `sl` only if that alias is installed in the user environment.
-- `slurm-launcher` project execution commands still assume the current repo contains the intended project config.
-- `slurm-launcher jobs`, `slurm-launcher job-show`, and `slurm-launcher job-log` should also be treated as global commands: run them directly from any directory when the user only wants generic cluster inspection.
-- Do not require `cd` into the project repo for `slurm-launcher jobs`, `slurm-launcher job-show`, or `slurm-launcher job-log`.
-- `init`, `run`, `stage`, `submit`, `render`, and `validate` remain project-scoped commands and should be run in the intended repo.
-- Do not introduce wrappers, PATH shims, or repo code changes unless the current execution environment is the thing preventing normal tool use.
-- If the current runtime already documents a repo-local launcher checkout fallback, use that runtime's documented invocation rather than inventing a new wrapper.
-- If an SSH-backed `slurm-launcher` command fails inside the agent sandbox, retry it with escalated permissions before diagnosing the failure as a cluster or project issue.
-- If `slurm-launcher` fails because the local `ssh` command is broken in the current agent environment even after escalation, explain that this is an environment issue, not a launcher usage issue.
-- Only use an `ssh` wrapper or override as a temporary execution workaround when needed to unblock the task; prefer fixes to machine `ssh` config or explicit launcher support for custom SSH options as the long-term solution.
-- If network or DNS access is blocked by the sandbox, request escalation rather than replacing tool usage with ad hoc non-tool flows.
-- When a repo already contains `.slurm/remote_launcher_config*.py`, inspect and extend that config before proposing a parallel launcher structure.
-- If the needed tool is unavailable, stop and report missing installation.
+The canonical public command metadata now lives in:
 
-2. Cover config lifecycle features
-- Default config lookup is:
-  `.slurm/remote_launcher_config.mn5.py`, then `remote_launcher_config.py`.
-- `init` features:
-  - `slurm-launcher init`
-  - `slurm-launcher init --force`
-  - `slurm-launcher init --non-interactive`
-- Init creates:
-  - `.slurm/remote_launcher_config.mn5.py` (private)
-  - `.slurm/remote_launcher_config.mn5.example.py` (shareable)
-  - `.gitignore` entries for `.slurm/*.py` and `!.slurm/*.example.py`
+- `launcher/command_specs.py`
+- `launcher/payloads.py`
 
-3. Cover run/stage/submit/sbatch execution features
-- `run` is the default command when no subcommand is given.
-- Shared knobs:
-  - `--config <path>`
-  - `--workspace per-run|fixed`
-  - `--only <job...>` (where supported)
-  - `--dry-run` (where supported)
-- Full run:
-  - `slurm-launcher run`
-  - `slurm-launcher run --dry-run`
-  - `slurm-launcher run --only train eval`
-- Split flow:
-  - `slurm-launcher stage [--workspace ...] [--dry-run]`
-  - `slurm-launcher submit [--workspace ...] [--only ...] [--dry-run]`
-  - For `submit` in `per-run` mode, require `--job-folder <existing_folder>`.
-- Existing sbatch file flow:
-  - `slurm-launcher sbatch <sbatch_file>`
-  - Optional: `--name <tracking_name>`
-  - Optional repeatable: `--sbatch-arg <arg>`
-  - Supports `--workspace`, `--config`, and `--dry-run`.
+Keep this skill aligned with those files when the source repo changes.
 
-4. Cover validation and rendering features
-- Validate local config:
-  - `slurm-launcher validate`
-  - `slurm-launcher validate --only <job...>`
-  - Prefer `slurm-launcher validate --json` for agent use
-- Validate connectivity/prereqs:
-  - `slurm-launcher validate --ssh`
-  - `slurm-launcher validate --ssh --check-remote-paths`
-  - `--check-remote-paths` is valid only with `--ssh`.
-- Render scripts without submit:
-  - `slurm-launcher render`
-  - `slurm-launcher render --only <job...>`
-  - `slurm-launcher render --job-script`
-  - Prefer `slurm-launcher render --json` for agent use
+## Operating Rules
 
-5. Cover tracking, monitoring, and retrieval features
-- Tracking files:
-  - per-run `slurm_output/<job_folder>/jobs.json`
-  - pointer `slurm_output/latest_jobs.json`
-  - commands may also auto-pick latest `slurm_output/*/jobs.json`
-- Inspect tracking:
-  - `slurm-launcher logs`
-  - `slurm-launcher logs --only <job...>`
-  - Prefer `slurm-launcher logs --json` for agent use
-  - `slurm-launcher logs --tracking-file <jobs.json>`
-- Monitor queue:
-  - `slurm-launcher monitor`
-  - `slurm-launcher monitor --only <job...>`
-  - `slurm-launcher monitor --tracking-file <jobs.json>`
-  - `slurm-launcher monitor --dry-run`
-  - Prefer `slurm-launcher monitor --json` for agent use
-- Download `.out/.err`:
-  - `slurm-launcher download-logs`
-  - `--job-name <name>` repeatable
-  - `--job-id <id>` repeatable
-  - `--tracking-file <jobs.json>`
-  - `--output-dir <local_dir>`
-  - `--dry-run`
-- Download artifacts from tracked `remote_workdir`:
-  - `slurm-launcher download-artifacts`
-  - `--path <remote_relative_or_absolute_path>` repeatable
-  - `--tracking-file <jobs.json>`
-  - `--output-dir <local_dir>`
-  - `--dry-run`
-- Generic cluster inspection without tracking files:
-  - `slurm-launcher jobs`
-  - Prefer `slurm-launcher jobs --json` for agent use
-  - `slurm-launcher doctor`
-  - `slurm-launcher doctor --ssh`
-  - `slurm-launcher jobs --cluster-login <user@host>`
-  - `slurm-launcher jobs --config <path>`
-  - default generic config lookup also checks `~/.config/slurm-launcher/config.py`
-  - these generic commands are intended to work from any directory, not only from inside a project repo
-  - `slurm-launcher jobs --hours <n> --limit <n>`
-  - keep `jobs --json` list-shaped; if more detail is needed for one job, use `job-show`
-  - `slurm-launcher job-show <job_id>`
-  - Prefer `slurm-launcher job-show <job_id> --json` for agent use
-  - `job-show` should resolve generic SLURM fields from `scontrol show job -o` and optionally `sacct`
-  - `job-show` may add launcher enrichment when available, but that enrichment is additive and must not be required for generic inspection
-  - `slurm-launcher job-log <job_id>`
-  - `slurm-launcher job-log <job_id> --json`
-  - `slurm-launcher job-log <job_id> --stream stdout|stderr`
-  - `slurm-launcher job-log <job_id> --lines <n>`
-  - `slurm-launcher job-log <job_id> --follow`
-  - `slurm-launcher job-log <job_id> --full`
-  - `slurm-launcher job-log <job_id> --path-only`
-  - `job-log --json` should return structured log resolution only, not log content parsing
-  - `job-log` resolves `StdOut`/`StdErr` from SLURM first, then falls back to the default archive convention for old jobs.
-  - archive fallback should be explained explicitly: use `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR` when configured, otherwise default to `~/.slurm-dashboard/logs`.
-  - user-level generic config should be treated as minimal: `CLUSTER_LOGIN` is required; `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR` is optional.
-  - when machine-specific SSH behavior needs overrides, prefer config keys like `SSH_CONFIG_FILE` and `SSH_OPTIONS` instead of agent-only wrappers.
+1. Prefer `slurm-launcher` directly.
+- Use `sl` only if that alias is already installed in the user environment.
 
-6. Cover workspace/runtime/config model features
-- Workspace modes:
-  - `per-run`: requires `REMOTE_WORKSPACE_BASE`; creates unique run folder.
-  - `fixed`: requires `REMOTE_WORKSPACE_DIR`; reuses fixed remote directory.
-- Runtime modes:
-  - `native` (default)
-  - `venv` (requires `VENV_PYTHON_EXECUTABLE`)
-  - `singularity` (requires `SINGULARITY_IMAGE_PATH`, optional `SINGULARITY_EXEC_FLAGS`)
-- Core required config:
-  - `CLUSTER_LOGIN`
-  - `JOBS`
-  - workspace path requirement by mode above
-- Job model:
-  - each job must define exactly one of `command` or `sbatch_file`
-  - `sbatch_file` jobs may use `sbatch_args`
-  - `command` jobs may use `setup`, `env`, `sbatch`
-  - `RUN_JOBS` can define default subset; `--only` overrides it
-  - `DEFAULT_ENV` and `DEFAULT_SBATCH` apply globally
-- Optional archive integration:
-  - `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
-  - `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
+2. Distinguish global commands from project commands.
+- `doctor`, `jobs`, `job-show`, and `job-log` are intended to work from any directory.
+- `init`, `validate`, `render`, `stage`, `submit`, `sbatch`, and `run` are project-scoped.
+
+3. Prefer JSON-capable commands for agent workflows.
+- For agents, default to `--json` whenever the command supports it.
+- Read content only after a discovery step. Example: use `job-log --json` before `job-log --follow`.
+
+4. Use dry-run before costly or risky remote actions.
+- Prefer `stage --dry-run --json`, `submit --dry-run --json`, `sbatch --dry-run --json`, or `run --dry-run --json` before live submission.
+
+5. Treat SSH or sandbox failures as environment issues first.
+- If an SSH-backed command fails in the sandbox, retry with escalation before assuming the cluster or repo is broken.
+
+## Decision Guide
+
+Use this quick mapping before choosing a command.
+
+- “Is my config valid?”:
+  `slurm-launcher validate --json`
+- “What exactly will be submitted?”:
+  `slurm-launcher render --json`
+- “Stage files but do not submit”:
+  `slurm-launcher stage --dry-run --json` or `slurm-launcher stage --json`
+- “Submit from already staged code”:
+  `slurm-launcher submit --job-folder <folder> --json`
+- “Stage and submit end to end”:
+  `slurm-launcher run --json`
+- “Submit one existing sbatch file from the project”:
+  `slurm-launcher sbatch <sbatch_file> --json`
+- “What jobs exist on the cluster?”:
+  `slurm-launcher jobs --json`
+- “What jobs are currently running?”:
+  `slurm-launcher jobs --state running --json`
+- “What happened to one job?”:
+  `slurm-launcher job-show <job_id> --json`
+- “Where is the log for one job?”:
+  `slurm-launcher job-log <job_id> --json`
+- “What logs were tracked for the last launcher run?”:
+  `slurm-launcher logs --json`
+- “Are tracked jobs still queued/running?”:
+  `slurm-launcher monitor --json`
+- “Download tracked logs/artifacts locally”:
+  `slurm-launcher download-logs --dry-run`
+  `slurm-launcher download-artifacts --dry-run`
+
+## Config Model
+
+These are the config concepts an agent should keep straight.
+
+- Required for most project commands:
+  `CLUSTER_LOGIN`
+  `JOBS`
+- Workspace mode:
+  `WORKSPACE_MODE = "per-run" | "fixed"`
+- Path requirement for `per-run`:
+  `REMOTE_WORKSPACE_BASE`
+- Path requirement for `fixed`:
+  `REMOTE_WORKSPACE_DIR`
+- Optional log base:
+  `REMOTE_LOG_BASE_PATH`
+  If omitted, the launcher falls back to the configured workspace path.
+- Runtime mode:
+  `RUNTIME_MODE = "native" | "venv" | "singularity"`
+- Required for `venv`:
+  `VENV_PYTHON_EXECUTABLE`
+- Required for `singularity`:
+  `SINGULARITY_IMAGE_PATH`
+- Optional for `singularity`:
+  `SINGULARITY_EXEC_FLAGS`
 - Optional SSH behavior:
-  - `SSH_CONFIG_FILE` to map to `ssh -F <path>`
-  - `SSH_OPTIONS` as a list of extra args appended to launcher-managed `ssh` calls
+  `SSH_CONFIG_FILE`
+  `SSH_OPTIONS`
+- Optional download defaults:
+  `ARTIFACT_PATHS`
+- Optional dashboard/archive integration:
+  `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
+  `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
 
-7. Standard operation loop
-- Start with `validate`, preferably `validate --json` when another agent step needs a stable payload.
-- If a command will cross SSH boundaries (`validate --ssh`, `jobs`, `job-show`, `job-log`, `run`, `stage`, `submit`), be ready to retry with escalation if the sandbox interferes.
-- Then use `render --json` and/or dry-runs before submission, especially after edits to quoting, runtime mode, or staged paths.
-- Submit via `run` or split `stage` + `submit`/`sbatch` as requested.
-- Prefer `stage --dry-run --json`, `submit --dry-run --json`, or `run --dry-run --json` before costly remote actions.
-- Use `logs`, `monitor`, `download-logs`, `download-artifacts`, `doctor`, `jobs`, `job-show`, and `job-log` to inspect failures and recover outputs.
-- When the task is generic cluster inspection rather than project execution, prefer the generic `doctor` / `jobs` / `job-show` / `job-log` commands over repo-scoped launcher workflows.
-- For `doctor` / `jobs` / `job-show` / `job-log`, assume the normal invocation is the installed `slurm-launcher` binary from any directory, backed by `~/.config/slurm-launcher/config.py` when needed.
-- Apply minimal fixes in the target project and rerun until success criteria are met.
+## Job Model
 
-8. Guardrails
-- Prefer minimal, reversible edits.
-- Avoid dependency/lockfile changes unless explicitly requested.
-- Use dry-run before costly or risky remote actions.
-- Distinguish tool behavior from environment behavior. If `slurm-launcher` would work in a normal shell but fails in the current agent sandbox because of `ssh` config or blocked network access, state that clearly.
-- When a temporary wrapper or environment override is required to run the installed CLI in this agent session, keep it outside the repo when possible and avoid turning an execution-environment workaround into a product change unless the user asks for that change.
-- Report: what changed, exact commands run, and current job state.
+- Each job must define exactly one of:
+  `command`
+  `sbatch_file`
+- `command` jobs may also define:
+  `setup`
+  `env`
+  `sbatch`
+- `sbatch_file` jobs may also define:
+  `sbatch_args`
+- `RUN_JOBS` defines a default subset.
+- `--only` overrides `RUN_JOBS`.
+- `DEFAULT_ENV` and `DEFAULT_SBATCH` apply globally before per-job overrides.
+
+## Command Contracts
+
+Each command below lists the purpose, when to use it, recommended agent invocation, and the most relevant arguments.
+
+### `doctor`
+
+- Purpose:
+  Resolve cluster login, SSH settings, and archive-dir behavior. Optionally test SSH and remote SLURM tools.
+- Use when:
+  The task is generic cluster inspection or diagnosing config/SSH problems before other commands.
+- Recommended for agents:
+  `slurm-launcher doctor --json`
+  `slurm-launcher doctor --ssh --json`
+- Key arguments:
+  `--cluster-login` to bypass config lookup.
+  `--config` to point at a repo or user-level config.
+  `--ssh` to test connectivity and `sacct`/`scontrol`/`squeue`.
+  `--json` for machine-readable output.
+- JSON fields:
+  `cluster_login`, `config_path`, `ssh_config_file`, `ssh_options`, `archive_dir`, `archive_dir_source`, optional `ssh_ok`, optional `remote_tools`
+
+### `jobs`
+
+- Purpose:
+  List recent jobs directly from the cluster.
+- Use when:
+  You need a broad view of job history or queue state, including jobs not launched by this repo.
+- Recommended for agents:
+  `slurm-launcher jobs --json`
+  `slurm-launcher jobs --state running --json`
+  `slurm-launcher jobs --hours 72 --limit 50 --json`
+- Key arguments:
+  `--cluster-login`
+  `--config`
+  `--user`
+  `--hours`
+  `--limit`
+  repeatable `--state`
+  `--json`
+- JSON fields:
+  `cluster_login`, `user`, `hours`, `limit`, `states`, `source`, `jobs`
+
+### `job-show`
+
+- Purpose:
+  Show generic job details for one SLURM job ID.
+- Use when:
+  `jobs` already identified the interesting job and you need state, paths, command, or node details.
+- Recommended for agents:
+  `slurm-launcher job-show <job_id> --json`
+- Key arguments:
+  positional `job_id`
+  `--cluster-login`
+  `--config`
+  `--json`
+- JSON fields:
+  `job_id`, `detail_level`, `resolved_via`, plus any resolved fields among `job_name`, `state`, `partition`, `command`, `work_dir`, `stdout`, `stderr`, `node_list`, `num_nodes`, `gres`, `submit_time`, `start_time`, `end_time`, optional `launcher`
+- Important behavior:
+  Check `detail_level` before assuming all metadata is present.
+  `detail_level=log-resolution` means the command could resolve log paths and core state, but omitted unavailable fields instead of returning a large set of `null` values.
+
+### `job-log`
+
+- Purpose:
+  Resolve and optionally read stdout or stderr for a SLURM job ID.
+- Use when:
+  A specific job ID is already known.
+- Recommended for agents:
+  First: `slurm-launcher job-log <job_id> --json`
+  Then, if needed: `slurm-launcher job-log <job_id> --stream stderr --follow`
+- Key arguments:
+  positional `job_id`
+  `--stream stdout|stderr`
+  `--lines <n>`
+  `--follow`
+  `--full`
+  `--path-only`
+  `--cluster-login`
+  `--config`
+  `--json`
+- JSON fields:
+  `job_id`, `job_name`, `state`, `stream`, `path`, `resolved_via`
+- Important behavior:
+  Path resolution tries SLURM metadata first and falls back to the archive convention only when needed.
+
+### `init`
+
+- Purpose:
+  Create `.slurm/remote_launcher_config.mn5.py` and `.slurm/remote_launcher_config.mn5.example.py`.
+- Use when:
+  A project has not been configured for launcher use yet.
+- Recommended for agents:
+  `slurm-launcher init --non-interactive`
+- Key arguments:
+  `--force`
+  `--non-interactive`
+
+### `validate`
+
+- Purpose:
+  Validate config structure, selected jobs, path requirements, and optional remote runtime prerequisites.
+- Use when:
+  Before render, stage, submit, or run, especially after config edits.
+- Recommended for agents:
+  `slurm-launcher validate --json`
+  `slurm-launcher validate --ssh --check-remote-paths --json`
+- Key arguments:
+  `--config`
+  `--workspace per-run|fixed`
+  `--only <job...>`
+  `--ssh`
+  `--check-remote-paths`
+  `--json`
+- JSON fields:
+  `ok`, `config_path`, `workspace_mode`, `selected_jobs`, `warnings`, `errors`, `ssh_checked`, `remote_checks`
+
+### `render`
+
+- Purpose:
+  Render launcher-generated scripts without submitting them.
+- Use when:
+  Inspecting final sbatch directives, shell quoting, runtime wrapping, or the exact command body.
+- Recommended for agents:
+  `slurm-launcher render --json`
+  `slurm-launcher render --job-script --json`
+- Key arguments:
+  `--config`
+  `--workspace`
+  `--only <job...>`
+  `--job-script`
+  `--json`
+- JSON fields:
+  `ok`, `config_path`, `workspace_mode`, `selected_jobs`, `rendered_jobs`, `job_scripts`, `sbatch_scripts`
+
+### `stage`
+
+- Purpose:
+  Sync project files to the remote workdir without submitting jobs.
+- Use when:
+  The workflow should be split into `stage` then `submit`, or when rsync/path debugging is needed.
+- Recommended for agents:
+  `slurm-launcher stage --dry-run --json`
+- Key arguments:
+  `--config`
+  `--workspace`
+  `--dry-run`
+  `--json`
+- JSON fields:
+  `ok`, `config_path`, `workspace_mode`, `remote_workdir`, `job_folder`, `commands`, `dry_run`
+
+### `submit`
+
+- Purpose:
+  Submit jobs using an already prepared remote workdir.
+- Use when:
+  Stage already happened, or a fixed workspace is already current.
+- Recommended for agents:
+  `slurm-launcher submit --workspace per-run --job-folder <folder> --dry-run --json`
+  `slurm-launcher submit --workspace fixed --json`
+- Key arguments:
+  `--config`
+  `--workspace`
+  `--only <job...>`
+  `--job-folder <folder>`
+  `--dry-run`
+  `--json`
+- JSON fields:
+  `ok`, `config_path`, `workspace_mode`, `remote_workdir`, `job_folder`, `selected_jobs`, `submitted_jobs`, `tracking_file`, `commands`, `monitor_command`, `dry_run`
+
+### `sbatch`
+
+- Purpose:
+  Stage project files and submit one existing sbatch file from the project tree.
+- Use when:
+  The project already contains a hand-written sbatch script and you still want launcher staging/tracking behavior.
+- Recommended for agents:
+  `slurm-launcher sbatch slurm/train.sbatch --dry-run --json`
+- Key arguments:
+  positional `sbatch_file`
+  `--name`
+  repeatable `--sbatch-arg`
+  `--config`
+  `--workspace`
+  `--dry-run`
+  `--json`
+- JSON fields:
+  `ok`, `config_path`, `workspace_mode`, `remote_workdir`, `job_folder`, `selected_jobs`, `submitted_jobs`, `tracking_file`, `commands`, `monitor_command`, `dry_run`
+
+### `run`
+
+- Purpose:
+  Stage the project and submit the selected jobs in one command.
+- Use when:
+  Validation and render checks are already complete and the user wants the normal end-to-end flow.
+- Recommended for agents:
+  `slurm-launcher run --dry-run --json`
+  `slurm-launcher run --only train eval --json`
+- Key arguments:
+  `--config`
+  `--workspace`
+  `--only <job...>`
+  `--dry-run`
+  `--json`
+- JSON fields:
+  `ok`, `config_path`, `workspace_mode`, `remote_workdir`, `job_folder`, `selected_jobs`, `submitted_jobs`, `tracking_file`, `commands`, `monitor_command`, `dry_run`
+
+### `logs`
+
+- Purpose:
+  Read the local tracking file and show tracked stdout/stderr paths.
+- Use when:
+  You want tracked paths from the latest launcher submission without querying the cluster.
+- Recommended for agents:
+  `slurm-launcher logs --json`
+- Key arguments:
+  `--tracking-file`
+  `--only <job...>`
+  `--json`
+- JSON fields:
+  `created_at`, `cluster_login`, `ssh_config_file`, `ssh_options`, `job_folder`, `remote_workdir`, `remote_logdir`, `remote_slurm_output_dir`, `jobs`
+
+### `monitor`
+
+- Purpose:
+  Run `squeue` for tracked job IDs.
+- Use when:
+  The tracking file already exists and current queue state is needed.
+- Recommended for agents:
+  `slurm-launcher monitor --json`
+  `slurm-launcher monitor --dry-run --json`
+- Key arguments:
+  `--tracking-file`
+  `--only <job...>`
+  `--dry-run`
+  `--json`
+- JSON fields:
+  `ok`, `tracking_file`, `job_ids`, `command`, `dry_run`, optional `returncode`, optional `stdout`, optional `stderr`
+
+### `download-logs`
+
+- Purpose:
+  Download tracked `.out` and `.err` files locally.
+- Use when:
+  Remote log paths are already known from tracking and a local copy is needed.
+- Recommended for agents:
+  `slurm-launcher download-logs --dry-run`
+- Key arguments:
+  `--tracking-file`
+  repeatable `--job-name`
+  repeatable `--job-id`
+  `--output-dir`
+  `--dry-run`
+- Output model:
+  Plain text only. It prints the selected files and the exact rsync commands.
+
+### `download-artifacts`
+
+- Purpose:
+  Download configured or explicit artifact paths from the tracked remote workdir.
+- Use when:
+  Outputs, checkpoints, or reports need to be copied back locally after a run.
+- Recommended for agents:
+  `slurm-launcher download-artifacts --dry-run`
+- Key arguments:
+  `--tracking-file`
+  repeatable `--path`
+  `--output-dir`
+  `--dry-run`
+- Output model:
+  Plain text only. It prints selected artifact paths and rsync commands.
+
+## Recommended Agent Loop
+
+1. Resolve the mode.
+- Generic cluster inspection: start with `doctor`, `jobs`, `job-show`, or `job-log`.
+- Project execution: start with `validate`.
+
+2. Validate before submitting.
+- `slurm-launcher validate --json`
+- Add `--ssh --check-remote-paths` before remote execution when runtime paths matter.
+
+3. Preview before writing or submitting.
+- `slurm-launcher render --json`
+- `slurm-launcher stage --dry-run --json`
+- `slurm-launcher submit --dry-run --json`
+- `slurm-launcher sbatch --dry-run --json`
+- `slurm-launcher run --dry-run --json`
+
+4. Execute the smallest safe step.
+- Prefer `--only` when iterating on one job.
+- Prefer `submit` over `run` when the stage step already succeeded.
+
+5. Inspect or recover.
+- `logs --json`
+- `monitor --json`
+- `job-show <job_id> --json`
+- `job-log <job_id> --json`
+- `download-logs --dry-run`
+- `download-artifacts --dry-run`
+
+## Guardrails
+
+- Do not invent wrappers when the installed CLI should work.
+- Do not assume project commands work outside the intended repo.
+- Do not read full logs before first resolving the path and stream intentionally.
+- Do not treat launcher enrichment as required for generic cluster inspection.
+- Do not modify this source repository unless the user explicitly asks for source changes.

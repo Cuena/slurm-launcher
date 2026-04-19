@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -16,6 +16,15 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+from .cli_output import (
+    collect_job_ids,
+    collect_submission_results,
+    emit_submission_result,
+    monitor_command,
+    print_execution_panel,
+    print_job_logs_from_records,
+    selected_job_names,
+)
 from .core import (
     JobSpec,
     LauncherSettings,
@@ -27,8 +36,6 @@ from .core import (
     build_launcher_metadata,
     build_sbatch_script,
     format_sbatch_options,
-    format_ssh_command,
-    resolve_local_project_path,
     resolve_remote_paths,
     resolve_remote_paths_for_job_folder,
     ssh_script,
@@ -36,6 +43,20 @@ from .core import (
     sync_project,
     test_ssh_connection,
     write_job_tracking_file,
+)
+from .command_specs import COMMAND_NAMES, COMMAND_SPECS, DEFAULT_COMMAND
+from .config_utils import (
+    build_settings,
+    ensure_list,
+    fail_duplicate_jobs,
+    fail_if_not_absolute,
+    load_config,
+    normalize_workspace_mode,
+    prepare_jobs,
+    remote_runtime_checks,
+    resolve_local_sbatch_file_path,
+    validate_predefined_sbatch_file_job,
+    validate_predefined_sbatch_jobs,
 )
 from .download_artifacts import add_download_artifacts_args, run_download_artifacts
 from .download_logs import add_download_logs_args, run_download_logs
@@ -49,25 +70,41 @@ from .job_tools import (
 from .tracking import (
     JobRecord,
     TrackingError,
-    TrackingPayload,
     load_tracking_payload,
     resolve_tracking_file,
+)
+from .payloads import (
+    doctor_payload,
+    error_payload,
+    monitor_payload,
+    render_payload,
+    stage_payload,
+    submission_payload,
+    tracking_payload_to_dict,
+    validate_payload,
 )
 
 console = Console()
 err_console = Console(stderr=True)
-WORKSPACE_MODES = {"per-run", "fixed"}
 GENERIC_CONFIG_PATH = Path.home() / ".config" / "slurm-launcher" / "config.py"
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class ExecutionContext:
+    config: ModuleType
+    config_path: Path
+    settings: LauncherSettings
+    remote_paths: RemotePaths
+
+
+def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     parser = argparse.ArgumentParser(
         description="Submit SLURM jobs on a remote cluster"
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
     init_parser = subparsers.add_parser(
-        "init", help="Initialize launcher config in current directory"
+        "init", help=COMMAND_SPECS["init"].summary
     )
     init_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing config file"
@@ -79,102 +116,90 @@ def parse_args() -> argparse.Namespace:
     )
 
     logs_parser = subparsers.add_parser(
-        "logs", help="Show tracked log file paths from a previous submission"
+        "logs", help=COMMAND_SPECS["logs"].summary
     )
     _add_logs_args(logs_parser)
 
     download_logs_parser = subparsers.add_parser(
         "download-logs",
-        help="Download tracked .out/.err files from a previous submission",
+        help=COMMAND_SPECS["download-logs"].summary,
     )
     add_download_logs_args(download_logs_parser)
 
     download_artifacts_parser = subparsers.add_parser(
         "download-artifacts",
-        help="Download tracked artifact paths from a previous submission",
+        help=COMMAND_SPECS["download-artifacts"].summary,
     )
     add_download_artifacts_args(download_artifacts_parser)
 
     monitor_parser = subparsers.add_parser(
-        "monitor", help="Run squeue for tracked jobs from a previous submission"
+        "monitor", help=COMMAND_SPECS["monitor"].summary
     )
     _add_monitor_args(monitor_parser)
 
     jobs_parser = subparsers.add_parser(
-        "jobs", help="Show recent SLURM jobs on the cluster"
+        "jobs", help=COMMAND_SPECS["jobs"].summary
     )
     _add_jobs_args(jobs_parser)
 
     job_show_parser = subparsers.add_parser(
-        "job-show", help="Show generic SLURM details for one job id"
+        "job-show", help=COMMAND_SPECS["job-show"].summary
     )
     _add_job_show_args(job_show_parser)
 
     job_log_parser = subparsers.add_parser(
-        "job-log", help="Read stdout or stderr for a SLURM job id"
+        "job-log", help=COMMAND_SPECS["job-log"].summary
     )
     _add_job_log_args(job_log_parser)
 
     doctor_parser = subparsers.add_parser(
-        "doctor", help="Check generic config resolution and SSH/tool availability"
+        "doctor", help=COMMAND_SPECS["doctor"].summary
     )
     _add_doctor_args(doctor_parser)
 
     validate_parser = subparsers.add_parser(
         "validate",
-        help="Validate the launcher config without submitting jobs",
+        help=COMMAND_SPECS["validate"].summary,
     )
     _add_validate_args(validate_parser)
 
     render_parser = subparsers.add_parser(
         "render",
-        help="Render generated sbatch scripts without submitting jobs",
+        help=COMMAND_SPECS["render"].summary,
     )
     _add_render_args(render_parser)
 
     stage_parser = subparsers.add_parser(
         "stage",
-        help="Sync project files to the remote cluster without submitting jobs",
+        help=COMMAND_SPECS["stage"].summary,
     )
     _add_stage_args(stage_parser)
 
     submit_parser = subparsers.add_parser(
         "submit",
-        help="Submit jobs without syncing code first",
+        help=COMMAND_SPECS["submit"].summary,
     )
     _add_submit_args(submit_parser)
 
     sbatch_parser = subparsers.add_parser(
         "sbatch",
-        help="Stage code and submit one existing sbatch file",
+        help=COMMAND_SPECS["sbatch"].summary,
     )
     _add_sbatch_args(sbatch_parser)
 
     run_parser = subparsers.add_parser(
-        "run", help="Stage code and submit jobs (default if no command provided)"
+        "run", help=COMMAND_SPECS["run"].summary
     )
     _add_run_args(run_parser)
+    return parser, run_parser
 
-    raw_args = sys.argv[1:]
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser, run_parser = _build_parser()
+    raw_args = list(sys.argv[1:] if argv is None else argv)
     if not raw_args:
         return run_parser.parse_args([])
-    if raw_args[0] in {
-        "init",
-        "logs",
-        "download-logs",
-        "download-artifacts",
-        "monitor",
-        "jobs",
-        "job-show",
-        "job-log",
-        "doctor",
-        "validate",
-        "render",
-        "stage",
-        "submit",
-        "sbatch",
-        "run",
-    }:
+    if raw_args[0] in COMMAND_NAMES:
         return parser.parse_args(raw_args)
     if raw_args[0] in {"-h", "--help"}:
         return parser.parse_args(raw_args)
@@ -299,6 +324,11 @@ def _add_sbatch_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Print commands without running SSH/rsync/sbatch",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable JSON result.",
+    )
 
 
 def _add_validate_args(parser: argparse.ArgumentParser) -> None:
@@ -400,6 +430,15 @@ def _add_jobs_args(parser: argparse.ArgumentParser) -> None:
         help="Maximum number of jobs to show. Default: 20.",
     )
     parser.add_argument(
+        "--state",
+        action="append",
+        default=[],
+        help=(
+            "Filter to one or more job states. Matches the leading state token, "
+            "so '--state cancelled' also matches 'CANCELLED by <uid>'."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print the raw job list as JSON.",
@@ -467,21 +506,8 @@ def _add_doctor_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def load_config(config_path: Path) -> ModuleType:
-    config_path = config_path.resolve()
-    spec = importlib.util.spec_from_file_location("remote_launcher_config", config_path)
-    if spec is None or spec.loader is None:
-        raise SystemExit(f"ERROR: Unable to load config from {config_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def _normalize_workspace_mode(value: Any, *, setting_name: str) -> str:
-    mode = str(value).strip().lower()
-    if mode in WORKSPACE_MODES:
-        return mode
-    raise SystemExit(f"ERROR: {setting_name} must be one of: per-run, fixed.")
+    return normalize_workspace_mode(value, setting_name=setting_name)
 
 
 def _workspace_mode_from_args(args: argparse.Namespace) -> str | None:
@@ -489,205 +515,6 @@ def _workspace_mode_from_args(args: argparse.Namespace) -> str | None:
     if workspace:
         return _normalize_workspace_mode(workspace, setting_name="--workspace")
     return None
-
-
-def build_settings(
-    config: ModuleType,
-    config_path: Path,
-    *,
-    workspace_mode_override: str | None = None,
-) -> LauncherSettings:
-    cluster_login = getattr(config, "CLUSTER_LOGIN", None)
-    ssh_config_file = getattr(config, "SSH_CONFIG_FILE", None)
-    ssh_options = ensure_list(getattr(config, "SSH_OPTIONS", []))
-    remote_workspace_base = getattr(config, "REMOTE_WORKSPACE_BASE", None)
-    remote_workspace_dir = getattr(config, "REMOTE_WORKSPACE_DIR", None)
-    configured_workspace_mode = getattr(config, "WORKSPACE_MODE", "per-run")
-    workspace_mode = _normalize_workspace_mode(
-        workspace_mode_override or configured_workspace_mode,
-        setting_name="WORKSPACE_MODE",
-    )
-
-    if not cluster_login:
-        raise SystemExit("ERROR: Config must define CLUSTER_LOGIN.")
-
-    remote_log_base_path = getattr(config, "REMOTE_LOG_BASE_PATH", None)
-    if not remote_log_base_path:
-        remote_log_base_path = remote_workspace_base or remote_workspace_dir
-    if not remote_log_base_path:
-        raise SystemExit(
-            "ERROR: Config must define REMOTE_LOG_BASE_PATH and one workspace path "
-            "(REMOTE_WORKSPACE_BASE/REMOTE_WORKSPACE_DIR)."
-        )
-    if workspace_mode == "per-run" and not remote_workspace_base:
-        raise SystemExit(
-            "ERROR: REMOTE_WORKSPACE_BASE is required for WORKSPACE_MODE='per-run'."
-        )
-    if workspace_mode == "fixed" and not remote_workspace_dir:
-        raise SystemExit(
-            "ERROR: REMOTE_WORKSPACE_DIR is required for WORKSPACE_MODE='fixed'."
-        )
-
-    remote_slurm_dashboard_log_archive_dir = getattr(
-        config, "REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR", None
-    )
-    remote_slurm_dashboard_log_view_dir = getattr(
-        config, "REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR", None
-    )
-    local_root = Path(getattr(config, "LOCAL_ROOT", config_path.parent)).resolve()
-    project_prefix = getattr(
-        config,
-        "PROJECT_NAME",
-        local_root.name.replace(" ", "_") or "project",
-    )
-
-    runtime_mode = str(getattr(config, "RUNTIME_MODE", "native")).lower()
-    allowed_runtimes = {"native", "venv", "singularity"}
-    if runtime_mode not in allowed_runtimes:
-        raise SystemExit(
-            "ERROR: RUNTIME_MODE must be one of: native, venv, singularity."
-        )
-
-    venv_python = getattr(config, "VENV_PYTHON_EXECUTABLE", None)
-    singularity_image = getattr(config, "SINGULARITY_IMAGE_PATH", None)
-    if hasattr(config, "SINGULARITY_EXTRA_ARGS"):
-        raise SystemExit(
-            "ERROR: SINGULARITY_EXTRA_ARGS was removed. "
-            "Rename it to SINGULARITY_EXEC_FLAGS."
-        )
-    singularity_exec_flags = [
-        str(arg) for arg in getattr(config, "SINGULARITY_EXEC_FLAGS", [])
-    ]
-
-    if runtime_mode == "venv":
-        if not venv_python:
-            raise SystemExit(
-                "ERROR: Set VENV_PYTHON_EXECUTABLE when RUNTIME_MODE='venv'."
-            )
-    elif runtime_mode == "singularity":
-        if not singularity_image:
-            raise SystemExit(
-                "ERROR: Set SINGULARITY_IMAGE_PATH when RUNTIME_MODE='singularity'."
-            )
-    default_env = dict(getattr(config, "DEFAULT_ENV", {}))
-    default_sbatch = dict(getattr(config, "DEFAULT_SBATCH", {}))
-    extra_rsync_excludes = [
-        str(item) for item in getattr(config, "EXTRA_RSYNC_EXCLUDES", [])
-    ]
-    extra_rsync_args = [str(item) for item in getattr(config, "EXTRA_RSYNC_ARGS", [])]
-    artifact_paths = ensure_list(getattr(config, "ARTIFACT_PATHS", []))
-    verbose = bool(getattr(config, "VERBOSE", False))
-
-    return LauncherSettings(
-        cluster_login=cluster_login,
-        ssh_config_file=(str(ssh_config_file) if ssh_config_file else None),
-        ssh_options=ssh_options,
-        remote_workspace_base=(
-            str(remote_workspace_base) if remote_workspace_base else None
-        ),
-        remote_log_base_path=str(remote_log_base_path),
-        workspace_mode=workspace_mode,
-        remote_workspace_dir=(
-            str(remote_workspace_dir) if remote_workspace_dir else None
-        ),
-        project_root=local_root,
-        project_prefix=project_prefix,
-        venv_python_executable=(str(venv_python) if venv_python else None),
-        default_env=default_env,
-        default_sbatch=default_sbatch,
-        extra_rsync_excludes=extra_rsync_excludes,
-        extra_rsync_args=extra_rsync_args,
-        remote_slurm_dashboard_log_archive_dir=(
-            str(remote_slurm_dashboard_log_archive_dir)
-            if remote_slurm_dashboard_log_archive_dir
-            else None
-        ),
-        remote_slurm_dashboard_log_view_dir=(
-            str(remote_slurm_dashboard_log_view_dir)
-            if remote_slurm_dashboard_log_view_dir
-            else None
-        ),
-        runtime_mode=runtime_mode,
-        singularity_image_path=(str(singularity_image) if singularity_image else None),
-        singularity_exec_flags=singularity_exec_flags,
-        artifact_paths=artifact_paths,
-        verbose=verbose,
-    )
-
-
-def ensure_list(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return [str(item) for item in value]
-    return [str(value)]
-
-
-def coerce_job(entry: Any) -> JobSpec:
-    if isinstance(entry, JobSpec):
-        return entry
-    if isinstance(entry, dict):
-        name = str(entry["name"])
-        if "python" in entry:
-            raise ValueError(
-                f"Job '{name}' uses unsupported key 'python'. "
-                "Use a single explicit 'command' string."
-            )
-        if "script" in entry or "entrypoint" in entry:
-            raise ValueError(
-                f"Job '{name}' uses unsupported keys ('script'/'entrypoint'). "
-                "Use a single explicit 'command' string."
-            )
-        if "args" in entry or "shell" in entry or "interpreter" in entry:
-            raise ValueError(
-                f"Job '{name}' uses unsupported keys ('args'/'shell'/'interpreter'). "
-                "Use a single explicit 'command' string."
-            )
-        has_command = "command" in entry and bool(str(entry.get("command", "")).strip())
-        has_sbatch_file = "sbatch_file" in entry and bool(
-            str(entry.get("sbatch_file", "")).strip()
-        )
-        if has_command == has_sbatch_file:
-            raise ValueError(
-                f"Job '{name}' must define exactly one of 'command' or 'sbatch_file'."
-            )
-        command = str(entry["command"]) if has_command else None
-        sbatch_file = str(entry["sbatch_file"]) if has_sbatch_file else None
-        return JobSpec(
-            name=name,
-            command=command,
-            sbatch_file=sbatch_file,
-            sbatch_args=ensure_list(entry.get("sbatch_args")),
-            env=dict(entry.get("env") or {}),
-            sbatch=dict(entry.get("sbatch") or {}),
-            setup=ensure_list(entry.get("setup")),
-        )
-    raise TypeError(f"Unsupported job entry: {entry!r}")
-
-
-def prepare_jobs(
-    config: ModuleType, run_only: list[str] | None, default_env: dict[str, Any]
-) -> list[JobSpec]:
-    raw_jobs = getattr(config, "JOBS", None)
-    if not raw_jobs:
-        raise SystemExit("ERROR: Config must define JOBS.")
-    jobs = [coerce_job(entry) for entry in raw_jobs]
-    for job in jobs:
-        if job.uses_sbatch_file():
-            continue
-        job.env = {**default_env, **job.env}
-    return select_jobs(jobs, run_only)
-
-
-def select_jobs(jobs: list[JobSpec], run_only: list[str] | None) -> list[JobSpec]:
-    if not run_only:
-        return jobs
-    wanted = set(run_only)
-    available = {job.name for job in jobs}
-    missing = wanted.difference(available)
-    if missing:
-        raise SystemExit(f"ERROR: Requested jobs not found: {sorted(missing)}")
-    return [job for job in jobs if job.name in wanted]
 
 
 def do_init(args: argparse.Namespace) -> int:
@@ -770,6 +597,58 @@ def _load_run_config(
     return load_config(config_path), config_path
 
 
+def _configured_run_only(
+    config: ModuleType, args: argparse.Namespace
+) -> list[str] | None:
+    return args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
+
+
+def _prepare_configured_jobs(
+    config: ModuleType,
+    settings: LauncherSettings,
+    args: argparse.Namespace,
+    *,
+    fail_duplicate_names: bool = False,
+    validate_predefined_jobs: bool = True,
+) -> list[JobSpec]:
+    jobs = prepare_jobs(config, _configured_run_only(config, args), settings.default_env)
+    if fail_duplicate_names:
+        _fail_duplicate_jobs(jobs)
+    if validate_predefined_jobs:
+        _validate_predefined_sbatch_jobs(settings, jobs)
+    return jobs
+
+
+def _load_execution_context(
+    args: argparse.Namespace,
+    *,
+    json_output: bool,
+    existing_job_folder: bool = False,
+) -> ExecutionContext | None:
+    loaded = _load_run_config(args, quiet_errors=json_output)
+    if loaded is None:
+        return None
+    config, config_path = loaded
+    settings = build_settings(
+        config,
+        config_path,
+        workspace_mode_override=_workspace_mode_from_args(args),
+    )
+    if existing_job_folder:
+        remote_paths = resolve_remote_paths_for_job_folder(
+            settings,
+            job_folder=args.job_folder,
+        )
+    else:
+        remote_paths = resolve_remote_paths(settings)
+    return ExecutionContext(
+        config=config,
+        config_path=config_path,
+        settings=settings,
+        remote_paths=remote_paths,
+    )
+
+
 def _resolve_cluster_context(
     args: argparse.Namespace,
 ) -> tuple[str, str | None, str | None, list[str], Path | None] | None:
@@ -820,15 +699,12 @@ def _emit_command_error(
 ) -> int:
     err_console.print(message, style="bold red")
     if json_output:
-        error_payload: dict[str, Any] = {"ok": False, "error": message}
-        if payload:
-            error_payload.update(payload)
-        console.print_json(data=error_payload)
+        console.print_json(data=error_payload(message, **(payload or {})))
     return 1
 
 
 def _selected_job_names(jobs: list[JobSpec]) -> list[str]:
-    return [job.name for job in jobs]
+    return selected_job_names(jobs)
 
 
 def _monitor_command(
@@ -838,12 +714,11 @@ def _monitor_command(
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
 ) -> str:
-    remote_command = f"squeue -j {','.join(job_ids)}" if job_ids else "squeue -u $USER"
-    return format_ssh_command(
+    return monitor_command(
         cluster_login,
         ssh_config_file=ssh_config_file,
         ssh_options=ssh_options,
-        remote_command=remote_command,
+        job_ids=job_ids,
     )
 
 
@@ -855,85 +730,101 @@ def _collect_submission_results(
     dry_run: bool,
     quiet: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
-    submitted_jobs: list[dict[str, Any]] = []
-    job_records: list[dict[str, Any]] = []
-    commands: list[str] = []
-    for job in jobs:
-        submission = submit_job(
-            settings,
-            remote_paths,
-            job,
-            dry_run=dry_run,
-            quiet=quiet,
-        )
-        commands.extend(submission.commands)
-        record = build_job_record(job, submission, settings)
-        submitted_jobs.append(record)
-        if not dry_run:
-            job_records.append(record)
-    return submitted_jobs, job_records, commands
+    return collect_submission_results(
+        settings,
+        remote_paths,
+        jobs,
+        dry_run=dry_run,
+        quiet=quiet,
+    )
+
+
+def _print_execution_panel(
+    title: str,
+    settings: LauncherSettings,
+    remote_paths: RemotePaths,
+    *,
+    extra_lines: list[str] | None = None,
+    note: str | None = None,
+) -> None:
+    print_execution_panel(
+        console,
+        title,
+        settings,
+        remote_paths,
+        extra_lines=extra_lines,
+        note=note,
+    )
+
+
+def _emit_submission_result(
+    *,
+    json_output: bool,
+    payload: dict[str, Any],
+    settings: LauncherSettings,
+    remote_paths: RemotePaths,
+    tracking_file: Path | None,
+    job_records: list[dict[str, Any]],
+    monitor_cmd: str,
+    dry_run: bool,
+    include_archive_dirs: bool = False,
+) -> int:
+    return emit_submission_result(
+        console,
+        json_output=json_output,
+        payload=payload,
+        settings=settings,
+        remote_paths=remote_paths,
+        tracking_file=tracking_file,
+        job_records=job_records,
+        monitor_cmd=monitor_cmd,
+        dry_run=dry_run,
+        include_archive_dirs=include_archive_dirs,
+    )
 
 
 def do_run(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
-    loaded = _load_run_config(args, quiet_errors=json_output)
-    if loaded is None:
+    context = _load_execution_context(args, json_output=json_output)
+    if context is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH or run 'slurm-launcher init'.",
             json_output=json_output,
             payload={"config_path": None, "dry_run": bool(args.dry_run)},
         )
 
-    config, config_path = loaded
     commands: list[str] = []
     try:
-        settings = build_settings(
-            config,
-            config_path,
-            workspace_mode_override=_workspace_mode_from_args(args),
+        jobs = _prepare_configured_jobs(
+            context.config,
+            context.settings,
+            args,
+            fail_duplicate_names=True,
         )
-        run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
-        jobs = prepare_jobs(config, run_jobs, settings.default_env)
-        _validate_predefined_sbatch_jobs(settings, jobs)
-        remote_paths = resolve_remote_paths(settings)
         if not json_output:
-            console.print()
-            console.print(
-                Panel.fit(
-                    "\n".join(
-                        [
-                            f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                            f"[bold]Workspace:[/bold] {settings.workspace_mode}",
-                            f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
-                        ]
-                    ),
-                    title="Remote Launcher",
-                    border_style="cyan",
-                )
+            _print_execution_panel(
+                "Remote Launcher",
+                context.settings,
+                context.remote_paths,
             )
-            if settings.workspace_mode == "fixed":
-                console.print(
-                    "Using REMOTE_WORKSPACE_DIR as the execution directory.",
-                    style="yellow",
-                )
         test_ssh_connection(
-            settings.cluster_login,
+            context.settings.cluster_login,
             dry_run=args.dry_run,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
+            ssh_config_file=context.settings.ssh_config_file,
+            ssh_options=context.settings.ssh_options,
             quiet=json_output,
         )
         commands.extend(
             sync_project(
-                settings,
-                remote_paths,
+                context.settings,
+                context.remote_paths,
                 dry_run=args.dry_run,
                 quiet=json_output,
             )
         )
         submitted_jobs, job_records, submit_commands = _collect_submission_results(
-            settings,
-            remote_paths,
+            context.settings,
+            context.remote_paths,
             jobs,
             dry_run=args.dry_run,
             quiet=json_output,
@@ -944,7 +835,7 @@ def do_run(args: argparse.Namespace) -> int:
             str(exc),
             json_output=json_output,
             payload={
-                "config_path": str(config_path),
+                "config_path": str(context.config_path),
                 "commands": commands,
                 "dry_run": bool(args.dry_run),
             },
@@ -952,123 +843,69 @@ def do_run(args: argparse.Namespace) -> int:
 
     tracking_file: Path | None = None
     if job_records:
-        tracking_file = write_job_tracking_file(settings, remote_paths, job_records)
+        tracking_file = write_job_tracking_file(
+            context.settings, context.remote_paths, job_records
+        )
 
     job_ids = _collect_job_ids(job_records)
     monitor_cmd = _monitor_command(
-        settings.cluster_login,
+        context.settings.cluster_login,
         job_ids,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
+        ssh_config_file=context.settings.ssh_config_file,
+        ssh_options=context.settings.ssh_options,
     )
-
-    if json_output:
-        console.print_json(
-            data={
-                "ok": True,
-                "config_path": str(config_path),
-                "workspace_mode": settings.workspace_mode,
-                "remote_workdir": remote_paths.workdir,
-                "job_folder": remote_paths.job_folder,
-                "selected_jobs": _selected_job_names(jobs),
-                "submitted_jobs": submitted_jobs,
-                "tracking_file": str(tracking_file) if tracking_file else None,
-                "commands": commands,
-                "monitor_command": monitor_cmd,
-                "dry_run": bool(args.dry_run),
-            }
-        )
-        return 0
-
-    if tracking_file is not None:
-        console.print()
-        console.print(f"Saved job metadata to {tracking_file}", style="green")
-        submitted_table = Table(title="Submitted Jobs")
-        submitted_table.add_column("Job")
-        submitted_table.add_column("Job ID")
-        for record in job_records:
-            submitted_table.add_row(
-                str(record.get("job_name", "")),
-                str(record.get("job_id", "")),
-            )
-        console.print(submitted_table)
-        _print_job_logs_from_records(job_records)
-    elif args.dry_run:
-        console.print()
-        console.print(
-            "Skipped job metadata tracking because --dry-run was used.",
-            style="yellow",
-        )
-
-    details_table = Table.grid(padding=(0, 1))
-    details_table.add_row("Workspace", settings.workspace_mode)
-    details_table.add_row("Remote workdir", remote_paths.workdir)
-    details_table.add_row("Remote logdir", remote_paths.logdir)
-    if settings.remote_slurm_dashboard_log_archive_dir:
-        details_table.add_row(
-            "Remote slurm-dashboard archive dir",
-            settings.remote_slurm_dashboard_log_archive_dir,
-        )
-    if settings.remote_slurm_dashboard_log_view_dir:
-        details_table.add_row(
-            "Remote slurm-dashboard view dir",
-            settings.remote_slurm_dashboard_log_view_dir,
-        )
-    console.print()
-    console.print(details_table)
-    console.print("Monitor jobs with:")
-    console.print(monitor_cmd, style="bold")
-    return 0
+    payload = submission_payload(
+        config_path=context.config_path,
+        workspace_mode=context.settings.workspace_mode,
+        remote_workdir=context.remote_paths.workdir,
+        job_folder=context.remote_paths.job_folder,
+        selected_jobs=_selected_job_names(jobs),
+        submitted_jobs=submitted_jobs,
+        tracking_file=tracking_file,
+        commands=commands,
+        monitor_command=monitor_cmd,
+        dry_run=bool(args.dry_run),
+    )
+    return _emit_submission_result(
+        json_output=json_output,
+        payload=payload,
+        settings=context.settings,
+        remote_paths=context.remote_paths,
+        tracking_file=tracking_file,
+        job_records=job_records,
+        monitor_cmd=monitor_cmd,
+        dry_run=bool(args.dry_run),
+        include_archive_dirs=True,
+    )
 
 
 def do_stage(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
-    loaded = _load_run_config(args, quiet_errors=json_output)
-    if loaded is None:
+    context = _load_execution_context(args, json_output=json_output)
+    if context is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH or run 'slurm-launcher init'.",
             json_output=json_output,
             payload={"config_path": None, "dry_run": bool(args.dry_run)},
         )
 
-    config, config_path = loaded
     try:
-        settings = build_settings(
-            config,
-            config_path,
-            workspace_mode_override=_workspace_mode_from_args(args),
-        )
-        remote_paths = resolve_remote_paths(settings)
         if not json_output:
-            console.print()
-            console.print(
-                Panel.fit(
-                    "\n".join(
-                        [
-                            f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                            f"[bold]Workspace:[/bold] {settings.workspace_mode}",
-                            f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
-                        ]
-                    ),
-                    title="Stage",
-                    border_style="cyan",
-                )
+            _print_execution_panel(
+                "Stage",
+                context.settings,
+                context.remote_paths,
             )
-            if settings.workspace_mode == "fixed":
-                console.print(
-                    "Using REMOTE_WORKSPACE_DIR as the execution directory.",
-                    style="yellow",
-                )
         test_ssh_connection(
-            settings.cluster_login,
+            context.settings.cluster_login,
             dry_run=args.dry_run,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
+            ssh_config_file=context.settings.ssh_config_file,
+            ssh_options=context.settings.ssh_options,
             quiet=json_output,
         )
         commands = sync_project(
-            settings,
-            remote_paths,
+            context.settings,
+            context.remote_paths,
             dry_run=args.dry_run,
             include_logging_dirs=False,
             quiet=json_output,
@@ -1078,30 +915,29 @@ def do_stage(args: argparse.Namespace) -> int:
             str(exc),
             json_output=json_output,
             payload={
-                "config_path": str(config_path),
+                "config_path": str(context.config_path),
                 "dry_run": bool(args.dry_run),
             },
         )
 
     if json_output:
         console.print_json(
-            data={
-                "ok": True,
-                "config_path": str(config_path),
-                "workspace_mode": settings.workspace_mode,
-                "remote_workdir": remote_paths.workdir,
-                "job_folder": remote_paths.job_folder,
-                "commands": commands,
-                "dry_run": bool(args.dry_run),
-            }
+            data=stage_payload(
+                config_path=context.config_path,
+                workspace_mode=context.settings.workspace_mode,
+                remote_workdir=context.remote_paths.workdir,
+                job_folder=context.remote_paths.job_folder,
+                commands=commands,
+                dry_run=bool(args.dry_run),
+            )
         )
         return 0
 
     details_table = Table.grid(padding=(0, 1))
-    details_table.add_row("Workspace", settings.workspace_mode)
-    details_table.add_row("Remote workdir", remote_paths.workdir)
-    if settings.workspace_mode == "per-run":
-        details_table.add_row("Job folder", remote_paths.job_folder)
+    details_table.add_row("Workspace", context.settings.workspace_mode)
+    details_table.add_row("Remote workdir", context.remote_paths.workdir)
+    if context.settings.workspace_mode == "per-run":
+        details_table.add_row("Job folder", context.remote_paths.job_folder)
     console.print()
     console.print(details_table)
     return 0
@@ -1109,61 +945,48 @@ def do_stage(args: argparse.Namespace) -> int:
 
 def do_submit(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
-    loaded = _load_run_config(args, quiet_errors=json_output)
-    if loaded is None:
+    context = _load_execution_context(
+        args,
+        json_output=json_output,
+        existing_job_folder=True,
+    )
+    if context is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH or run 'slurm-launcher init'.",
             json_output=json_output,
             payload={"config_path": None, "dry_run": bool(args.dry_run)},
         )
 
-    config, config_path = loaded
     try:
-        settings = build_settings(
-            config,
-            config_path,
-            workspace_mode_override=_workspace_mode_from_args(args),
-        )
-        if settings.workspace_mode == "per-run" and not args.job_folder:
+        if context.settings.workspace_mode == "per-run" and not args.job_folder:
             raise SystemExit(
                 "ERROR: --job-folder is required for submit-only when --workspace per-run."
             )
-        run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
-        jobs = prepare_jobs(config, run_jobs, settings.default_env)
-        _validate_predefined_sbatch_jobs(settings, jobs)
-        remote_paths = resolve_remote_paths_for_job_folder(
-            settings,
-            job_folder=args.job_folder,
+        jobs = _prepare_configured_jobs(
+            context.config,
+            context.settings,
+            args,
+            fail_duplicate_names=True,
         )
         if not json_output:
-            console.print()
-            console.print(
-                Panel.fit(
-                    "\n".join(
-                        [
-                            f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                            f"[bold]Workspace:[/bold] {settings.workspace_mode}",
-                            f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
-                        ]
-                    ),
-                    title="Submit",
-                    border_style="cyan",
-                )
-            )
-            console.print(
-                "Skipping stage step. Assuming code is already present on the remote workdir.",
-                style="yellow",
+            _print_execution_panel(
+                "Submit",
+                context.settings,
+                context.remote_paths,
+                note=(
+                    "Skipping stage step. Assuming code is already present on the remote workdir."
+                ),
             )
         test_ssh_connection(
-            settings.cluster_login,
+            context.settings.cluster_login,
             dry_run=args.dry_run,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
+            ssh_config_file=context.settings.ssh_config_file,
+            ssh_options=context.settings.ssh_options,
             quiet=json_output,
         )
         submitted_jobs, job_records, commands = _collect_submission_results(
-            settings,
-            remote_paths,
+            context.settings,
+            context.remote_paths,
             jobs,
             dry_run=args.dry_run,
             quiet=json_output,
@@ -1173,85 +996,59 @@ def do_submit(args: argparse.Namespace) -> int:
             str(exc),
             json_output=json_output,
             payload={
-                "config_path": str(config_path),
+                "config_path": str(context.config_path),
                 "dry_run": bool(args.dry_run),
             },
         )
 
     tracking_file: Path | None = None
     if job_records:
-        tracking_file = write_job_tracking_file(settings, remote_paths, job_records)
+        tracking_file = write_job_tracking_file(
+            context.settings, context.remote_paths, job_records
+        )
 
     job_ids = _collect_job_ids(job_records)
     monitor_cmd = _monitor_command(
-        settings.cluster_login,
+        context.settings.cluster_login,
         job_ids,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
+        ssh_config_file=context.settings.ssh_config_file,
+        ssh_options=context.settings.ssh_options,
     )
-
-    if json_output:
-        console.print_json(
-            data={
-                "ok": True,
-                "config_path": str(config_path),
-                "workspace_mode": settings.workspace_mode,
-                "remote_workdir": remote_paths.workdir,
-                "job_folder": remote_paths.job_folder,
-                "selected_jobs": _selected_job_names(jobs),
-                "submitted_jobs": submitted_jobs,
-                "tracking_file": str(tracking_file) if tracking_file else None,
-                "commands": commands,
-                "monitor_command": monitor_cmd,
-                "dry_run": bool(args.dry_run),
-            }
-        )
-        return 0
-
-    if tracking_file is not None:
-        console.print()
-        console.print(f"Saved job metadata to {tracking_file}", style="green")
-        submitted_table = Table(title="Submitted Jobs")
-        submitted_table.add_column("Job")
-        submitted_table.add_column("Job ID")
-        for record in job_records:
-            submitted_table.add_row(
-                str(record.get("job_name", "")),
-                str(record.get("job_id", "")),
-            )
-        console.print(submitted_table)
-        _print_job_logs_from_records(job_records)
-    elif args.dry_run:
-        console.print()
-        console.print(
-            "Skipped job metadata tracking because --dry-run was used.",
-            style="yellow",
-        )
-
-    details_table = Table.grid(padding=(0, 1))
-    details_table.add_row("Workspace", settings.workspace_mode)
-    details_table.add_row("Remote workdir", remote_paths.workdir)
-    details_table.add_row("Remote logdir", remote_paths.logdir)
-    console.print()
-    console.print(details_table)
-    console.print("Monitor jobs with:")
-    console.print(monitor_cmd, style="bold")
-    return 0
+    payload = submission_payload(
+        config_path=context.config_path,
+        workspace_mode=context.settings.workspace_mode,
+        remote_workdir=context.remote_paths.workdir,
+        job_folder=context.remote_paths.job_folder,
+        selected_jobs=_selected_job_names(jobs),
+        submitted_jobs=submitted_jobs,
+        tracking_file=tracking_file,
+        commands=commands,
+        monitor_command=monitor_cmd,
+        dry_run=bool(args.dry_run),
+    )
+    return _emit_submission_result(
+        json_output=json_output,
+        payload=payload,
+        settings=context.settings,
+        remote_paths=context.remote_paths,
+        tracking_file=tracking_file,
+        job_records=job_records,
+        monitor_cmd=monitor_cmd,
+        dry_run=bool(args.dry_run),
+    )
 
 
 def do_sbatch(args: argparse.Namespace) -> int:
-    loaded = _load_run_config(args)
-    if loaded is None:
-        return 1
-    config, config_path = loaded
-
-    try:
-        settings = build_settings(
-            config,
-            config_path,
-            workspace_mode_override=_workspace_mode_from_args(args),
+    json_output = bool(getattr(args, "json", False))
+    context = _load_execution_context(args, json_output=json_output)
+    if context is None:
+        return _emit_command_error(
+            "Config file not found. Pass --config PATH or run 'slurm-launcher init'.",
+            json_output=json_output,
+            payload={"config_path": None, "dry_run": bool(args.dry_run)},
         )
 
+    try:
         job_name = (
             args.name or Path(str(args.sbatch_file)).stem or "sbatch_job"
         ).strip()
@@ -1262,155 +1059,114 @@ def do_sbatch(args: argparse.Namespace) -> int:
             sbatch_file=str(args.sbatch_file),
             sbatch_args=ensure_list(args.sbatch_arg),
         )
-        _validate_predefined_sbatch_file_job(settings, job)
+        _validate_predefined_sbatch_file_job(context.settings, job)
 
         test_ssh_connection(
-            settings.cluster_login,
+            context.settings.cluster_login,
             dry_run=args.dry_run,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
+            ssh_config_file=context.settings.ssh_config_file,
+            ssh_options=context.settings.ssh_options,
+            quiet=json_output,
         )
-        remote_paths = resolve_remote_paths(settings)
-
-        console.print()
-        console.print(
-            Panel.fit(
-                "\n".join(
-                    [
-                        f"[bold]Cluster:[/bold] {settings.cluster_login}",
-                        f"[bold]Workspace:[/bold] {settings.workspace_mode}",
-                        f"[bold]Job folder:[/bold] {remote_paths.job_folder}",
-                        f"[bold]Sbatch file:[/bold] {job.sbatch_file}",
-                    ]
-                ),
-                title="Sbatch",
-                border_style="cyan",
+        if not json_output:
+            _print_execution_panel(
+                "Sbatch",
+                context.settings,
+                context.remote_paths,
+                extra_lines=[f"[bold]Sbatch file:[/bold] {job.sbatch_file}"],
             )
+        stage_commands = sync_project(
+            context.settings,
+            context.remote_paths,
+            dry_run=args.dry_run,
+            quiet=json_output,
         )
-
-        if settings.workspace_mode == "fixed":
-            console.print(
-                "Using REMOTE_WORKSPACE_DIR as the execution directory.",
-                style="yellow",
-            )
-        sync_project(settings, remote_paths, dry_run=args.dry_run)
-
-        submission = submit_job(settings, remote_paths, job, dry_run=args.dry_run)
+        submission = submit_job(
+            context.settings,
+            context.remote_paths,
+            job,
+            dry_run=args.dry_run,
+            quiet=json_output,
+        )
     except (RuntimeError, SystemExit, ValueError) as exc:
-        err_console.print(str(exc), style="bold red")
-        return 1
+        return _emit_command_error(
+            str(exc),
+            json_output=json_output,
+            payload={
+                "config_path": str(context.config_path),
+                "dry_run": bool(args.dry_run),
+            },
+        )
 
     job_records: list[dict[str, Any]] = []
     if not args.dry_run:
-        job_records.append(build_job_record(job, submission, settings))
+        job_records.append(build_job_record(job, submission, context.settings))
 
+    tracking_file: Path | None = None
     if job_records:
-        tracking_file = write_job_tracking_file(settings, remote_paths, job_records)
-        console.print()
-        console.print(f"Saved job metadata to {tracking_file}", style="green")
-        submitted_table = Table(title="Submitted Jobs")
-        submitted_table.add_column("Job")
-        submitted_table.add_column("Job ID")
-        for record in job_records:
-            submitted_table.add_row(
-                str(record.get("job_name", "")),
-                str(record.get("job_id", "")),
-            )
-        console.print(submitted_table)
-        _print_job_logs_from_records(job_records)
-    elif args.dry_run:
-        console.print()
-        console.print(
-            "Skipped job metadata tracking because --dry-run was used.",
-            style="yellow",
+        tracking_file = write_job_tracking_file(
+            context.settings, context.remote_paths, job_records
         )
-
-    details_table = Table.grid(padding=(0, 1))
-    details_table.add_row("Workspace", settings.workspace_mode)
-    details_table.add_row("Remote workdir", remote_paths.workdir)
-    details_table.add_row("Remote logdir", remote_paths.logdir)
-    console.print()
-    console.print(details_table)
     job_ids = _collect_job_ids(job_records)
     monitor_cmd = _monitor_command(
-        settings.cluster_login,
+        context.settings.cluster_login,
         job_ids,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
+        ssh_config_file=context.settings.ssh_config_file,
+        ssh_options=context.settings.ssh_options,
     )
-    console.print("Monitor jobs with:")
-    console.print(monitor_cmd, style="bold")
-    return 0
+    submitted_jobs = [build_job_record(job, submission, context.settings)]
+    payload = submission_payload(
+        config_path=context.config_path,
+        workspace_mode=context.settings.workspace_mode,
+        remote_workdir=context.remote_paths.workdir,
+        job_folder=context.remote_paths.job_folder,
+        selected_jobs=[job.name],
+        submitted_jobs=submitted_jobs,
+        tracking_file=tracking_file,
+        commands=[*stage_commands, *submission.commands],
+        monitor_command=monitor_cmd,
+        dry_run=bool(args.dry_run),
+    )
+    return _emit_submission_result(
+        json_output=json_output,
+        payload=payload,
+        settings=context.settings,
+        remote_paths=context.remote_paths,
+        tracking_file=tracking_file,
+        job_records=job_records,
+        monitor_cmd=monitor_cmd,
+        dry_run=bool(args.dry_run),
+    )
 
 
 def _fail_duplicate_jobs(jobs: list[JobSpec]) -> None:
-    seen: set[str] = set()
-    duplicates: set[str] = set()
-    for job in jobs:
-        if job.name in seen:
-            duplicates.add(job.name)
-        seen.add(job.name)
-    if duplicates:
-        raise SystemExit(f"ERROR: Duplicate job names found: {sorted(duplicates)}")
+    fail_duplicate_jobs(jobs)
 
 
 def _fail_if_not_absolute(label: str, value: str | None) -> None:
-    if value is None:
-        return
-    if not str(value).startswith("/"):
-        raise SystemExit(f"ERROR: {label} must be an absolute path. Got: {value!r}")
+    fail_if_not_absolute(label, value)
 
 
 def _resolve_local_sbatch_file_path(
     settings: LauncherSettings, sbatch_file: str
 ) -> Path | None:
-    return resolve_local_project_path(settings.project_root, sbatch_file)
+    return resolve_local_sbatch_file_path(settings, sbatch_file)
 
 
 def _validate_predefined_sbatch_file_job(
     settings: LauncherSettings, job: JobSpec
 ) -> None:
-    if not job.sbatch_file:
-        return
-    local_path = _resolve_local_sbatch_file_path(settings, job.sbatch_file)
-    if local_path is None:
-        raise SystemExit(
-            f"ERROR: Job '{job.name}' sbatch_file must stay inside LOCAL_ROOT. "
-            f"Got: {job.sbatch_file!r}"
-        )
-    if not local_path.exists():
-        raise SystemExit(
-            f"ERROR: Job '{job.name}' sbatch_file not found in LOCAL_ROOT: {local_path}"
-        )
+    validate_predefined_sbatch_file_job(settings, job)
 
 
 def _validate_predefined_sbatch_jobs(
     settings: LauncherSettings, jobs: list[JobSpec]
 ) -> None:
-    for job in jobs:
-        if job.uses_sbatch_file():
-            _validate_predefined_sbatch_file_job(settings, job)
+    validate_predefined_sbatch_jobs(settings, jobs)
 
 
 def _remote_runtime_checks(settings: LauncherSettings) -> list[str]:
-    commands: list[str] = []
-    if settings.runtime_mode == "venv" and settings.venv_python_executable:
-        venv_python = settings.venv_python_executable
-        activate = str(Path(venv_python).parent / "activate")
-        commands.extend(
-            [
-                f"test -f {activate}",
-                f"test -x {venv_python}",
-            ]
-        )
-    if settings.runtime_mode == "singularity" and settings.singularity_image_path:
-        commands.extend(
-            [
-                "command -v singularity >/dev/null 2>&1",
-                f"test -f {settings.singularity_image_path}",
-            ]
-        )
-    return commands
+    return remote_runtime_checks(settings)
 
 
 def do_validate(args: argparse.Namespace) -> int:
@@ -1419,19 +1175,20 @@ def do_validate(args: argparse.Namespace) -> int:
         return _emit_command_error(
             "ERROR: --check-remote-paths requires --ssh.",
             json_output=json_output,
-            payload={
-                "config_path": str(args.config) if args.config else None,
-                "workspace_mode": _workspace_mode_from_args(args),
-                "selected_jobs": list(args.only or []),
-                "warnings": [],
-                "errors": ["ERROR: --check-remote-paths requires --ssh."],
-                "ssh_checked": bool(args.ssh),
-                "remote_checks": {
+            payload=validate_payload(
+                ok=False,
+                config_path=Path(str(args.config)) if args.config else None,
+                workspace_mode=_workspace_mode_from_args(args),
+                selected_jobs=list(args.only or []),
+                warnings=[],
+                errors=["ERROR: --check-remote-paths requires --ssh."],
+                ssh_checked=bool(args.ssh),
+                remote_checks={
                     "requested": bool(args.check_remote_paths),
                     "checks": [],
                     "ok": False,
                 },
-            },
+            ),
         )
 
     config_arg = str(args.config) if args.config else None
@@ -1440,19 +1197,20 @@ def do_validate(args: argparse.Namespace) -> int:
         return _emit_command_error(
             "Config file not found. Pass --config PATH.",
             json_output=json_output,
-            payload={
-                "config_path": None,
-                "workspace_mode": _workspace_mode_from_args(args),
-                "selected_jobs": list(args.only or []),
-                "warnings": [],
-                "errors": ["Config file not found. Pass --config PATH."],
-                "ssh_checked": bool(args.ssh),
-                "remote_checks": {
+            payload=validate_payload(
+                ok=False,
+                config_path=None,
+                workspace_mode=_workspace_mode_from_args(args),
+                selected_jobs=list(args.only or []),
+                warnings=[],
+                errors=["Config file not found. Pass --config PATH."],
+                ssh_checked=bool(args.ssh),
+                remote_checks={
                     "requested": bool(args.check_remote_paths),
                     "checks": [],
                     "ok": False,
                 },
-            },
+            ),
         )
 
     selected_jobs = list(args.only or [])
@@ -1471,10 +1229,14 @@ def do_validate(args: argparse.Namespace) -> int:
             workspace_mode_override=workspace_mode,
         )
         workspace_mode = settings.workspace_mode
-        run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
-        jobs = prepare_jobs(config, run_jobs, settings.default_env)
+        jobs = _prepare_configured_jobs(
+            config,
+            settings,
+            args,
+            fail_duplicate_names=True,
+            validate_predefined_jobs=False,
+        )
         selected_jobs = _selected_job_names(jobs)
-        _fail_duplicate_jobs(jobs)
 
         _fail_if_not_absolute("REMOTE_LOG_BASE_PATH", settings.remote_log_base_path)
         if settings.workspace_mode == "per-run":
@@ -1530,29 +1292,30 @@ def do_validate(args: argparse.Namespace) -> int:
         return _emit_command_error(
             str(exc),
             json_output=json_output,
-            payload={
-                "config_path": str(config_path),
-                "workspace_mode": workspace_mode,
-                "selected_jobs": selected_jobs,
-                "warnings": [],
-                "errors": [str(exc)],
-                "ssh_checked": bool(args.ssh),
-                "remote_checks": remote_checks,
-            },
+            payload=validate_payload(
+                ok=False,
+                config_path=config_path,
+                workspace_mode=workspace_mode,
+                selected_jobs=selected_jobs,
+                warnings=[],
+                errors=[str(exc)],
+                ssh_checked=bool(args.ssh),
+                remote_checks=remote_checks,
+            ),
         )
 
     if json_output:
         console.print_json(
-            data={
-                "ok": True,
-                "config_path": str(config_path),
-                "workspace_mode": settings.workspace_mode,
-                "selected_jobs": selected_jobs,
-                "warnings": [],
-                "errors": [],
-                "ssh_checked": bool(args.ssh),
-                "remote_checks": remote_checks,
-            }
+            data=validate_payload(
+                ok=True,
+                config_path=config_path,
+                workspace_mode=settings.workspace_mode,
+                selected_jobs=selected_jobs,
+                warnings=[],
+                errors=[],
+                ssh_checked=bool(args.ssh),
+                remote_checks=remote_checks,
+            )
         )
         return 0
 
@@ -1596,10 +1359,12 @@ def do_render(args: argparse.Namespace) -> int:
             config_path,
             workspace_mode_override=_workspace_mode_from_args(args),
         )
-        run_jobs = args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
-        jobs = prepare_jobs(config, run_jobs, settings.default_env)
-        _fail_duplicate_jobs(jobs)
-        _validate_predefined_sbatch_jobs(settings, jobs)
+        jobs = _prepare_configured_jobs(
+            config,
+            settings,
+            args,
+            fail_duplicate_names=True,
+        )
         remote_paths = resolve_remote_paths(settings)
     except (RuntimeError, SystemExit, ValueError) as exc:
         return _emit_command_error(
@@ -1661,15 +1426,14 @@ def do_render(args: argparse.Namespace) -> int:
 
     if json_output:
         console.print_json(
-            data={
-                "ok": True,
-                "config_path": str(config_path),
-                "workspace_mode": settings.workspace_mode,
-                "selected_jobs": _selected_job_names(jobs),
-                "rendered_jobs": rendered_jobs,
-                "job_scripts": job_scripts,
-                "sbatch_scripts": sbatch_scripts,
-            }
+            data=render_payload(
+                config_path=config_path,
+                workspace_mode=settings.workspace_mode,
+                selected_jobs=_selected_job_names(jobs),
+                rendered_jobs=rendered_jobs,
+                job_scripts=job_scripts,
+                sbatch_scripts=sbatch_scripts,
+            )
         )
         return 0
 
@@ -1750,7 +1514,7 @@ def do_logs(args: argparse.Namespace) -> int:
     selected = payload.filter_jobs(names=set(args.only) if args.only else None)
 
     if args.json:
-        console.print_json(data=_tracking_payload_to_dict(payload, selected))
+        console.print_json(data=tracking_payload_to_dict(payload, selected))
         return 0
 
     console.print(
@@ -1776,73 +1540,11 @@ def do_logs(args: argparse.Namespace) -> int:
 
 
 def _collect_job_ids(records: list[dict[str, Any]]) -> list[str]:
-    return [
-        str(record.get("job_id", "") or "")
-        for record in records
-        if str(record.get("job_id", "") or "") not in {"", "unknown", "dry-run"}
-    ]
-
-
-def _tracking_payload_to_dict(
-    payload: TrackingPayload,
-    jobs: list[JobRecord | dict[str, object]],
-) -> dict[str, Any]:
-    job_dicts = []
-    for job in jobs:
-        if isinstance(job, JobRecord):
-            entry: dict[str, Any] = {
-                "job_name": job.job_name,
-                "job_id": job.job_id,
-                "stdout": job.stdout,
-                "stderr": job.stderr,
-            }
-            if job.sbatch_command:
-                entry["sbatch_command"] = job.sbatch_command
-            if job.remote_sbatch:
-                entry["remote_sbatch"] = job.remote_sbatch
-            if job.submitted_at:
-                entry["submitted_at"] = job.submitted_at
-            if job.launcher:
-                entry["launcher"] = job.launcher
-            job_dicts.append(entry)
-        else:
-            job_dicts.append(job)
-    return {
-        "created_at": payload.created_at,
-        "cluster_login": payload.cluster_login,
-        "ssh_config_file": payload.ssh_config_file,
-        "ssh_options": payload.ssh_options,
-        "job_folder": payload.job_folder,
-        "remote_workdir": payload.remote_workdir,
-        "remote_logdir": payload.remote_logdir,
-        "remote_slurm_output_dir": payload.remote_slurm_output_dir,
-        "jobs": job_dicts,
-    }
+    return collect_job_ids(records)
 
 
 def _print_job_logs_from_records(jobs: list[JobRecord | dict[str, object]]) -> None:
-    console.print()
-    console.print(Panel.fit("Remote Logs", border_style="cyan"))
-    for index, job in enumerate(jobs):
-        if isinstance(job, JobRecord):
-            job_name = job.job_name
-            job_id = job.job_id
-            stdout_path = job.stdout or ""
-            stderr_path = job.stderr or ""
-        else:
-            job_name = str(job.get("job_name", "") or "")
-            job_id = str(job.get("job_id", "") or "")
-            stdout_path = str(job.get("stdout", "") or "")
-            stderr_path = str(job.get("stderr", "") or "")
-        job_label = f"{job_name} ({job_id})" if job_id else job_name
-        console.print(f"[bold]{job_label}[/bold]")
-        console.print(f"stdout: {stdout_path or '-'}", soft_wrap=True)
-        console.print(
-            f"stderr: {stderr_path if stderr_path and stderr_path != stdout_path else '-'}",
-            soft_wrap=True,
-        )
-        if index < len(jobs) - 1:
-            console.print()
+    print_job_logs_from_records(console, jobs)
 
 
 def do_monitor(args: argparse.Namespace) -> int:
@@ -1852,12 +1554,13 @@ def do_monitor(args: argparse.Namespace) -> int:
         return _emit_command_error(
             "No tracking file found. Run a non-dry submission first or pass --tracking-file.",
             json_output=json_output,
-            payload={
-                "tracking_file": None,
-                "job_ids": [],
-                "command": None,
-                "dry_run": bool(args.dry_run),
-            },
+            payload=monitor_payload(
+                ok=False,
+                tracking_file=None,
+                job_ids=[],
+                command=None,
+                dry_run=bool(args.dry_run),
+            ),
         )
 
     try:
@@ -1866,24 +1569,26 @@ def do_monitor(args: argparse.Namespace) -> int:
         return _emit_command_error(
             str(exc),
             json_output=json_output,
-            payload={
-                "tracking_file": str(tracking_path),
-                "job_ids": [],
-                "command": None,
-                "dry_run": bool(args.dry_run),
-            },
+            payload=monitor_payload(
+                ok=False,
+                tracking_file=tracking_path,
+                job_ids=[],
+                command=None,
+                dry_run=bool(args.dry_run),
+            ),
         )
 
     if not payload.cluster_login:
         return _emit_command_error(
             f"Missing cluster_login in tracking file: {tracking_path}",
             json_output=json_output,
-            payload={
-                "tracking_file": str(tracking_path),
-                "job_ids": [],
-                "command": None,
-                "dry_run": bool(args.dry_run),
-            },
+            payload=monitor_payload(
+                ok=False,
+                tracking_file=tracking_path,
+                job_ids=[],
+                command=None,
+                dry_run=bool(args.dry_run),
+            ),
         )
 
     selected = payload.filter_jobs(names=set(args.only) if args.only else None)
@@ -1892,12 +1597,13 @@ def do_monitor(args: argparse.Namespace) -> int:
         return _emit_command_error(
             "No runnable job IDs found in tracking file selection.",
             json_output=json_output,
-            payload={
-                "tracking_file": str(tracking_path),
-                "job_ids": [],
-                "command": None,
-                "dry_run": bool(args.dry_run),
-            },
+            payload=monitor_payload(
+                ok=False,
+                tracking_file=tracking_path,
+                job_ids=[],
+                command=None,
+                dry_run=bool(args.dry_run),
+            ),
         )
 
     remote_command = f"squeue -j {','.join(job_ids)}"
@@ -1910,13 +1616,13 @@ def do_monitor(args: argparse.Namespace) -> int:
     command = shlex.join(ssh_cmd)
 
     if json_output:
-        result_payload: dict[str, Any] = {
-            "ok": True,
-            "tracking_file": str(tracking_path),
-            "job_ids": job_ids,
-            "command": command,
-            "dry_run": bool(args.dry_run),
-        }
+        result_payload = monitor_payload(
+            ok=True,
+            tracking_file=tracking_path,
+            job_ids=job_ids,
+            command=command,
+            dry_run=bool(args.dry_run),
+        )
         if not args.dry_run:
             result = subprocess.run(
                 ssh_cmd,
@@ -1924,11 +1630,18 @@ def do_monitor(args: argparse.Namespace) -> int:
                 text=True,
                 check=False,
             )
-            result_payload["ok"] = result.returncode == 0
-            result_payload["returncode"] = result.returncode
-            result_payload["stdout"] = result.stdout
-            result_payload["stderr"] = result.stderr
-            console.print_json(data=result_payload)
+            console.print_json(
+                data=monitor_payload(
+                    ok=result.returncode == 0,
+                    tracking_file=tracking_path,
+                    job_ids=job_ids,
+                    command=command,
+                    dry_run=bool(args.dry_run),
+                    returncode=result.returncode,
+                    stdout=result.stdout,
+                    stderr=result.stderr,
+                )
+            )
             return result.returncode
         console.print_json(data=result_payload)
         return 0
@@ -1953,14 +1666,14 @@ def do_doctor(args: argparse.Namespace) -> int:
         config_path,
     ) = resolved
     effective_archive, archive_source = effective_archive_dir(archive_dir)
-    payload: dict[str, Any] = {
-        "cluster_login": cluster_login,
-        "config_path": str(config_path) if config_path else None,
-        "ssh_config_file": ssh_config_file,
-        "ssh_options": ssh_options,
-        "archive_dir": effective_archive,
-        "archive_dir_source": archive_source,
-    }
+    payload = doctor_payload(
+        cluster_login=cluster_login,
+        config_path=config_path,
+        ssh_config_file=ssh_config_file,
+        ssh_options=ssh_options,
+        archive_dir=effective_archive,
+        archive_dir_source=archive_source,
+    )
 
     if args.ssh:
         try:
@@ -2005,8 +1718,16 @@ def do_doctor(args: argparse.Namespace) -> int:
                 continue
             name, status = line.split("=", 1)
             remote_tools[name.strip()] = status.strip()
-        payload["ssh_ok"] = True
-        payload["remote_tools"] = remote_tools
+        payload = doctor_payload(
+            cluster_login=cluster_login,
+            config_path=config_path,
+            ssh_config_file=ssh_config_file,
+            ssh_options=ssh_options,
+            archive_dir=effective_archive,
+            archive_dir_source=archive_source,
+            ssh_ok=True,
+            remote_tools=remote_tools,
+        )
 
     if args.json:
         console.print_json(data=payload)
@@ -2044,11 +1765,13 @@ def do_jobs(args: argparse.Namespace) -> int:
     if resolved is None:
         return 1
     cluster_login, _, ssh_config_file, ssh_options, _ = resolved
+    states = {str(state) for state in args.state if str(state).strip()} or None
     return list_recent_jobs(
         cluster_login,
         user=args.user,
         hours=args.hours,
         limit=args.limit,
+        states=states,
         json_output=args.json,
         ssh_config_file=ssh_config_file,
         ssh_options=ssh_options,
@@ -2097,34 +1820,26 @@ def do_download_artifacts(args: argparse.Namespace) -> int:
     return run_download_artifacts(args)
 
 
-def main() -> int:
-    args = parse_args()
-    if hasattr(args, "command") and args.command == "init":
-        return do_init(args)
-    if hasattr(args, "command") and args.command == "logs":
-        return do_logs(args)
-    if hasattr(args, "command") and args.command == "download-logs":
-        return do_download_logs(args)
-    if hasattr(args, "command") and args.command == "download-artifacts":
-        return do_download_artifacts(args)
-    if hasattr(args, "command") and args.command == "monitor":
-        return do_monitor(args)
-    if hasattr(args, "command") and args.command == "jobs":
-        return do_jobs(args)
-    if hasattr(args, "command") and args.command == "job-show":
-        return do_job_show(args)
-    if hasattr(args, "command") and args.command == "job-log":
-        return do_job_log(args)
-    if hasattr(args, "command") and args.command == "doctor":
-        return do_doctor(args)
-    if hasattr(args, "command") and args.command == "validate":
-        return do_validate(args)
-    if hasattr(args, "command") and args.command == "render":
-        return do_render(args)
-    if hasattr(args, "command") and args.command == "stage":
-        return do_stage(args)
-    if hasattr(args, "command") and args.command == "submit":
-        return do_submit(args)
-    if hasattr(args, "command") and args.command == "sbatch":
-        return do_sbatch(args)
-    return do_run(args)
+COMMAND_HANDLERS = {
+    "doctor": do_doctor,
+    "download-artifacts": do_download_artifacts,
+    "download-logs": do_download_logs,
+    "init": do_init,
+    "job-log": do_job_log,
+    "job-show": do_job_show,
+    "jobs": do_jobs,
+    "logs": do_logs,
+    "monitor": do_monitor,
+    "render": do_render,
+    "run": do_run,
+    "sbatch": do_sbatch,
+    "stage": do_stage,
+    "submit": do_submit,
+    "validate": do_validate,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    command = getattr(args, "command", None) or DEFAULT_COMMAND
+    return COMMAND_HANDLERS[command](args)

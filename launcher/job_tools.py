@@ -68,6 +68,7 @@ class JobDetails:
     start_time: str | None
     end_time: str | None
     source: str
+    detail_level: str = "full"
     launcher: LauncherInfo | None = None
 
 
@@ -132,17 +133,18 @@ def _job_details_from_sacct(output: str, job_id: str) -> JobDetails | None:
         line = raw_line.strip()
         if not line:
             continue
-        parts = [part.strip() for part in line.split("|")]
-        if len(parts) < 14:
+        parts = [part.strip() for part in line.split("|", 13)]
+        if len(parts) < 13:
             continue
         if parts[0] != job_id:
             continue
+        command = _normalized_text(parts[13]) if len(parts) > 13 else None
         return JobDetails(
             job_id=parts[0],
             job_name=_normalized_text(parts[1]),
             state=_normalized_text(parts[2]),
             partition=_normalized_text(parts[3]),
-            command=_normalized_text(parts[13]),
+            command=command,
             work_dir=_normalized_text(parts[10]),
             stdout=resolve_log_path(_normalized_text(parts[11]), job_id),
             stderr=resolve_log_path(_normalized_text(parts[12]), job_id),
@@ -180,7 +182,33 @@ def _merge_job_details(primary: JobDetails, secondary: JobDetails) -> JobDetails
         start_time=pick(primary.start_time, secondary.start_time),
         end_time=pick(primary.end_time, secondary.end_time),
         source=source,
+        detail_level=(
+            "full"
+            if "full" in {primary.detail_level, secondary.detail_level}
+            else primary.detail_level
+        ),
         launcher=primary.launcher or secondary.launcher,
+    )
+
+
+def _job_details_from_log_info(info: JobLogInfo) -> JobDetails:
+    return JobDetails(
+        job_id=info.job_id,
+        job_name=info.job_name or None,
+        state=info.state or None,
+        partition=None,
+        command=None,
+        work_dir=None,
+        stdout=info.stdout,
+        stderr=info.stderr,
+        node_list=None,
+        num_nodes=None,
+        gres=None,
+        submit_time=None,
+        start_time=None,
+        end_time=None,
+        source=info.source,
+        detail_level="log-resolution",
     )
 
 
@@ -293,7 +321,33 @@ def resolve_job_details(
 
     details = scontrol_details or sacct_details
     if details is None:
-        return None
+        scontrol_log_info = (
+            _job_log_info_from_scontrol(scontrol_result.stdout, job_id)
+            if scontrol_result.returncode == 0
+            else None
+        )
+        if scontrol_log_info is not None:
+            details = _job_details_from_log_info(scontrol_log_info)
+        else:
+            sacct_log_result = _run_ssh_capture(
+                cluster_login,
+                (
+                    "command -v sacct >/dev/null 2>&1 && "
+                    f"sacct -X -n -P -j {shlex.quote(job_id)} "
+                    "--format JobIDRaw,JobName,State,StdOut,StdErr"
+                ),
+                ssh_config_file=ssh_config_file,
+                ssh_options=ssh_options,
+            )
+            if sacct_log_result.returncode == 0:
+                sacct_log_info = _job_log_info_from_sacct(
+                    sacct_log_result.stdout,
+                    job_id,
+                )
+                if sacct_log_info is not None:
+                    details = _job_details_from_log_info(sacct_log_info)
+        if details is None:
+            return None
     if scontrol_details is not None and sacct_details is not None:
         details = _merge_job_details(scontrol_details, sacct_details)
     if not enrich_launcher:
@@ -323,21 +377,18 @@ def resolve_job_details(
         start_time=details.start_time,
         end_time=details.end_time,
         source=details.source,
+        detail_level=details.detail_level,
         launcher=launcher,
     )
 
 
 def _job_details_payload(details: JobDetails) -> dict[str, Any]:
-    launcher = None
-    if details.launcher is not None:
-        launcher = {
-            "managed": details.launcher.managed,
-            "runtime_kind": details.launcher.runtime_kind,
-            "runtime_artifact": details.launcher.runtime_artifact,
-            "entry_command": details.launcher.entry_command,
-        }
-    return {
+    payload: dict[str, Any] = {
         "job_id": details.job_id,
+        "resolved_via": details.source,
+        "detail_level": details.detail_level,
+    }
+    optional_fields = {
         "job_name": details.job_name,
         "state": details.state,
         "partition": details.partition,
@@ -351,8 +402,21 @@ def _job_details_payload(details: JobDetails) -> dict[str, Any]:
         "submit_time": details.submit_time,
         "start_time": details.start_time,
         "end_time": details.end_time,
-        "launcher": launcher,
     }
+    for field_name, value in optional_fields.items():
+        if value is not None:
+            payload[field_name] = value
+    launcher = None
+    if details.launcher is not None:
+        launcher = {
+            "managed": details.launcher.managed,
+            "runtime_kind": details.launcher.runtime_kind,
+            "runtime_artifact": details.launcher.runtime_artifact,
+            "entry_command": details.launcher.entry_command,
+        }
+    if launcher is not None:
+        payload["launcher"] = launcher
+    return payload
 
 
 def effective_archive_dir(archive_dir: str | None) -> tuple[str, str]:
@@ -427,6 +491,28 @@ def _parse_recent_jobs(output: str, *, source: str) -> list[RecentJob]:
     return jobs
 
 
+def _normalized_state_token(state: str) -> str:
+    normalized = state.strip().upper()
+    if not normalized:
+        return ""
+    return normalized.split()[0]
+
+
+def _filter_recent_jobs(
+    jobs: list[RecentJob],
+    *,
+    states: set[str] | None,
+) -> list[RecentJob]:
+    if not states:
+        return jobs
+    normalized_states = {_normalized_state_token(state) for state in states if state}
+    return [
+        job
+        for job in jobs
+        if _normalized_state_token(job.state) in normalized_states
+    ]
+
+
 def _recent_jobs_sort_key(job: RecentJob) -> tuple[str, str, str, str]:
     return (job.submit, job.start, job.end, job.job_id)
 
@@ -437,6 +523,7 @@ def list_recent_jobs(
     user: str | None,
     hours: int,
     limit: int,
+    states: set[str] | None,
     json_output: bool,
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
@@ -488,6 +575,7 @@ def list_recent_jobs(
         output = result.stdout
 
     jobs = _parse_recent_jobs(output, source=source)
+    jobs = _filter_recent_jobs(jobs, states=states)
     jobs.sort(key=_recent_jobs_sort_key, reverse=True)
     jobs = jobs[:limit]
 
@@ -496,6 +584,7 @@ def list_recent_jobs(
         "user": user or "$USER",
         "hours": hours,
         "limit": limit,
+        "states": sorted(states) if states else [],
         "source": source,
         "jobs": [
             {
@@ -523,6 +612,7 @@ def list_recent_jobs(
                     f"[bold]User:[/bold] {user or '$USER'}",
                     f"[bold]Source:[/bold] {source}",
                     f"[bold]Window:[/bold] last {hours}h",
+                    f"[bold]States:[/bold] {', '.join(sorted(states)) if states else 'all'}",
                 ]
             ),
             title="Recent Jobs",

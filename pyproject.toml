@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 dependencies = [
     "rich>=14.3.2",
     "ruff>=0.15.0",
+    "vulture>=2.16",
 ]
 
 [project.scripts]

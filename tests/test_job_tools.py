@@ -58,6 +58,7 @@ class JobToolsTests(unittest.TestCase):
             user=None,
             hours=24,
             limit=5,
+            states=None,
             json_output=True,
             ssh_config_file="/dev/null",
             ssh_options=["-o", "BatchMode=yes"],
@@ -69,6 +70,39 @@ class JobToolsTests(unittest.TestCase):
         self.assertEqual(kwargs["ssh_config_file"], "/dev/null")
         self.assertEqual(kwargs["ssh_options"], ["-o", "BatchMode=yes"])
         mock_print_json.assert_called_once()
+
+    @patch("launcher.job_tools.console.print_json")
+    @patch("launcher.job_tools._run_ssh_capture")
+    def test_list_recent_jobs_filters_by_leading_state_token(
+        self,
+        mock_run_ssh_capture,
+        mock_print_json,
+    ) -> None:
+        mock_run_ssh_capture.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "__SOURCE__=sacct\n"
+                "1|job-a|RUNNING|acc|2026-03-26T12:00:00|2026-03-26T12:00:01|Unknown|00:01:00\n"
+                "2|job-b|CANCELLED by 4840|acc|2026-03-26T11:00:00|2026-03-26T11:01:00|2026-03-26T11:02:00|00:01:00\n"
+            ),
+            stderr="",
+        )
+
+        exit_code = list_recent_jobs(
+            "user@cluster",
+            user=None,
+            hours=24,
+            limit=5,
+            states={"cancelled"},
+            json_output=True,
+        )
+
+        self.assertEqual(exit_code, 0)
+        payload = mock_print_json.call_args.kwargs["data"]
+        self.assertEqual(payload["states"], ["cancelled"])
+        self.assertEqual(len(payload["jobs"]), 1)
+        self.assertEqual(payload["jobs"][0]["job_id"], "2")
 
     @patch("launcher.job_tools._launcher_info_from_script")
     @patch("launcher.job_tools._launcher_info_from_tracking")
@@ -124,7 +158,59 @@ class JobToolsTests(unittest.TestCase):
         self.assertEqual(payload["stdout"], "/tmp/38238485.out")
         self.assertEqual(payload["stderr"], "/tmp/38238485.err")
         self.assertEqual(payload["gres"], "gpu:1")
-        self.assertIsNone(payload["launcher"])
+        self.assertEqual(payload["resolved_via"], "scontrol+sacct")
+        self.assertEqual(payload["detail_level"], "full")
+        self.assertNotIn("launcher", payload)
+
+    @patch("launcher.job_tools._launcher_info_from_script")
+    @patch("launcher.job_tools._launcher_info_from_tracking")
+    @patch("launcher.job_tools.console.print_json")
+    @patch("launcher.job_tools._run_ssh_capture")
+    def test_show_job_details_falls_back_to_log_resolution_for_finished_jobs(
+        self,
+        mock_run_ssh_capture,
+        mock_print_json,
+        mock_launcher_info_from_tracking,
+        mock_launcher_info_from_script,
+    ) -> None:
+        mock_run_ssh_capture.side_effect = [
+            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="38238485|job|FAILED|acc|2026-03-26T12:00:00|2026-03-26T12:00:01|2026-03-26T12:30:00|node01|1|gpu:1|/remote/workdir|/tmp/%j.out",
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="38238485|job|FAILED|/tmp/%j.out|/tmp/%j.err",
+                stderr="",
+            ),
+        ]
+        mock_launcher_info_from_tracking.return_value = None
+        mock_launcher_info_from_script.return_value = None
+
+        exit_code = show_job_details(
+            "user@cluster",
+            "38238485",
+            json_output=True,
+            ssh_config_file="/dev/null",
+            ssh_options=["-o", "BatchMode=yes"],
+        )
+
+        self.assertEqual(exit_code, 0)
+        payload = mock_print_json.call_args.kwargs["data"]
+        self.assertEqual(payload["job_id"], "38238485")
+        self.assertEqual(payload["job_name"], "job")
+        self.assertEqual(payload["state"], "FAILED")
+        self.assertEqual(payload["stdout"], "/tmp/38238485.out")
+        self.assertEqual(payload["stderr"], "/tmp/38238485.err")
+        self.assertEqual(payload["resolved_via"], "sacct")
+        self.assertEqual(payload["detail_level"], "log-resolution")
+        self.assertNotIn("partition", payload)
+        self.assertNotIn("command", payload)
+        self.assertNotIn("launcher", payload)
 
     def test_launcher_info_from_tracking_reads_latest_tracking_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

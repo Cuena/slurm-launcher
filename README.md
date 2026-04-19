@@ -19,9 +19,13 @@ The launcher is SLURM-cluster agnostic, but the bundled examples are MN5-oriente
 ## Repository layout
 
 - `launcher/`: launcher package (`slurm-launcher ...` after tool install, or `uv run slurm-launcher ...`)
+- `launcher/command_specs.py`: shared public command metadata used by parser help, tests, and agent docs
+- `launcher/payloads.py`: shared JSON payload builders for machine-readable command output
 - `launcher/templates/config.py.template`: starter config copied by `init`
 - `examples/remote_launcher_config.demo.py`: minimal dry-run example
 - `examples/remote_launcher_config.mn5.example.py`: MN5-oriented example
+
+`launcher/command_specs.py` is the source of truth for command summaries, JSON-capable examples, and the expected machine-readable fields. This README keeps the human workflow shorter on purpose.
 
 ## Requirements
 
@@ -161,6 +165,7 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher submit --workspace fixed`: submit only against fixed workspace
 - `slurm-launcher sbatch slurm/train.sbatch`: stage + submit one existing sbatch file
 - `slurm-launcher sbatch slurm/train.sbatch --sbatch-arg --export=ALL,SEED=1`: pass extra sbatch args
+- `slurm-launcher sbatch slurm/train.sbatch --dry-run --json`: machine-readable dry-run for one sbatch file
 - `slurm-launcher run --json`: print run result payload as JSON
 - `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
 - `slurm-launcher logs --json`: print full tracking payload
@@ -170,13 +175,6 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher monitor`: run `squeue` for tracked job IDs from the latest run
 - `slurm-launcher monitor --dry-run`: print the monitoring command only
 - `slurm-launcher monitor --json`: print the monitor command contract as JSON
-- `slurm-launcher jobs`: show recent SLURM jobs directly from the cluster
-- `slurm-launcher job-show 12345678`: show generic SLURM details for one job id
-- `slurm-launcher job-show 12345678 --json`: print generic job details as JSON
-- `slurm-launcher job-log 12345678`: tail stdout for a SLURM job id directly from the cluster
-- `slurm-launcher job-log 12345678 --json`: print structured log resolution as JSON
-- `slurm-launcher job-log 12345678 --stream stderr --follow`: follow stderr for a job id
-- `slurm-launcher doctor`: show effective generic config and optional SSH checks
 
 ## Download logs locally
 
@@ -237,6 +235,8 @@ directly over SSH, which makes them useful even for jobs not launched by this re
 - Show generic details for one job id:
   - `slurm-launcher job-show 36114735`
   - `slurm-launcher job-show 36114735 --json`
+  - JSON always includes `job_id`, `resolved_via`, and `detail_level`
+  - when only log resolution is available, unresolved fields are omitted instead of emitted as `null`
 - Read stdout for a job id:
   - `slurm-launcher job-log 36114735`
 - Print structured log resolution without reading the file:

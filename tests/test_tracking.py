@@ -206,7 +206,6 @@ class RunnableJobIdsTests(unittest.TestCase):
             venv_python_executable=None,
             singularity_image_path=None,
             artifact_paths=[],
-            local_project_root=None,
             jobs=jobs,
         )
         self.assertEqual(payload.runnable_job_ids(), ["12345", "67890"])
@@ -232,7 +231,6 @@ class RunnableJobIdsTests(unittest.TestCase):
             venv_python_executable=None,
             singularity_image_path=None,
             artifact_paths=[],
-            local_project_root=None,
             jobs=jobs,
         )
         self.assertEqual(payload.runnable_job_ids([jobs[1]]), [])
