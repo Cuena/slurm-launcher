@@ -26,6 +26,8 @@ class CliTests(unittest.TestCase):
             "jobs",
             "job-show",
             "job-log",
+            "download-logs",
+            "download-artifacts",
         ]
         for command in commands:
             argv = ["slurm-launcher", command, "--json"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import tempfile
 import unittest
@@ -120,6 +121,32 @@ class DownloadLogsWorkflowTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
 
+    def test_download_logs_json_dry_run_reports_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracking = write_tracking_file(
+                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
+            )
+            args = argparse.Namespace(
+                tracking_file=str(tracking),
+                job_name=["train"],
+                job_id=[],
+                output_dir=str(Path(tmpdir) / "out"),
+                dry_run=True,
+                json=True,
+            )
+            with patch("builtins.print") as mock_print:
+                exit_code = run_download_logs(args)
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(mock_print.call_args.args[0])
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["tracking_file"], str(tracking))
+        self.assertEqual(payload["selected_jobs"][0]["job_name"], "train")
+        self.assertEqual(len(payload["downloads"]), 2)
+        self.assertEqual(len(payload["commands"]), 2)
+        self.assertIn("rsync -az", payload["commands"][0])
+        self.assertEqual(payload["dry_run"], True)
+
 
 class DownloadArtifactsWorkflowTests(unittest.TestCase):
     """Tests download-artifacts through the canonical tracking boundary."""
@@ -175,6 +202,31 @@ class DownloadArtifactsWorkflowTests(unittest.TestCase):
                 exit_code = run_download_artifacts(args)
 
         self.assertEqual(exit_code, 1)
+
+    def test_download_artifacts_json_dry_run_reports_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracking = write_tracking_file(
+                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
+            )
+            args = argparse.Namespace(
+                tracking_file=str(tracking),
+                path=["custom/path"],
+                output_dir=str(Path(tmpdir) / "out"),
+                dry_run=True,
+                json=True,
+            )
+            with patch("builtins.print") as mock_print:
+                exit_code = run_download_artifacts(args)
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(mock_print.call_args.args[0])
+        self.assertEqual(payload["ok"], True)
+        self.assertEqual(payload["tracking_file"], str(tracking))
+        self.assertEqual(payload["artifact_paths"], ["custom/path"])
+        self.assertEqual(payload["artifacts"][0]["path"], "custom/path")
+        self.assertEqual(len(payload["commands"]), 1)
+        self.assertIn("rsync -az", payload["commands"][0])
+        self.assertEqual(payload["dry_run"], True)
 
 
 class SbatchErrorWrapperTests(unittest.TestCase):
