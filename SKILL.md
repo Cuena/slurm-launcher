@@ -33,12 +33,19 @@ Keep this skill aligned with those files when the source repo changes.
 3. Prefer JSON-capable commands for agent workflows.
 - For agents, default to `--json` whenever the command supports it.
 - Read content only after a discovery step. Example: use `job-log --json` before `job-log --follow`.
+- Do not omit `--json` because the plain text looks easier; the JSON fields are the stable contract for agents.
 
 4. Use dry-run before costly or risky remote actions.
 - Prefer `stage --dry-run --json`, `submit --dry-run --json`, `sbatch --dry-run --json`, or `run --dry-run --json` before live submission.
+- Prefer `download-logs --dry-run --json` and `download-artifacts --dry-run --json` before copying files.
 
 5. Treat SSH or sandbox failures as environment issues first.
 - If an SSH-backed command fails in the sandbox, retry with escalation before assuming the cluster or repo is broken.
+
+6. Avoid raw SSH and rsync when a launcher command exists.
+- Do not run manual `ssh ... squeue`, `ssh ... sacct`, `ssh ... find`, `ssh ... du`, or `rsync` for launcher-managed jobs before trying the matching `slurm-launcher` command.
+- Use `jobs`, `job-show`, `job-log`, `logs`, `monitor`, `download-logs`, and `download-artifacts` to resolve locations, status, logs, and downloads.
+- Use raw SSH only when the launcher command cannot answer the request, and state why.
 
 ## Decision Guide
 
@@ -69,8 +76,8 @@ Use this quick mapping before choosing a command.
 - “Are tracked jobs still queued/running?”:
   `slurm-launcher monitor --json`
 - “Download tracked logs/artifacts locally”:
-  `slurm-launcher download-logs --dry-run`
-  `slurm-launcher download-artifacts --dry-run`
+  `slurm-launcher download-logs --dry-run --json`
+  `slurm-launcher download-artifacts --dry-run --json`
 
 ## Config Model
 
@@ -365,15 +372,19 @@ Each command below lists the purpose, when to use it, recommended agent invocati
 - Use when:
   Remote log paths are already known from tracking and a local copy is needed.
 - Recommended for agents:
-  `slurm-launcher download-logs --dry-run`
+  `slurm-launcher download-logs --dry-run --json`
+  `slurm-launcher download-logs --json`
 - Key arguments:
   `--tracking-file`
   repeatable `--job-name`
   repeatable `--job-id`
   `--output-dir`
   `--dry-run`
-- Output model:
-  Plain text only. It prints the selected files and the exact rsync commands.
+  `--json`
+- JSON fields:
+  `ok`, `tracking_file`, `cluster_login`, `selected_jobs`, `downloads`, `commands`, `output_dir`, `dry_run`, `failures`
+- Important behavior:
+  Use the returned `commands` and `downloads` instead of constructing `rsync` manually.
 
 ### `download-artifacts`
 
@@ -382,14 +393,18 @@ Each command below lists the purpose, when to use it, recommended agent invocati
 - Use when:
   Outputs, checkpoints, or reports need to be copied back locally after a run.
 - Recommended for agents:
-  `slurm-launcher download-artifacts --dry-run`
+  `slurm-launcher download-artifacts --dry-run --json`
+  `slurm-launcher download-artifacts --path outputs/metrics.json --json`
 - Key arguments:
   `--tracking-file`
   repeatable `--path`
   `--output-dir`
   `--dry-run`
-- Output model:
-  Plain text only. It prints selected artifact paths and rsync commands.
+  `--json`
+- JSON fields:
+  `ok`, `tracking_file`, `cluster_login`, `remote_workdir`, `artifact_paths`, `artifacts`, `commands`, `output_dir`, `dry_run`, `failures`
+- Important behavior:
+  Use `--path` for targeted downloads and the returned `artifacts`/`commands` fields instead of remote `find`, `du`, or manual `rsync`.
 
 ## Recommended Agent Loop
 
@@ -417,13 +432,14 @@ Each command below lists the purpose, when to use it, recommended agent invocati
 - `monitor --json`
 - `job-show <job_id> --json`
 - `job-log <job_id> --json`
-- `download-logs --dry-run`
-- `download-artifacts --dry-run`
+- `download-logs --dry-run --json`
+- `download-artifacts --dry-run --json`
 
 ## Guardrails
 
 - Do not invent wrappers when the installed CLI should work.
 - Do not assume project commands work outside the intended repo.
 - Do not read full logs before first resolving the path and stream intentionally.
+- Do not use raw SSH or rsync for status, log lookup, or artifact downloads until the launcher command path has been tried.
 - Do not treat launcher enrichment as required for generic cluster inspection.
 - Do not modify this source repository unless the user explicitly asks for source changes.

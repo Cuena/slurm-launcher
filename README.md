@@ -170,7 +170,9 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
 - `slurm-launcher logs --json`: print full tracking payload
 - `slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
+- `slurm-launcher download-logs --dry-run --json`: inspect log download plan for agents
 - `slurm-launcher download-artifacts`: download configured artifact paths from latest run
+- `slurm-launcher download-artifacts --dry-run --json`: inspect artifact download plan for agents
 - `slurm-launcher download-artifacts --path outputs --path checkpoints/best.pt`: override configured artifact paths
 - `slurm-launcher monitor`: run `squeue` for tracked job IDs from the latest run
 - `slurm-launcher monitor --dry-run`: print the monitoring command only
@@ -190,6 +192,8 @@ Use `download-logs` to fetch remote `.out/.err` files recorded in a tracking fil
   - `slurm-launcher download-logs --tracking-file slurm_output/<job_folder>/jobs.json`
 - Preview rsync commands without downloading:
   - `slurm-launcher download-logs --dry-run`
+- Preview machine-readable download plan:
+  - `slurm-launcher download-logs --dry-run --json`
 
 Script compatibility:
 
@@ -209,6 +213,8 @@ Use `download-artifacts` to fetch outputs or checkpoints from the tracked remote
   - `slurm-launcher download-artifacts --tracking-file slurm_output/<job_folder>/jobs.json`
 - Preview rsync commands without downloading:
   - `slurm-launcher download-artifacts --dry-run`
+- Preview machine-readable download plan:
+  - `slurm-launcher download-artifacts --dry-run --json`
 
 Path rules:
 
