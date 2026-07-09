@@ -20,6 +20,9 @@ REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR: str | None = None
 REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 
 PROJECT_NAME = "slurm-launcher-demo"
+ARTIFACT_PATHS: list[str] = ["outputs"]
+LOCAL_ARTIFACT_ROOT: str | None = None
+SYNC_SYMLINKS: str | None = "preserve"
 
 RUNTIME_MODE = "native"  # native | venv | singularity
 VENV_PYTHON_EXECUTABLE: str | None = None
@@ -58,9 +61,12 @@ JOBS = [
         "name": "eval",
         "command": "python3 examples/demo_eval.py --config configs/eval.yaml --ckpt checkpoints/latest.pt",
         "env": {"EXPERIMENT_NAME": "eval"},
+        "artifacts": ["outputs/eval"],
+        "requires": ["checkpoints/latest.pt", "configs/eval.yaml"],
     },
     {
         "name": "shell_example",
         "command": "srun bash scripts/run_eval.sh --config-name eval",
+        "setup": ["export GPUS_PER_NODE=1"],
     },
 ]
