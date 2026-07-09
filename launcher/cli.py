@@ -95,12 +95,26 @@ err_console = Console(stderr=True)
 GENERIC_CONFIG_PATH = Path.home() / ".config" / "slurm-launcher" / "config.py"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class ExecutionContext:
     config: ModuleType
     config_path: Path
     settings: LauncherSettings
     remote_paths: RemotePaths
+
+    @property
+    def latest_tracking_file(self) -> Path | None:
+        from .tracking import resolve_tracking_file
+
+        return resolve_tracking_file(None)
+
+    def tracking_payload(self) -> "TrackingPayload":
+        from .tracking import load_tracking_payload
+
+        path = self.latest_tracking_file
+        if path is None:
+            raise RuntimeError("No tracking file found.")
+        return load_tracking_payload(path)
 
 
 def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
@@ -178,9 +192,15 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
 
     preflight_parser = subparsers.add_parser(
         "preflight",
-        help="Check remote prerequisites for selected jobs before submitting.",
+        help=COMMAND_SPECS["preflight"].summary,
     )
     _add_preflight_args(preflight_parser)
+
+    summary_parser = subparsers.add_parser(
+        "summary",
+        help=COMMAND_SPECS["summary"].summary,
+    )
+    _add_summary_args(summary_parser)
 
     render_parser = subparsers.add_parser(
         "render",
@@ -393,6 +413,15 @@ def _add_preflight_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Print the preflight check script without running it.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable JSON result.",
+    )
+
+
+def _add_summary_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
     parser.add_argument(
         "--json",
         action="store_true",
@@ -1290,6 +1319,53 @@ def _remote_runtime_checks(settings: LauncherSettings) -> list[str]:
     return remote_runtime_checks(settings)
 
 
+def do_summary(args: argparse.Namespace) -> int:
+    json_output = bool(args.json)
+    context = _load_execution_context(args, json_output=json_output)
+    if context is None:
+        return _emit_command_error(
+            "Config file not found. Pass --config PATH.",
+            json_output=json_output,
+            payload={"config_path": None},
+        )
+
+    from .summary import update_summary_from_status
+
+    tracking_file = context.latest_tracking_file
+    if tracking_file is None:
+        return _emit_command_error(
+            "No tracking file found.",
+            json_output=json_output,
+            payload={"config_path": str(context.config_path)},
+        )
+
+    try:
+        summary_path = update_summary_from_status(
+            context.settings,
+            context.remote_paths,
+            load_tracking_payload(tracking_file),
+        )
+    except (RuntimeError, SystemExit, ValueError) as exc:
+        return _emit_command_error(
+            str(exc),
+            json_output=json_output,
+            payload={"config_path": str(context.config_path)},
+        )
+
+    if json_output:
+        console.print_json(
+            data={
+                "ok": True,
+                "summary_path": str(summary_path),
+                "config_path": str(context.config_path),
+            }
+        )
+        return 0
+
+    console.print(f"Summary updated: {summary_path}", style="green")
+    return 0
+
+
 def do_preflight(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
     context = _load_execution_context(args, json_output=json_output)
@@ -2136,6 +2212,7 @@ COMMAND_HANDLERS = {
     "stage": do_stage,
     "status": do_status,
     "submit": do_submit,
+    "summary": do_summary,
     "validate": do_validate,
 }
 

@@ -118,6 +118,20 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "slurm-launcher validate --ssh --check-remote-paths --json",
         ),
     ),
+    "summary": CommandSpec(
+        summary="Write/update a post-run summary.json from the latest run.",
+        agent_recommendation="Use after `run` to persist current job states in a local summary file.",
+        supports_json=True,
+        json_fields=(
+            "ok",
+            "summary_path",
+            "config_path",
+        ),
+        examples=(
+            "slurm-launcher summary",
+            "slurm-launcher summary --json",
+        ),
+    ),
     "preflight": CommandSpec(
         summary="Check remote prerequisites for selected jobs before submitting.",
         agent_recommendation="Prefer `preflight --dry-run --json` first; fail loud on missing globs or broken symlinks.",

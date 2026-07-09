@@ -109,10 +109,13 @@ Use these command groups consistently:
   - `slurm-launcher sbatch`
   - `slurm-launcher run`
 - Project tracking and retrieval:
+  - `slurm-launcher status`
   - `slurm-launcher logs`
   - `slurm-launcher monitor`
   - `slurm-launcher download-logs`
   - `slurm-launcher download-artifacts`
+  - `slurm-launcher artifacts`
+  - `slurm-launcher summary`
 
 Only `doctor`, `jobs`, `job-show`, and `job-log` are intended to work as generic cluster tools from any directory.
 The execution commands above assume you are in the target project repo or passed the intended repo config.
@@ -135,12 +138,15 @@ Recommended execution loop for humans and coding agents:
    - `slurm-launcher run`
    - or split flow: `slurm-launcher stage`, then `slurm-launcher submit ...`
 4. Inspect and retrieve:
+   - `slurm-launcher status`
    - `slurm-launcher logs`
    - `slurm-launcher monitor`
    - `slurm-launcher job-show <job_id>`
    - `slurm-launcher job-log <job_id>`
    - `slurm-launcher download-logs`
    - `slurm-launcher download-artifacts`
+   - `slurm-launcher artifacts list` / `slurm-launcher artifacts download`
+   - `slurm-launcher summary`
 
 ## Common commands
 
@@ -154,6 +160,9 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher validate --json`: print validation results as one JSON object
 - `slurm-launcher validate --ssh`: validate config and test SSH connectivity
 - `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
+- `slurm-launcher validate`: also prints non-fatal warnings about missing artifacts, excluded requirements, GPU jobs without prerequisites, etc.
+- `slurm-launcher preflight --only <job>`: run remote prerequisite checks (`requires` paths and model validators) before submitting
+- `slurm-launcher preflight --dry-run --only <job>`: print the preflight script without executing it
 - `slurm-launcher render`: print generated sbatch scripts without submission
 - `slurm-launcher render --json`: print rendered job metadata and scripts as JSON
 - `slurm-launcher render --only train`: render only a subset of jobs
@@ -167,13 +176,26 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher sbatch slurm/train.sbatch --sbatch-arg --export=ALL,SEED=1`: pass extra sbatch args
 - `slurm-launcher sbatch slurm/train.sbatch --dry-run --json`: machine-readable dry-run for one sbatch file
 - `slurm-launcher run --json`: print run result payload as JSON
+- `slurm-launcher status`: show SLURM status for tracked jobs from latest run
+- `slurm-launcher status --json`: print job status as JSON
+- `slurm-launcher status <job_id>`: query one job by id
 - `slurm-launcher logs`: show tracked `.out/.err` paths from latest run
 - `slurm-launcher logs --json`: print full tracking payload
+- `slurm-launcher logs --latest`: stream latest stdout
+- `slurm-launcher logs --follow`: stream live stdout
+- `slurm-launcher logs --lines 100`: tail last 100 lines
+- `slurm-launcher logs --stderr`: inspect stderr instead
 - `slurm-launcher download-logs`: download tracked `.out/.err` files from latest run
 - `slurm-launcher download-logs --dry-run --json`: inspect log download plan for agents
 - `slurm-launcher download-artifacts`: download configured artifact paths from latest run
 - `slurm-launcher download-artifacts --dry-run --json`: inspect artifact download plan for agents
 - `slurm-launcher download-artifacts --path outputs --path checkpoints/best.pt`: override configured artifact paths
+- `slurm-launcher artifacts list`: list artifacts declared by tracked jobs
+- `slurm-launcher artifacts list --json`: print artifact list as JSON
+- `slurm-launcher artifacts download`: download declared artifacts with rsync
+- `slurm-launcher artifacts download --dry-run --json`: preview download plan
+- `slurm-launcher artifacts download --only train eval`: download only selected jobs
+- `slurm-launcher summary`: write/update local summary.json with current job states
 - `slurm-launcher monitor`: run `squeue` for tracked job IDs from the latest run
 - `slurm-launcher monitor --dry-run`: print the monitoring command only
 - `slurm-launcher monitor --json`: print the monitor command contract as JSON

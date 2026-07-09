@@ -69,6 +69,7 @@ class CommandContractTests(unittest.TestCase):
                 "stage",
                 "status",
                 "submit",
+                "summary",
                 "validate",
             },
         )
