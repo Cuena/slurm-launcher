@@ -102,20 +102,6 @@ class ExecutionContext:
     settings: LauncherSettings
     remote_paths: RemotePaths
 
-    @property
-    def latest_tracking_file(self) -> Path | None:
-        from .tracking import resolve_tracking_file
-
-        return resolve_tracking_file(None)
-
-    def tracking_payload(self) -> "TrackingPayload":
-        from .tracking import load_tracking_payload
-
-        path = self.latest_tracking_file
-        if path is None:
-            raise RuntimeError("No tracking file found.")
-        return load_tracking_payload(path)
-
 
 def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     parser = argparse.ArgumentParser(
@@ -409,6 +395,13 @@ def _add_preflight_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
     _add_job_selection_arg(parser)
     parser.add_argument(
+        "--job-folder",
+        help=(
+            "Existing per-run folder to check. Required in per-run mode; "
+            "optional in fixed mode."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the preflight check script without running it.",
@@ -422,6 +415,13 @@ def _add_preflight_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_summary_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    parser.add_argument(
+        "--tracking-file",
+        help=(
+            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
+            "or the most recent slurm_output/*/jobs.json."
+        ),
+    )
     parser.add_argument(
         "--json",
         action="store_true",
@@ -446,6 +446,11 @@ def _add_render_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_status_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    parser.add_argument(
+        "job_id_arg",
+        nargs="?",
+        help="Query status for a single SLURM job id (positional alternative to --job).",
+    )
     parser.add_argument(
         "--tracking-file",
         help=(
@@ -1321,8 +1326,9 @@ def _remote_runtime_checks(settings: LauncherSettings) -> list[str]:
 
 def do_summary(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
-    context = _load_execution_context(args, json_output=json_output)
-    if context is None:
+    config_arg = str(args.config) if args.config else None
+    config_path = _resolve_config_path(config_arg)
+    if config_path is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH.",
             json_output=json_output,
@@ -1331,25 +1337,34 @@ def do_summary(args: argparse.Namespace) -> int:
 
     from .summary import update_summary_from_status
 
-    tracking_file = context.latest_tracking_file
+    tracking_file = resolve_tracking_file(args.tracking_file)
     if tracking_file is None:
         return _emit_command_error(
             "No tracking file found.",
             json_output=json_output,
-            payload={"config_path": str(context.config_path)},
+            payload={"config_path": str(config_path)},
         )
 
     try:
+        payload = load_tracking_payload(tracking_file)
+        if not payload.remote_workdir:
+            raise ValueError(f"Missing remote_workdir in {tracking_file}")
+        remote_paths = RemotePaths(
+            job_folder=payload.job_folder,
+            workdir=payload.remote_workdir,
+            logdir=payload.remote_logdir or "",
+            slurm_output_dir=payload.remote_slurm_output_dir or "",
+        )
         summary_path = update_summary_from_status(
-            context.settings,
-            context.remote_paths,
-            load_tracking_payload(tracking_file),
+            build_settings(load_config(config_path), config_path),
+            remote_paths,
+            payload,
         )
     except (RuntimeError, SystemExit, ValueError) as exc:
         return _emit_command_error(
             str(exc),
             json_output=json_output,
-            payload={"config_path": str(context.config_path)},
+            payload={"config_path": str(config_path)},
         )
 
     if json_output:
@@ -1357,7 +1372,7 @@ def do_summary(args: argparse.Namespace) -> int:
             data={
                 "ok": True,
                 "summary_path": str(summary_path),
-                "config_path": str(context.config_path),
+                "config_path": str(config_path),
             }
         )
         return 0
@@ -1368,36 +1383,57 @@ def do_summary(args: argparse.Namespace) -> int:
 
 def do_preflight(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
-    context = _load_execution_context(args, json_output=json_output)
-    if context is None:
+    dry_run = bool(args.dry_run)
+    config_arg = str(args.config) if args.config else None
+    config_path = _resolve_config_path(config_arg)
+    if config_path is None:
         return _emit_command_error(
             "Config file not found. Pass --config PATH or run 'slurm-launcher init'.",
             json_output=json_output,
-            payload={"config_path": None, "dry_run": bool(args.dry_run)},
+            payload={"config_path": None, "dry_run": dry_run},
         )
 
     try:
+        config = load_config(config_path)
+        settings = build_settings(
+            config,
+            config_path,
+            workspace_mode_override=_workspace_mode_from_args(args),
+        )
+        if args.job_folder:
+            remote_paths = resolve_remote_paths_for_job_folder(
+                settings,
+                job_folder=args.job_folder,
+            )
+        elif settings.workspace_mode == "per-run":
+            raise ValueError(
+                "In per-run mode preflight requires --job-folder. "
+                "Stage first with `slurm-launcher stage`, then pass the folder name."
+            )
+        else:
+            remote_paths = resolve_remote_paths(settings)
+
         jobs = _prepare_configured_jobs(
-            context.config,
-            context.settings,
+            config,
+            settings,
             args,
             fail_duplicate_names=True,
         )
         return run_preflight(
-            context.settings,
-            context.remote_paths,
+            settings,
+            remote_paths,
             jobs,
-            selected_jobs=_configured_run_only(context.config, args),
+            selected_jobs=_configured_run_only(config, args),
             json_output=json_output,
-            dry_run=bool(args.dry_run),
+            dry_run=dry_run,
         )
     except (RuntimeError, SystemExit, ValueError) as exc:
         return _emit_command_error(
             str(exc),
             json_output=json_output,
             payload={
-                "config_path": str(context.config_path),
-                "dry_run": bool(args.dry_run),
+                "config_path": str(config_path),
+                "dry_run": dry_run,
             },
         )
 
@@ -1771,9 +1807,17 @@ def do_status(args: argparse.Namespace) -> int:
     cluster_login, ssh_config_file, ssh_options, _ = _resolve_cluster_login_from_args(
         args
     )
+    positional_job_id = getattr(args, "job_id_arg", None)
+    flag_job_id = args.job_id
+    if positional_job_id and flag_job_id and positional_job_id != flag_job_id:
+        err_console.print(
+            "ERROR: --job and positional job_id must match.", style="bold red"
+        )
+        return 1
+    effective_job_id = flag_job_id or positional_job_id
     return run_status(
         tracking_file=args.tracking_file,
-        job_id=args.job_id,
+        job_id=effective_job_id,
         cluster_login=cluster_login,
         ssh_config_file=ssh_config_file,
         ssh_options=ssh_options,

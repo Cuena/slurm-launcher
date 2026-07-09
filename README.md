@@ -161,8 +161,9 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher validate --ssh`: validate config and test SSH connectivity
 - `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
 - `slurm-launcher validate`: also prints non-fatal warnings about missing artifacts, excluded requirements, GPU jobs without prerequisites, etc.
-- `slurm-launcher preflight --only <job>`: run remote prerequisite checks (`requires` paths and model validators) before submitting
+- `slurm-launcher preflight --only <job>`: run remote prerequisite checks (`requires` paths and globs) before submitting
 - `slurm-launcher preflight --dry-run --only <job>`: print the preflight script without executing it
+- `slurm-launcher preflight --job-folder <folder>`: check an already staged per-run workspace
 - `slurm-launcher render`: print generated sbatch scripts without submission
 - `slurm-launcher render --json`: print rendered job metadata and scripts as JSON
 - `slurm-launcher render --only train`: render only a subset of jobs

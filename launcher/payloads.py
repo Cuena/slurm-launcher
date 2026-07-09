@@ -184,8 +184,6 @@ def tracking_payload_to_dict(
                 entry["artifacts"] = job.artifacts
             if job.requires:
                 entry["requires"] = job.requires
-            if job.validators:
-                entry["validators"] = job.validators
             job_dicts.append(entry)
             continue
         job_dicts.append(job)

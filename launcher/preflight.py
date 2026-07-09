@@ -5,7 +5,6 @@ from __future__ import annotations
 import shlex
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -13,7 +12,6 @@ from rich.panel import Panel
 from rich.table import Table
 
 from .core import LauncherSettings, RemotePaths, build_ssh_command
-from .validators import ValidationIssue, run_validator
 
 console = Console()
 err_console = Console(stderr=True)
@@ -37,7 +35,6 @@ class PreflightResult:
     job_name: str
     ok: bool
     checks: list[PreflightCheck] = field(default_factory=list)
-    validator_issues: list[ValidationIssue] = field(default_factory=list)
 
 
 def _run_ssh_capture(
@@ -68,7 +65,7 @@ def build_remote_check_script(
     remote_workdir: str,
     requirements: list[str],
 ) -> str:
-    """Build a bash script that checks requirements on the remote workspace.
+    """Build a bash script that checks generic requirements on the remote workspace.
 
     For each requirement:
       - If it contains a glob character (*, ?, [), count matches and fail on zero.
@@ -91,8 +88,12 @@ def build_remote_check_script(
         lines.append(f'    echo "CHECK_OK|{req}|matched $count"')
         lines.append('  fi')
         lines.append('else')
+        # Detect broken symlinks: -L without -e means a symlink pointing to a missing target.
         lines.append(f'  if [ -e {quoted} ]; then')
         lines.append(f'    echo "CHECK_OK|{req}|exists"')
+        lines.append(f'  elif [ -L {quoted} ]; then')
+        lines.append(f'    echo "CHECK_FAIL|{req}|broken symlink"')
+        lines.append('    failed=1')
         lines.append('  else')
         lines.append(f'    echo "CHECK_FAIL|{req}|missing"')
         lines.append('    failed=1')
@@ -122,80 +123,39 @@ def run_preflight_for_job(
     remote_paths: RemotePaths,
     job_name: str,
     requirements: list[str],
-    validators: list[str],
     *,
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
 ) -> PreflightResult:
     """Run remote preflight checks for one job."""
     checks: list[PreflightCheck] = []
-    if not requirements and not validators:
+    if not requirements:
         return PreflightResult(job_name=job_name, ok=True, checks=checks)
 
-    if requirements:
-        script = build_remote_check_script(remote_paths.workdir, requirements)
-        result = _run_ssh_capture(
-            settings.cluster_login,
-            script,
-            ssh_config_file=ssh_config_file or settings.ssh_config_file,
-            ssh_options=ssh_options or settings.ssh_options,
-        )
-        parsed = _parse_check_output(result.stdout)
-        for req in requirements:
-            ok, message = parsed.get(req, (False, "check did not return"))
-            checks.append(
-                PreflightCheck(
-                    kind="require",
-                    path=req,
-                    remote_path=f"{remote_paths.workdir}/{req.lstrip('/')}",
-                    ok=ok,
-                    message=message,
-                )
+    script = build_remote_check_script(remote_paths.workdir, requirements)
+    result = _run_ssh_capture(
+        settings.cluster_login,
+        script,
+        ssh_config_file=ssh_config_file or settings.ssh_config_file,
+        ssh_options=ssh_options or settings.ssh_options,
+    )
+    parsed = _parse_check_output(result.stdout)
+    for req in requirements:
+        ok, message = parsed.get(req, (False, "check did not return"))
+        checks.append(
+            PreflightCheck(
+                kind="require",
+                path=req,
+                remote_path=f"{remote_paths.workdir}/{req.lstrip('/')}",
+                ok=ok,
+                message=message,
             )
+        )
 
-    validator_issues: list[ValidationIssue] = []
-    for validator_name in validators:
-        # Resolve validator target relative to remote workdir.
-        target = validator_name
-        if "=" in validator_name:
-            name, _, target = validator_name.partition("=")
-        else:
-            name = target
-            target = remote_paths.workdir
-        # Local validators cannot inspect remote paths directly, so we only run
-        # them when the target is a local path that corresponds to the staged workdir.
-        # For remote-only targets, we issue an informational check.
-        local_target = Path(target)
-        if local_target.is_absolute() and local_target.exists():
-            issues = run_validator(name, target)
-        elif not local_target.is_absolute():
-            candidate = settings.project_root / target
-            if candidate.exists():
-                issues = run_validator(name, str(candidate))
-            else:
-                issues = [
-                    ValidationIssue(
-                        name,
-                        target,
-                        "Validator skipped: local path not staged yet. Run preflight after staging.",
-                    )
-                ]
-        else:
-            issues = [
-                ValidationIssue(
-                    name,
-                    target,
-                    "Validator skipped: target is remote-only. Run check on the cluster.",
-                )
-            ]
-        validator_issues.extend(issues)
-
-    all_ok = all(check.ok for check in checks) and not validator_issues
     return PreflightResult(
         job_name=job_name,
-        ok=all_ok,
+        ok=all(check.ok for check in checks),
         checks=checks,
-        validator_issues=validator_issues,
     )
 
 
@@ -215,31 +175,48 @@ def run_preflight(
         wanted = set(selected_jobs)
         jobs = [job for job in jobs if getattr(job, "name", "") in wanted]
 
+    dry_run_entries: list[dict[str, Any]] = []
     results: list[PreflightResult] = []
     for job in jobs:
         requirements = list(getattr(job, "requires", []) or [])
-        validators = list(getattr(job, "validators", []) or [])
-        if not requirements and not validators:
+        if not requirements:
             continue
         if dry_run:
             script = build_remote_check_script(remote_paths.workdir, requirements)
-            console.print(
-                f"[yellow]dry-run[/yellow] preflight for {job.name}", style="dim"
-            )
-            console.print(script, style="dim")
+            if json_output:
+                dry_run_entries.append(
+                    {
+                        "job_name": job.name,
+                        "requirements": requirements,
+                        "script": script,
+                    }
+                )
+            else:
+                console.print(
+                    f"[yellow]dry-run[/yellow] preflight for {job.name}", style="dim"
+                )
+                console.print(script, style="dim")
             continue
         result = run_preflight_for_job(
             settings,
             remote_paths,
             job.name,
             requirements,
-            validators,
             ssh_config_file=ssh_config_file,
             ssh_options=ssh_options,
         )
         results.append(result)
 
     if dry_run:
+        if json_output:
+            console.print_json(
+                data={
+                    "ok": True,
+                    "dry_run": True,
+                    "remote_workdir": remote_paths.workdir,
+                    "jobs": dry_run_entries,
+                }
+            )
         return 0
 
     if json_output:
@@ -261,14 +238,6 @@ def run_preflight(
                             }
                             for check in result.checks
                         ],
-                        "validator_issues": [
-                            {
-                                "validator": issue.validator,
-                                "path": issue.path,
-                                "message": issue.message,
-                            }
-                            for issue in result.validator_issues
-                        ],
                     }
                     for result in results
                 ],
@@ -284,7 +253,7 @@ def run_preflight(
         )
     )
     if not results:
-        console.print("No jobs with requirements or validators.", style="yellow")
+        console.print("No jobs with requirements.", style="yellow")
         return 0
 
     for result in results:
@@ -307,10 +276,6 @@ def run_preflight(
                     style=None if check.ok else "red",
                 )
             console.print(table)
-        for issue in result.validator_issues:
-            console.print(
-                f"  [red]VALIDATOR[/red] {issue.validator}: {issue.path} - {issue.message}"
-            )
 
     if any(not result.ok for result in results):
         err_console.print("\nPreflight failed. Fix issues before submitting.", style="bold red")

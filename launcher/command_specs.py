@@ -142,8 +142,8 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "jobs",
         ),
         examples=(
-            "slurm-launcher preflight --only sam3_batch_quality_all_clips --dry-run --json",
-            "slurm-launcher preflight --json",
+            "slurm-launcher preflight --only eval --dry-run --json",
+            "slurm-launcher preflight --job-folder run_20250101_120000 --json",
         ),
     ),
     "render": CommandSpec(

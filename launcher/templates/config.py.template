@@ -54,9 +54,9 @@ REQUIRE_CLEAN_GIT = False
 # singularity: wrap each job with singularity exec <flags> <image> ...
 RUNTIME_MODE = "native"  # native | venv | singularity
 
-# Optional local model/data validator names. Known validators: rfdetr, sam3.
-# These are checked by `preflight` when the target path exists locally.
-DEFAULT_VALIDATORS: list[str] = []
+# Generic prerequisites checked on the remote workspace by `preflight`.
+# Each entry is a plain path or glob relative to the remote workdir.
+DEFAULT_REQUIRES: list[str] = []
 
 VENV_PYTHON_EXECUTABLE: str | None = None
 SINGULARITY_IMAGE_PATH: str | None = None
@@ -155,9 +155,8 @@ JOBS = [
         # Artifacts discovered by `artifacts list/download` for this job.
         "artifacts": ["outputs/train"],
         # Remote paths the job expects (checked by `preflight`).
+        # Plain paths, globs, and symlinks are supported.
         "requires": ["data/processed", "models/base.pt"],
-        # Named model validators or custom target checks.
-        # "validators": ["rfdetr=models/rfdetr"],
     },
     # Explicit shell script command.
     {

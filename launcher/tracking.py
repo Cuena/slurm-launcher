@@ -23,7 +23,6 @@ class JobRecord:
     launcher: dict[str, object] | None = None
     artifacts: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
-    validators: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -128,7 +127,6 @@ def _parse_job_record(raw: object) -> JobRecord | None:
         launcher=launcher,
         artifacts=_str_list(raw.get("artifacts")),
         requires=_str_list(raw.get("requires")),
-        validators=_str_list(raw.get("validators")),
     )
 
 

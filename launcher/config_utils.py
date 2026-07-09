@@ -186,7 +186,6 @@ def python_job(
     setup: list[str] | None = None,
     artifacts: list[str] | None = None,
     requires: list[str] | None = None,
-    validators: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a Python job dictionary from a script and keyword args.
 
@@ -209,7 +208,6 @@ def python_job(
         "setup": setup or [],
         "artifacts": artifacts or [],
         "requires": requires or [],
-        "validators": validators or [],
     }
 
 
@@ -253,7 +251,6 @@ def coerce_job(entry: Any) -> JobSpec:
             setup=ensure_list(entry.get("setup")),
             artifacts=ensure_list(entry.get("artifacts")),
             requires=ensure_list(entry.get("requires")),
-            validators=ensure_list(entry.get("validators")),
         )
     raise TypeError(f"Unsupported job entry: {entry!r}")
 
@@ -416,9 +413,9 @@ def collect_config_warnings(
             continue
 
         # GPU-heavy job should declare requirements.
-        if _job_uses_gpu(job) and not job.requires and not job.validators:
+        if _job_uses_gpu(job) and not job.requires:
             warnings.append(
-                f"Job '{job.name}' uses GPU but has no 'requires' or 'validators'. "
+                f"Job '{job.name}' uses GPU but has no 'requires'. "
                 "Declare model/data prerequisites to catch failures early."
             )
 
