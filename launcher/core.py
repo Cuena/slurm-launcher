@@ -6,6 +6,7 @@ import json
 import re
 import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -99,6 +100,7 @@ class LauncherSettings:
     singularity_image_path: str | None
     singularity_exec_flags: list[str]
     artifact_paths: list[str]
+    require_clean_git: bool
     verbose: bool
 
 
@@ -308,6 +310,7 @@ def sync_project(
     include_logging_dirs: bool = True,
     quiet: bool = False,
 ) -> list[str]:
+    source_state = inspect_source_state(settings.project_root)
     remote_directories = [remote_paths.workdir]
     if include_logging_dirs:
         remote_directories.extend([remote_paths.logdir, remote_paths.slurm_output_dir])
@@ -348,8 +351,10 @@ def sync_project(
             console.print("dry-run rsync command:", style="yellow")
             console.print(rsync_command, style="dim")
             console.print("dry-run skipping rsync execution", style="yellow")
+        commands.append(format_source_metadata_command(settings, remote_paths, source_state))
         return commands
     subprocess.run(cmd, check=True)
+    commands.extend(write_remote_source_metadata(settings, remote_paths, source_state))
     if not quiet:
         console.print("Sync complete", style="green")
     return commands
@@ -909,8 +914,10 @@ def render_runtime_command(job: JobSpec, settings: LauncherSettings) -> str:
 
 def create_job_folder_name(prefix: str, repo_root: Path) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    git_hash = query_git_hash(repo_root)
-    return f"{prefix}_{timestamp}_{git_hash}"
+    source_state = inspect_source_state(repo_root)
+    git_hash = source_state.git_short_commit or "nogit"
+    suffix = "_dirty" if source_state.git_dirty else ""
+    return f"{prefix}_{timestamp}_{git_hash}{suffix}"
 
 
 def query_git_hash(repo_root: Path) -> str:
@@ -925,6 +932,151 @@ def query_git_hash(repo_root: Path) -> str:
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "nogit"
+
+
+@dataclass(frozen=True)
+class SourceState:
+    git_available: bool
+    git_commit: str | None
+    git_short_commit: str | None
+    git_branch: str | None
+    git_dirty: bool
+    git_status_porcelain: str
+    git_diff_stat: str
+    untracked_files: list[str]
+
+
+def _git_output(repo_root: Path, args: list[str]) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return result.stdout.strip()
+
+
+def inspect_source_state(repo_root: Path) -> SourceState:
+    commit = _git_output(repo_root, ["rev-parse", "HEAD"])
+    short_commit = _git_output(repo_root, ["rev-parse", "--short", "HEAD"])
+    branch = _git_output(repo_root, ["branch", "--show-current"])
+    status = _git_output(
+        repo_root,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+    )
+    diff_stat = _git_output(repo_root, ["diff", "--stat"])
+    untracked = _git_output(repo_root, ["ls-files", "--others", "--exclude-standard"])
+    git_available = commit is not None and status is not None
+    status_text = status or ""
+    return SourceState(
+        git_available=git_available,
+        git_commit=commit,
+        git_short_commit=short_commit,
+        git_branch=branch or None,
+        git_dirty=bool(status_text.strip()) if git_available else False,
+        git_status_porcelain=status_text,
+        git_diff_stat=diff_stat or "",
+        untracked_files=untracked.splitlines() if untracked else [],
+    )
+
+
+def enforce_clean_git(settings: LauncherSettings, *, require_clean_git: bool = False) -> None:
+    if not (settings.require_clean_git or require_clean_git):
+        return
+    source_state = inspect_source_state(settings.project_root)
+    if not source_state.git_available:
+        raise SystemExit(
+            "ERROR: Git state is unavailable and clean git state is required."
+        )
+    if not source_state.git_dirty:
+        return
+    dirty_files = source_state.git_status_porcelain.strip()
+    raise SystemExit(
+        "ERROR: Git working tree is dirty and clean git state is required.\n"
+        "Commit, stash, or rerun without --require-clean-git.\n"
+        f"Dirty files:\n{dirty_files}"
+    )
+
+
+def build_source_metadata(
+    settings: LauncherSettings,
+    remote_paths: RemotePaths,
+    source_state: SourceState,
+) -> dict[str, Any]:
+    return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "job_folder": remote_paths.job_folder,
+        "remote_workdir": remote_paths.workdir,
+        "local_project_root": str(settings.project_root),
+        "workspace_mode": settings.workspace_mode,
+        "project_prefix": settings.project_prefix,
+        "git": {
+            "available": source_state.git_available,
+            "commit": source_state.git_commit,
+            "short_commit": source_state.git_short_commit,
+            "branch": source_state.git_branch,
+            "dirty": source_state.git_dirty,
+            "status_porcelain": source_state.git_status_porcelain,
+            "diff_stat": source_state.git_diff_stat,
+            "untracked_files": source_state.untracked_files,
+        },
+    }
+
+
+def format_source_metadata_command(
+    settings: LauncherSettings,
+    remote_paths: RemotePaths,
+    source_state: SourceState,
+) -> str:
+    remote_dir = f"{remote_paths.workdir.rstrip('/')}/.slurm_run"
+    remote_path = f"{remote_dir}/source.json"
+    metadata = json.dumps(
+        build_source_metadata(settings, remote_paths, source_state),
+        indent=2,
+    )
+    script = "\n".join(
+        [
+            f"mkdir -p {shlex.quote(remote_dir)}",
+            f"cat > {shlex.quote(remote_path)} <<'SOURCE_METADATA_JSON'",
+            metadata,
+            "SOURCE_METADATA_JSON",
+        ]
+    )
+    return format_ssh_script_command(
+        settings.cluster_login,
+        script,
+        ssh_config_file=settings.ssh_config_file,
+        ssh_options=settings.ssh_options,
+    )
+
+
+def write_remote_source_metadata(
+    settings: LauncherSettings,
+    remote_paths: RemotePaths,
+    source_state: SourceState,
+) -> list[str]:
+    metadata = build_source_metadata(settings, remote_paths, source_state)
+    remote_dir = f"{remote_paths.workdir.rstrip('/')}/.slurm_run"
+    remote_path = f"{remote_dir}/source.json"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json") as handle:
+        json.dump(metadata, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        command = [
+            "rsync",
+            "-az",
+            "-e",
+            build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
+            handle.name,
+            f"{settings.cluster_login}:{remote_path}",
+        ]
+        ensure_remote_directories(settings, [remote_dir], dry_run=False, quiet=True)
+        subprocess.run(command, check=True)
+    return [shlex.join(command)]
 
 
 def resolve_remote_paths(settings: LauncherSettings) -> RemotePaths:

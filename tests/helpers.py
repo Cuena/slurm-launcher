@@ -34,6 +34,7 @@ def make_settings(**overrides: object) -> LauncherSettings:
         "singularity_image_path": None,
         "singularity_exec_flags": [],
         "artifact_paths": [],
+        "require_clean_git": False,
         "verbose": False,
     }
     defaults.update(overrides)

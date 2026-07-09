@@ -38,6 +38,7 @@ REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 
 PROJECT_NAME = LOCAL_ROOT.name.replace(" ", "_")
 ARTIFACT_PATHS: list[str] = ["outputs"]
+REQUIRE_CLEAN_GIT = False
 
 # ---------------------------------------------------------------------------
 # Runtime mode

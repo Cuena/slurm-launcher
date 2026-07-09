@@ -122,6 +122,7 @@ def build_settings(
     ]
     extra_rsync_args = [str(item) for item in getattr(config, "EXTRA_RSYNC_ARGS", [])]
     artifact_paths = ensure_list(getattr(config, "ARTIFACT_PATHS", []))
+    require_clean_git = bool(getattr(config, "REQUIRE_CLEAN_GIT", False))
     verbose = bool(getattr(config, "VERBOSE", False))
 
     return LauncherSettings(
@@ -157,6 +158,7 @@ def build_settings(
         singularity_image_path=(str(singularity_image) if singularity_image else None),
         singularity_exec_flags=singularity_exec_flags,
         artifact_paths=artifact_paths,
+        require_clean_git=require_clean_git,
         verbose=verbose,
     )
 

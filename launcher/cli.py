@@ -35,6 +35,7 @@ from .core import (
     build_job_script,
     build_launcher_metadata,
     build_sbatch_script,
+    enforce_clean_git,
     format_sbatch_options,
     resolve_remote_paths,
     resolve_remote_paths_for_job_folder,
@@ -253,6 +254,11 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
     _add_job_selection_arg(parser)
     parser.add_argument(
+        "--require-clean-git",
+        action="store_true",
+        help="Fail before staging if LOCAL_ROOT is not a clean git checkout.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without running SSH/rsync/sbatch",
@@ -266,6 +272,11 @@ def _add_run_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_stage_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    parser.add_argument(
+        "--require-clean-git",
+        action="store_true",
+        help="Fail before staging if LOCAL_ROOT is not a clean git checkout.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -302,6 +313,11 @@ def _add_submit_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_sbatch_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
+    parser.add_argument(
+        "--require-clean-git",
+        action="store_true",
+        help="Fail before staging if LOCAL_ROOT is not a clean git checkout.",
+    )
     parser.add_argument(
         "sbatch_file",
         help=(
@@ -807,6 +823,10 @@ def do_run(args: argparse.Namespace) -> int:
                 context.settings,
                 context.remote_paths,
             )
+        enforce_clean_git(
+            context.settings,
+            require_clean_git=bool(getattr(args, "require_clean_git", False)),
+        )
         test_ssh_connection(
             context.settings.cluster_login,
             dry_run=args.dry_run,
@@ -896,6 +916,10 @@ def do_stage(args: argparse.Namespace) -> int:
                 context.settings,
                 context.remote_paths,
             )
+        enforce_clean_git(
+            context.settings,
+            require_clean_git=bool(getattr(args, "require_clean_git", False)),
+        )
         test_ssh_connection(
             context.settings.cluster_login,
             dry_run=args.dry_run,
@@ -1061,6 +1085,10 @@ def do_sbatch(args: argparse.Namespace) -> int:
         )
         _validate_predefined_sbatch_file_job(context.settings, job)
 
+        enforce_clean_git(
+            context.settings,
+            require_clean_git=bool(getattr(args, "require_clean_git", False)),
+        )
         test_ssh_connection(
             context.settings.cluster_login,
             dry_run=args.dry_run,
