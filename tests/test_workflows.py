@@ -356,6 +356,14 @@ class LogsCommandWorkflowTests(unittest.TestCase):
             args = argparse.Namespace(
                 tracking_file=str(tracking),
                 only=["train"],
+                config=None,
+                workspace=None,
+                latest=False,
+                job_id=None,
+                use_stderr=False,
+                follow=False,
+                lines=50,
+                full=False,
                 json=True,
             )
             exit_code = cli.do_logs(args)

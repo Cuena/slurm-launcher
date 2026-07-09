@@ -47,6 +47,9 @@ class JobSpec:
     env: dict[str, Any] = field(default_factory=dict)
     sbatch: dict[str, Any] = field(default_factory=dict)
     setup: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
+    validators: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.command is not None:
@@ -66,6 +69,9 @@ class JobSpec:
             )
         self.setup = [str(cmd) for cmd in self.setup]
         self.sbatch_args = [str(arg) for arg in self.sbatch_args]
+        self.artifacts = [str(path) for path in self.artifacts]
+        self.requires = [str(path) for path in self.requires]
+        self.validators = [str(name) for name in self.validators]
 
     def render_command(self) -> str:
         if self.command is None:
@@ -101,6 +107,8 @@ class LauncherSettings:
     singularity_exec_flags: list[str]
     artifact_paths: list[str]
     require_clean_git: bool
+    sync_symlinks: str
+    local_artifact_root: Path | None
     verbose: bool
 
 
@@ -335,6 +343,8 @@ def sync_project(
         "-e",
         build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
     ]
+    if settings.sync_symlinks == "copy-links":
+        cmd.append("--copy-links")
     if dry_run:
         cmd.append("--dry-run")
     for pattern in excludes:
@@ -673,6 +683,11 @@ def submit_job(
     return submission
 
 
+def job_artifact_paths(settings: LauncherSettings, job: JobSpec) -> list[str]:
+    """Return artifact paths for a job, preferring job-specific declarations."""
+    return job.artifacts if job.artifacts else settings.artifact_paths
+
+
 def resolve_remote_sbatch_path(
     settings: LauncherSettings, remote_paths: RemotePaths, sbatch_file: str
 ) -> str:
@@ -839,6 +854,9 @@ def build_job_record(
         "remote_sbatch": submission.remote_sbatch_path,
         "submitted_at": datetime.now().isoformat(timespec="seconds"),
         "launcher": launcher,
+        "artifacts": job.artifacts,
+        "requires": job.requires,
+        "validators": job.validators,
     }
 
 
@@ -884,6 +902,7 @@ def write_job_tracking_file(
         "venv_python_executable": settings.venv_python_executable,
         "singularity_image_path": settings.singularity_image_path,
         "artifact_paths": settings.artifact_paths,
+        "sync_symlinks": settings.sync_symlinks,
         "jobs": job_records,
     }
     output_path = tracking_dir / "jobs.json"
@@ -894,7 +913,54 @@ def write_job_tracking_file(
     )
     latest_run_path = root_tracking_dir / "latest_run.txt"
     latest_run_path.write_text(remote_paths.job_folder + "\n", encoding="utf-8")
+
+    # Write local + remote summary
+    try:
+        from .summary import write_submission_summary
+
+        write_submission_summary(settings, remote_paths, _tracking_payload(payload))
+    except Exception:
+        # Summary is best-effort; do not fail submission.
+        pass
+
     return output_path
+
+
+def _tracking_payload(raw_payload: dict[str, Any]):
+    # Local import to avoid circular dependency.
+    from .tracking import TrackingPayload, _parse_job_record, _str_list, _str_or_none
+
+    raw_jobs = raw_payload.get("jobs", [])
+    jobs = [
+        rec
+        for item in (raw_jobs if isinstance(raw_jobs, list) else [])
+        if (rec := _parse_job_record(item)) is not None
+    ]
+    return TrackingPayload(
+        source_path=Path("."),
+        created_at=raw_payload.get("created_at"),
+        cluster_login=str(raw_payload.get("cluster_login") or ""),
+        ssh_config_file=_str_or_none(raw_payload.get("ssh_config_file")),
+        ssh_options=_str_list(raw_payload.get("ssh_options")),
+        job_folder=str(raw_payload.get("job_folder", "unknown_job_folder")),
+        remote_workdir=_str_or_none(raw_payload.get("remote_workdir")),
+        remote_logdir=_str_or_none(raw_payload.get("remote_logdir")),
+        remote_slurm_output_dir=_str_or_none(
+            raw_payload.get("remote_slurm_output_dir")
+        ),
+        remote_slurm_dashboard_log_archive_dir=_str_or_none(
+            raw_payload.get("remote_slurm_dashboard_log_archive_dir")
+        ),
+        remote_slurm_dashboard_log_view_dir=_str_or_none(
+            raw_payload.get("remote_slurm_dashboard_log_view_dir")
+        ),
+        runtime_mode=_str_or_none(raw_payload.get("runtime_mode")),
+        venv_python_executable=_str_or_none(raw_payload.get("venv_python_executable")),
+        singularity_image_path=_str_or_none(raw_payload.get("singularity_image_path")),
+        artifact_paths=_str_list(raw_payload.get("artifact_paths")),
+        sync_symlinks=_str_or_none(raw_payload.get("sync_symlinks")),
+        jobs=jobs,
+    )
 
 
 def render_runtime_command(job: JobSpec, settings: LauncherSettings) -> str:

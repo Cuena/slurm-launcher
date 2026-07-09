@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import shlex
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -123,6 +124,12 @@ def build_settings(
     extra_rsync_args = [str(item) for item in getattr(config, "EXTRA_RSYNC_ARGS", [])]
     artifact_paths = ensure_list(getattr(config, "ARTIFACT_PATHS", []))
     require_clean_git = bool(getattr(config, "REQUIRE_CLEAN_GIT", False))
+    sync_symlinks = str(getattr(config, "SYNC_SYMLINKS", "copy-links")).strip().lower()
+    if sync_symlinks not in {"copy-links", "preserve"}:
+        raise SystemExit(
+            "ERROR: SYNC_SYMLINKS must be one of: copy-links, preserve."
+        )
+    local_artifact_root = getattr(config, "LOCAL_ARTIFACT_ROOT", None)
     verbose = bool(getattr(config, "VERBOSE", False))
 
     return LauncherSettings(
@@ -159,8 +166,51 @@ def build_settings(
         singularity_exec_flags=singularity_exec_flags,
         artifact_paths=artifact_paths,
         require_clean_git=require_clean_git,
+        sync_symlinks=sync_symlinks,
+        local_artifact_root=(
+            Path(local_artifact_root).resolve()
+            if local_artifact_root
+            else None
+        ),
         verbose=verbose,
     )
+
+
+def python_job(
+    *,
+    name: str,
+    script: str,
+    args: dict[str, Any] | None = None,
+    env: dict[str, Any] | None = None,
+    sbatch: dict[str, Any] | None = None,
+    setup: list[str] | None = None,
+    artifacts: list[str] | None = None,
+    requires: list[str] | None = None,
+    validators: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a Python job dictionary from a script and keyword args.
+
+    Example:
+        python_job(
+            name="train",
+            script="scripts/train.py",
+            args={"--config-name": "train", "--lr": 1e-4},
+        )
+    """
+    command_parts = ["python", script]
+    for key, value in (args or {}).items():
+        command_parts.append(shlex.quote(str(key)))
+        command_parts.append(shlex.quote(str(value)))
+    return {
+        "name": name,
+        "command": " ".join(command_parts),
+        "env": env or {},
+        "sbatch": sbatch or {},
+        "setup": setup or [],
+        "artifacts": artifacts or [],
+        "requires": requires or [],
+        "validators": validators or [],
+    }
 
 
 def coerce_job(entry: Any) -> JobSpec:
@@ -171,17 +221,17 @@ def coerce_job(entry: Any) -> JobSpec:
         if "python" in entry:
             raise ValueError(
                 f"Job '{name}' uses unsupported key 'python'. "
-                "Use a single explicit 'command' string."
+                "Use a single explicit 'command' string or python_job()."
             )
         if "script" in entry or "entrypoint" in entry:
             raise ValueError(
                 f"Job '{name}' uses unsupported keys ('script'/'entrypoint'). "
-                "Use a single explicit 'command' string."
+                "Use a single explicit 'command' string or python_job()."
             )
         if "args" in entry or "shell" in entry or "interpreter" in entry:
             raise ValueError(
                 f"Job '{name}' uses unsupported keys ('args'/'shell'/'interpreter'). "
-                "Use a single explicit 'command' string."
+                "Use a single explicit 'command' string or python_job()."
             )
         has_command = "command" in entry and bool(str(entry.get("command", "")).strip())
         has_sbatch_file = "sbatch_file" in entry and bool(
@@ -201,6 +251,9 @@ def coerce_job(entry: Any) -> JobSpec:
             env=dict(entry.get("env") or {}),
             sbatch=dict(entry.get("sbatch") or {}),
             setup=ensure_list(entry.get("setup")),
+            artifacts=ensure_list(entry.get("artifacts")),
+            requires=ensure_list(entry.get("requires")),
+            validators=ensure_list(entry.get("validators")),
         )
     raise TypeError(f"Unsupported job entry: {entry!r}")
 
@@ -298,3 +351,109 @@ def remote_runtime_checks(settings: LauncherSettings) -> list[str]:
             ]
         )
     return commands
+
+
+# Heuristic known MN5 partitions; kept generic enough to avoid false positives.
+_KNOWN_PARTITIONS = {"acc", "gp_debug", "gp", "bsc_es", "interactive"}
+_GPU_HINTS = {"gpu", "gres"}
+_OUTPUT_DIR_HINTS = ("--output-dir", "output_dir", "hydra.run.dir", "out_dir")
+
+
+def _job_uses_gpu(job: JobSpec) -> bool:
+    combined = {**job.sbatch}
+    values = " ".join(str(value).lower() for value in combined.values())
+    return "gpu" in values
+
+
+def _extract_output_dir(command: str | None) -> str | None:
+    if not command:
+        return None
+    tokens = shlex.split(command)
+    for index, token in enumerate(tokens):
+        for hint in _OUTPUT_DIR_HINTS:
+            if token.startswith(f"{hint}="):
+                return token.split("=", 1)[1]
+            if token == hint and index + 1 < len(tokens):
+                return tokens[index + 1]
+    return None
+
+
+def _matches_excludes(path: str, excludes: list[str]) -> bool:
+    """Check whether a relative path is excluded by any rsync exclude pattern."""
+    normalized = path.strip("/")
+    for pattern in excludes:
+        pattern = pattern.strip("/")
+        if not pattern:
+            continue
+        # Simple suffix/prefix matching for common patterns.
+        if pattern.endswith("/") and normalized.startswith(pattern.rstrip("/")):
+            return True
+        if pattern.startswith("*.") and normalized.endswith(pattern.lstrip("*")):
+            return True
+        if pattern == normalized or normalized.startswith(pattern + "/"):
+            return True
+    return False
+
+
+def collect_config_warnings(
+    settings: LauncherSettings,
+    jobs: list[JobSpec],
+) -> list[str]:
+    """Return non-fatal config warnings."""
+    warnings: list[str] = []
+    all_excludes = settings.extra_rsync_excludes
+
+    # Singularity image local existence check (best effort).
+    if settings.runtime_mode == "singularity" and settings.singularity_image_path:
+        image_path = Path(settings.singularity_image_path)
+        if image_path.is_absolute() and not image_path.exists():
+            warnings.append(
+                f"SINGULARITY_IMAGE_PATH does not exist locally: {settings.singularity_image_path}"
+            )
+
+    for job in jobs:
+        if job.uses_sbatch_file():
+            continue
+
+        # GPU-heavy job should declare requirements.
+        if _job_uses_gpu(job) and not job.requires and not job.validators:
+            warnings.append(
+                f"Job '{job.name}' uses GPU but has no 'requires' or 'validators'. "
+                "Declare model/data prerequisites to catch failures early."
+            )
+
+        # Required paths should not be excluded from sync.
+        for req in job.requires:
+            if _matches_excludes(req, all_excludes):
+                warnings.append(
+                    f"Job '{job.name}' requires '{req}', but it matches an rsync exclude. "
+                    "It will be missing on the remote workspace."
+                )
+
+        # Output directory hints should be declared as artifacts.
+        output_dir = _extract_output_dir(job.command)
+        if output_dir:
+            output_normalized = output_dir.strip("/")
+            artifact_paths = [p.strip("/") for p in (job.artifacts or settings.artifact_paths)]
+            if output_normalized not in artifact_paths and not any(
+                output_normalized.startswith(p + "/") for p in artifact_paths
+            ):
+                warnings.append(
+                    f"Job '{job.name}' uses output dir '{output_dir}' but it is not "
+                    "declared as an artifact. Add it to job 'artifacts' or ARTIFACT_PATHS."
+                )
+            if not output_dir.startswith("/") and output_normalized.startswith(".."):
+                warnings.append(
+                    f"Job '{job.name}' output dir '{output_dir}' appears to be outside "
+                    "the managed workspace. Relative outputs should stay under the workspace."
+                )
+
+        # Partition/account sanity check (only when sbatch keys are present).
+        partition = str(job.sbatch.get("partition", settings.default_sbatch.get("partition", "")))
+        if partition and partition not in _KNOWN_PARTITIONS:
+            warnings.append(
+                f"Job '{job.name}' uses partition '{partition}' which is not in the "
+                "known set. Verify it exists on your cluster."
+            )
+
+    return warnings

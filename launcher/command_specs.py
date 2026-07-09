@@ -118,6 +118,20 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "slurm-launcher validate --ssh --check-remote-paths --json",
         ),
     ),
+    "preflight": CommandSpec(
+        summary="Check remote prerequisites for selected jobs before submitting.",
+        agent_recommendation="Prefer `preflight --dry-run --json` first; fail loud on missing globs or broken symlinks.",
+        supports_json=True,
+        json_fields=(
+            "ok",
+            "remote_workdir",
+            "jobs",
+        ),
+        examples=(
+            "slurm-launcher preflight --only sam3_batch_quality_all_clips --dry-run --json",
+            "slurm-launcher preflight --json",
+        ),
+    ),
     "render": CommandSpec(
         summary="Render generated job and sbatch scripts without submitting anything.",
         agent_recommendation="Prefer `render --json`; add `--job-script` only when the job-body script itself matters.",
@@ -152,6 +166,25 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         examples=(
             "slurm-launcher stage --dry-run --json",
             "slurm-launcher stage --workspace fixed --json",
+        ),
+    ),
+    "artifacts": CommandSpec(
+        summary="List or download job artifacts from a tracked submission.",
+        agent_recommendation="Prefer `artifacts list --json` before `artifacts download`; use `--only` to limit scope.",
+        supports_json=True,
+        json_fields=(
+            "ok",
+            "tracking_file",
+            "output_dir",
+            "dry_run",
+            "artifacts",
+            "commands",
+            "failures",
+        ),
+        examples=(
+            "slurm-launcher artifacts list --json",
+            "slurm-launcher artifacts download --dry-run --json",
+            "slurm-launcher artifacts download --only train eval --json",
         ),
     ),
     "submit": CommandSpec(
@@ -236,6 +269,21 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "jobs",
         ),
         examples=("slurm-launcher logs --json",),
+    ),
+    "status": CommandSpec(
+        summary="Show current SLURM state for tracked jobs or a single job id.",
+        agent_recommendation="Prefer `status --json` after a run; use `--job` for one-off checks without a tracking file.",
+        supports_json=True,
+        json_fields=(
+            "ok",
+            "tracking_file",
+            "cluster_login",
+            "jobs",
+        ),
+        examples=(
+            "slurm-launcher status --latest --json",
+            "slurm-launcher status --job 43054508 --json",
+        ),
     ),
     "monitor": CommandSpec(
         summary="Run `squeue` for the tracked job IDs from a prior submission.",

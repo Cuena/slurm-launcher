@@ -38,6 +38,11 @@ REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 
 PROJECT_NAME = LOCAL_ROOT.name.replace(" ", "_")
 ARTIFACT_PATHS: list[str] = ["outputs"]
+# Local directory used as the default root for `artifacts download`.
+LOCAL_ARTIFACT_ROOT: str | None = None
+# Symlink handling during rsync: "copy" (dereference with --copy-links) or
+# "preserve" (send symlinks as-is). Default: "preserve".
+SYNC_SYMLINKS: str | None = "preserve"
 REQUIRE_CLEAN_GIT = False
 
 # ---------------------------------------------------------------------------
@@ -48,6 +53,10 @@ REQUIRE_CLEAN_GIT = False
 # venv: source the virtualenv from VENV_PYTHON_EXECUTABLE before running jobs
 # singularity: wrap each job with singularity exec <flags> <image> ...
 RUNTIME_MODE = "native"  # native | venv | singularity
+
+# Optional local model/data validator names. Known validators: rfdetr, sam3.
+# These are checked by `preflight` when the target path exists locally.
+DEFAULT_VALIDATORS: list[str] = []
 
 VENV_PYTHON_EXECUTABLE: str | None = None
 SINGULARITY_IMAGE_PATH: str | None = None
@@ -143,6 +152,12 @@ JOBS = [
         "command": "python3 scripts/train.py --config-name=train +trainer.max_epochs=5",
         "env": {"EXPERIMENT_NAME": "train"},
         "sbatch": {},
+        # Artifacts discovered by `artifacts list/download` for this job.
+        "artifacts": ["outputs/train"],
+        # Remote paths the job expects (checked by `preflight`).
+        "requires": ["data/processed", "models/base.pt"],
+        # Named model validators or custom target checks.
+        # "validators": ["rfdetr=models/rfdetr"],
     },
     # Explicit shell script command.
     {

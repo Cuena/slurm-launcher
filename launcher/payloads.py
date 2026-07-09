@@ -75,6 +75,7 @@ def validate_payload(
 ) -> dict[str, Any]:
     return {
         "ok": ok,
+        "valid": ok,
         "config_path": str(config_path) if config_path else None,
         "workspace_mode": workspace_mode,
         "selected_jobs": selected_jobs,
@@ -179,6 +180,12 @@ def tracking_payload_to_dict(
                 entry["submitted_at"] = job.submitted_at
             if job.launcher:
                 entry["launcher"] = job.launcher
+            if job.artifacts:
+                entry["artifacts"] = job.artifacts
+            if job.requires:
+                entry["requires"] = job.requires
+            if job.validators:
+                entry["validators"] = job.validators
             job_dicts.append(entry)
             continue
         job_dicts.append(job)

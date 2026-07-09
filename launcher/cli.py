@@ -48,6 +48,7 @@ from .core import (
 from .command_specs import COMMAND_NAMES, COMMAND_SPECS, DEFAULT_COMMAND
 from .config_utils import (
     build_settings,
+    collect_config_warnings,
     ensure_list,
     fail_duplicate_jobs,
     fail_if_not_absolute,
@@ -59,6 +60,7 @@ from .config_utils import (
     validate_predefined_sbatch_file_job,
     validate_predefined_sbatch_jobs,
 )
+from .artifacts import add_artifacts_parser, dispatch_artifacts
 from .download_artifacts import add_download_artifacts_args, run_download_artifacts
 from .download_logs import add_download_logs_args, run_download_logs
 from .init_wizard import init_config
@@ -68,9 +70,11 @@ from .job_tools import (
     show_job_details,
     show_job_log,
 )
+from .status import run_status
 from .tracking import (
     JobRecord,
     TrackingError,
+    TrackingPayload,
     load_tracking_payload,
     resolve_tracking_file,
 )
@@ -84,6 +88,7 @@ from .payloads import (
     tracking_payload_to_dict,
     validate_payload,
 )
+from .preflight import run_preflight
 
 console = Console()
 err_console = Console(stderr=True)
@@ -116,10 +121,17 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         help="Copy the template without prompting (still updates .gitignore).",
     )
 
+    status_parser = subparsers.add_parser(
+        "status", help=COMMAND_SPECS["status"].summary
+    )
+    _add_status_args(status_parser)
+
     logs_parser = subparsers.add_parser(
         "logs", help=COMMAND_SPECS["logs"].summary
     )
     _add_logs_args(logs_parser)
+
+    add_artifacts_parser(subparsers)
 
     download_logs_parser = subparsers.add_parser(
         "download-logs",
@@ -163,6 +175,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
         help=COMMAND_SPECS["validate"].summary,
     )
     _add_validate_args(validate_parser)
+
+    preflight_parser = subparsers.add_parser(
+        "preflight",
+        help="Check remote prerequisites for selected jobs before submitting.",
+    )
+    _add_preflight_args(preflight_parser)
 
     render_parser = subparsers.add_parser(
         "render",
@@ -367,6 +385,21 @@ def _add_validate_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_preflight_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    _add_job_selection_arg(parser)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the preflight check script without running it.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable JSON result.",
+    )
+
+
 def _add_render_args(parser: argparse.ArgumentParser) -> None:
     _add_config_args(parser)
     _add_job_selection_arg(parser)
@@ -382,13 +415,73 @@ def _add_render_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_logs_args(parser: argparse.ArgumentParser) -> None:
+def _add_status_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
     parser.add_argument(
         "--tracking-file",
         help=(
             "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
             "or the most recent slurm_output/*/jobs.json."
         ),
+    )
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the latest tracking file (default when no --job is given).",
+    )
+    parser.add_argument(
+        "--job",
+        dest="job_id",
+        help="Query status for a single SLURM job id.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a machine-readable JSON result.",
+    )
+
+
+def _add_logs_args(parser: argparse.ArgumentParser) -> None:
+    _add_config_args(parser)
+    parser.add_argument(
+        "--tracking-file",
+        help=(
+            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
+            "or the most recent slurm_output/*/jobs.json."
+        ),
+    )
+    parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the latest tracking file.",
+    )
+    parser.add_argument(
+        "--job",
+        dest="job_id",
+        default=None,
+        help="Show logs for a single tracked job id.",
+    )
+    parser.add_argument(
+        "--stderr",
+        action="store_true",
+        dest="use_stderr",
+        help="Read stderr instead of stdout.",
+    )
+    parser.add_argument(
+        "--follow",
+        action="store_true",
+        help="Follow the log with tail -f.",
+    )
+    parser.add_argument(
+        "--lines",
+        type=int,
+        default=50,
+        help="How many lines to tail. Default: 50.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Print the full log file instead of tailing it.",
     )
     parser.add_argument(
         "--only",
@@ -1197,6 +1290,42 @@ def _remote_runtime_checks(settings: LauncherSettings) -> list[str]:
     return remote_runtime_checks(settings)
 
 
+def do_preflight(args: argparse.Namespace) -> int:
+    json_output = bool(args.json)
+    context = _load_execution_context(args, json_output=json_output)
+    if context is None:
+        return _emit_command_error(
+            "Config file not found. Pass --config PATH or run 'slurm-launcher init'.",
+            json_output=json_output,
+            payload={"config_path": None, "dry_run": bool(args.dry_run)},
+        )
+
+    try:
+        jobs = _prepare_configured_jobs(
+            context.config,
+            context.settings,
+            args,
+            fail_duplicate_names=True,
+        )
+        return run_preflight(
+            context.settings,
+            context.remote_paths,
+            jobs,
+            selected_jobs=_configured_run_only(context.config, args),
+            json_output=json_output,
+            dry_run=bool(args.dry_run),
+        )
+    except (RuntimeError, SystemExit, ValueError) as exc:
+        return _emit_command_error(
+            str(exc),
+            json_output=json_output,
+            payload={
+                "config_path": str(context.config_path),
+                "dry_run": bool(args.dry_run),
+            },
+        )
+
+
 def do_validate(args: argparse.Namespace) -> int:
     json_output = bool(args.json)
     if args.check_remote_paths and not args.ssh:
@@ -1316,6 +1445,8 @@ def do_validate(args: argparse.Namespace) -> int:
                 remote_checks["ok"] = True
         if args.check_remote_paths and remote_checks["ok"] is None:
             remote_checks["ok"] = True
+
+        warnings = collect_config_warnings(settings, jobs)
     except (RuntimeError, SystemExit, ValueError) as exc:
         return _emit_command_error(
             str(exc),
@@ -1339,7 +1470,7 @@ def do_validate(args: argparse.Namespace) -> int:
                 config_path=config_path,
                 workspace_mode=settings.workspace_mode,
                 selected_jobs=selected_jobs,
-                warnings=[],
+                warnings=warnings,
                 errors=[],
                 ssh_checked=bool(args.ssh),
                 remote_checks=remote_checks,
@@ -1360,6 +1491,10 @@ def do_validate(args: argparse.Namespace) -> int:
     summary.add_row("Remote slurm_output", remote_paths.slurm_output_dir)
     summary.add_row("Jobs", ", ".join(selected_jobs))
     console.print(summary)
+    if warnings:
+        console.print("\n[bold yellow]Warnings:[/bold yellow]")
+        for warning in warnings:
+            console.print(f"  - {warning}")
     if args.check_remote_paths:
         console.print("Remote checks OK", style="green")
     return 0
@@ -1523,23 +1658,80 @@ def _resolve_config_path(
     return None
 
 
+def _resolve_cluster_login_from_args(
+    args: argparse.Namespace,
+) -> tuple[str | None, str | None, list[str] | None, Path | None]:
+    """Resolve cluster login and SSH settings from --config or args.
+
+    Returns (cluster_login, ssh_config_file, ssh_options, config_path).
+    """
+    config_arg = str(args.config) if getattr(args, "config", None) else None
+    config_path = _resolve_config_path(
+        config_arg, extra_candidates=[GENERIC_CONFIG_PATH]
+    )
+    config = None
+    if config_arg and config_path is None:
+        return None, None, None, None
+    if config_path is not None:
+        config = load_config(config_path)
+
+    cluster_login = str(
+        getattr(args, "cluster_login", None)
+        or getattr(config, "CLUSTER_LOGIN", None)
+        or ""
+    ).strip()
+    ssh_config_file = getattr(config, "SSH_CONFIG_FILE", None)
+    ssh_config_file_text = str(ssh_config_file).strip() if ssh_config_file else None
+    ssh_options = ensure_list(getattr(config, "SSH_OPTIONS", [])) if config else []
+    return (
+        cluster_login or None,
+        ssh_config_file_text,
+        ssh_options,
+        config_path,
+    )
+
+
+def do_status(args: argparse.Namespace) -> int:
+    cluster_login, ssh_config_file, ssh_options, _ = _resolve_cluster_login_from_args(
+        args
+    )
+    return run_status(
+        tracking_file=args.tracking_file,
+        job_id=args.job_id,
+        cluster_login=cluster_login,
+        ssh_config_file=ssh_config_file,
+        ssh_options=ssh_options,
+        json_output=bool(args.json),
+    )
+
+
 def do_logs(args: argparse.Namespace) -> int:
+    json_output = bool(args.json)
     tracking_path = resolve_tracking_file(args.tracking_file)
     if tracking_path is None:
-        err_console.print(
+        message = (
             "No tracking file found. Run a non-dry submission first "
-            "or pass --tracking-file.",
-            style="bold red",
+            "or pass --tracking-file."
         )
+        if json_output:
+            console.print_json(data={"ok": False, "error": message})
+        else:
+            err_console.print(message, style="bold red")
         return 1
 
     try:
         payload = load_tracking_payload(tracking_path)
     except TrackingError as exc:
-        err_console.print(str(exc), style="bold red")
+        if json_output:
+            console.print_json(data={"ok": False, "error": str(exc)})
+        else:
+            err_console.print(str(exc), style="bold red")
         return 1
 
-    selected = payload.filter_jobs(names=set(args.only) if args.only else None)
+    if args.job_id:
+        selected = payload.filter_jobs(ids={args.job_id})
+    else:
+        selected = payload.filter_jobs(names=set(args.only) if args.only else None)
 
     if args.json:
         console.print_json(data=tracking_payload_to_dict(payload, selected))
@@ -1563,8 +1755,82 @@ def do_logs(args: argparse.Namespace) -> int:
         console.print("No matching jobs.", style="yellow")
         return 0
 
+    if args.job_id or args.follow or args.full or args.lines != 50 or args.use_stderr:
+        return _stream_tracked_logs(
+            payload,
+            selected,
+            use_stderr=args.use_stderr,
+            lines=args.lines,
+            follow=args.follow,
+            full=args.full,
+        )
+
     _print_job_logs_from_records(selected)
     return 0
+
+
+def _stream_tracked_logs(
+    payload: TrackingPayload,
+    jobs: list[JobRecord],
+    *,
+    use_stderr: bool,
+    lines: int,
+    follow: bool,
+    full: bool,
+) -> int:
+    """Stream actual log content for tracked jobs over SSH."""
+    from .job_tools import build_ssh_command
+
+    if not payload.cluster_login:
+        err_console.print(
+            "Missing cluster_login in tracking file.", style="bold red"
+        )
+        return 1
+
+    if len(jobs) > 1 and not full:
+        err_console.print(
+            "Can only stream logs for one job at a time unless --full is used.",
+            style="bold red",
+        )
+        return 1
+
+    failures = 0
+    for job in jobs:
+        target = job.stderr if use_stderr else job.stdout
+        stream = "stderr" if use_stderr else "stdout"
+        if not target:
+            err_console.print(
+                f"No {stream} path for job {job.job_name} ({job.job_id}).",
+                style="yellow",
+            )
+            failures += 1
+            continue
+
+        if full:
+            remote_command = f"cat {shlex.quote(target)}"
+        else:
+            tail_args = ["tail", "-n", str(lines)]
+            if follow:
+                tail_args.append("-f")
+            tail_args.append(target)
+            remote_command = shlex.join(tail_args)
+
+        ssh_cmd = build_ssh_command(
+            payload.cluster_login,
+            ssh_config_file=payload.ssh_config_file,
+            ssh_options=payload.ssh_options,
+        )
+        ssh_cmd.append(remote_command)
+
+        console.print()
+        console.print(
+            f"[bold]{job.job_name} ({job.job_id}) {stream}[/bold] {target}",
+            style="cyan",
+        )
+        result = subprocess.run(ssh_cmd, check=False)
+        if result.returncode != 0:
+            failures += 1
+    return 0 if failures == 0 else 1
 
 
 def _collect_job_ids(records: list[dict[str, Any]]) -> list[str]:
@@ -1848,6 +2114,10 @@ def do_download_artifacts(args: argparse.Namespace) -> int:
     return run_download_artifacts(args)
 
 
+def do_artifacts(args: argparse.Namespace) -> int:
+    return dispatch_artifacts(args)
+
+
 COMMAND_HANDLERS = {
     "doctor": do_doctor,
     "download-artifacts": do_download_artifacts,
@@ -1860,8 +2130,11 @@ COMMAND_HANDLERS = {
     "monitor": do_monitor,
     "render": do_render,
     "run": do_run,
+    "artifacts": do_artifacts,
+    "preflight": do_preflight,
     "sbatch": do_sbatch,
     "stage": do_stage,
+    "status": do_status,
     "submit": do_submit,
     "validate": do_validate,
 }

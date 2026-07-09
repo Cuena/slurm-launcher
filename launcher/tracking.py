@@ -21,6 +21,9 @@ class JobRecord:
     remote_sbatch: str | None = None
     submitted_at: str | None = None
     launcher: dict[str, object] | None = None
+    artifacts: list[str] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
+    validators: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,7 @@ class TrackingPayload:
     venv_python_executable: str | None
     singularity_image_path: str | None
     artifact_paths: list[str]
+    sync_symlinks: str | None
     jobs: list[JobRecord] = field(default_factory=list)
 
     def filter_jobs(
@@ -122,6 +126,9 @@ def _parse_job_record(raw: object) -> JobRecord | None:
         remote_sbatch=_str_or_none(raw.get("remote_sbatch")),
         submitted_at=_str_or_none(raw.get("submitted_at")),
         launcher=launcher,
+        artifacts=_str_list(raw.get("artifacts")),
+        requires=_str_list(raw.get("requires")),
+        validators=_str_list(raw.get("validators")),
     )
 
 
@@ -168,8 +175,25 @@ def load_tracking_payload(path: Path) -> TrackingPayload:
         venv_python_executable=_str_or_none(raw.get("venv_python_executable")),
         singularity_image_path=_str_or_none(raw.get("singularity_image_path")),
         artifact_paths=_str_list(raw.get("artifact_paths")),
+        sync_symlinks=_str_or_none(raw.get("sync_symlinks")),
         jobs=jobs,
     )
+
+
+def _str_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _str_list(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if value is None:
+        return []
+    text = str(value).strip()
+    return [text] if text else []
 
 
 def all_tracking_files() -> list[Path]:

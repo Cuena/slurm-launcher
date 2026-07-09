@@ -35,6 +35,8 @@ def make_settings(**overrides: object) -> LauncherSettings:
         "singularity_exec_flags": [],
         "artifact_paths": [],
         "require_clean_git": False,
+        "sync_symlinks": "copy-links",
+        "local_artifact_root": None,
         "verbose": False,
     }
     defaults.update(overrides)

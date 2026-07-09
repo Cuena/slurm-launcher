@@ -37,7 +37,7 @@ class CommandContractTests(unittest.TestCase):
             quiet=True,
         )
 
-        self.assertEqual(len(commands), 2)
+        self.assertEqual(len(commands), 3)
         self.assertIn(
             "ssh -F /dev/null -o BatchMode=yes user@cluster",
             commands[0],
@@ -46,11 +46,13 @@ class CommandContractTests(unittest.TestCase):
         self.assertIn("rsync -az --info=progress2", commands[1])
         self.assertIn("--dry-run", commands[1])
         self.assertIn("-e 'ssh -F /dev/null -o BatchMode=yes'", commands[1])
+        self.assertIn("source.json", commands[2])
 
     def test_command_specs_cover_public_commands(self) -> None:
         self.assertEqual(
             set(COMMAND_NAMES),
             {
+                "artifacts",
                 "doctor",
                 "download-artifacts",
                 "download-logs",
@@ -60,10 +62,12 @@ class CommandContractTests(unittest.TestCase):
                 "jobs",
                 "logs",
                 "monitor",
+                "preflight",
                 "render",
                 "run",
                 "sbatch",
                 "stage",
+                "status",
                 "submit",
                 "validate",
             },
