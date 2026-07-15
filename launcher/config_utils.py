@@ -400,14 +400,6 @@ def collect_config_warnings(
     warnings: list[str] = []
     all_excludes = settings.extra_rsync_excludes
 
-    # Singularity image local existence check (best effort).
-    if settings.runtime_mode == "singularity" and settings.singularity_image_path:
-        image_path = Path(settings.singularity_image_path)
-        if image_path.is_absolute() and not image_path.exists():
-            warnings.append(
-                f"SINGULARITY_IMAGE_PATH does not exist locally: {settings.singularity_image_path}"
-            )
-
     for job in jobs:
         if job.uses_sbatch_file():
             continue

@@ -49,7 +49,6 @@ class JobSpec:
     setup: list[str] = field(default_factory=list)
     artifacts: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
-    validators: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.command is not None:
@@ -71,7 +70,6 @@ class JobSpec:
         self.sbatch_args = [str(arg) for arg in self.sbatch_args]
         self.artifacts = [str(path) for path in self.artifacts]
         self.requires = [str(path) for path in self.requires]
-        self.validators = [str(name) for name in self.validators]
 
     def render_command(self) -> str:
         if self.command is None:
@@ -856,7 +854,6 @@ def build_job_record(
         "launcher": launcher,
         "artifacts": job.artifacts,
         "requires": job.requires,
-        "validators": job.validators,
     }
 
 

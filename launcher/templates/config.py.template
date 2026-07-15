@@ -54,10 +54,6 @@ REQUIRE_CLEAN_GIT = False
 # singularity: wrap each job with singularity exec <flags> <image> ...
 RUNTIME_MODE = "native"  # native | venv | singularity
 
-# Generic prerequisites checked on the remote workspace by `preflight`.
-# Each entry is a plain path or glob relative to the remote workdir.
-DEFAULT_REQUIRES: list[str] = []
-
 VENV_PYTHON_EXECUTABLE: str | None = None
 SINGULARITY_IMAGE_PATH: str | None = None
 SINGULARITY_EXEC_FLAGS: list[str] = []  # Example: ["--nv"]
