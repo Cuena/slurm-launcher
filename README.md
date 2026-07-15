@@ -132,11 +132,13 @@ Recommended execution loop for humans and coding agents:
    - `slurm-launcher render --json`
    - `slurm-launcher stage --dry-run`
    - `slurm-launcher stage --dry-run --json`
+   - for per-run preflight: `slurm-launcher stage --json`, then use the returned `job_folder`
+   - `slurm-launcher preflight --job-folder <job_folder> --dry-run --json`
    - `slurm-launcher submit --dry-run --job-folder <existing_folder> --json`
    - `slurm-launcher run --dry-run --json`
 3. Execute:
    - `slurm-launcher run`
-   - or split flow: `slurm-launcher stage`, then `slurm-launcher submit ...`
+   - or split flow: `slurm-launcher stage --json`, `slurm-launcher preflight --job-folder <job_folder>`, then `slurm-launcher submit --job-folder <job_folder>`
 4. Inspect and retrieve:
    - `slurm-launcher status`
    - `slurm-launcher logs`
@@ -161,9 +163,9 @@ Recommended execution loop for humans and coding agents:
 - `slurm-launcher validate --ssh`: validate config and test SSH connectivity
 - `slurm-launcher validate --ssh --check-remote-paths`: also check remote venv/singularity prerequisites (no writes)
 - `slurm-launcher validate`: also prints non-fatal warnings about missing artifacts, excluded requirements, GPU jobs without prerequisites, etc.
-- `slurm-launcher preflight --only <job>`: run remote prerequisite checks (`requires` paths and globs) before submitting
-- `slurm-launcher preflight --dry-run --only <job>`: print the preflight script without executing it
-- `slurm-launcher preflight --job-folder <folder>`: check an already staged per-run workspace
+- `slurm-launcher preflight --job-folder <folder> --only <job>`: run remote prerequisite checks (`requires` paths and globs) against an already staged per-run workspace
+- `slurm-launcher preflight --job-folder <folder> --dry-run --only <job>`: print the preflight script without executing it
+- `slurm-launcher preflight --workspace fixed --only <job>`: check a fixed workspace without a job folder
 - `slurm-launcher render`: print generated sbatch scripts without submission
 - `slurm-launcher render --json`: print rendered job metadata and scripts as JSON
 - `slurm-launcher render --only train`: render only a subset of jobs

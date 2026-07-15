@@ -134,7 +134,11 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "preflight": CommandSpec(
         summary="Check remote prerequisites for selected jobs before submitting.",
-        agent_recommendation="Prefer `preflight --dry-run --json` first; fail loud on missing globs or broken symlinks.",
+        agent_recommendation=(
+            "In per-run mode, run `stage --json` first and pass its job_folder "
+            "to `preflight --job-folder ... --json`; fail loud on missing globs "
+            "or broken symlinks."
+        ),
         supports_json=True,
         json_fields=(
             "ok",
@@ -142,7 +146,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "jobs",
         ),
         examples=(
-            "slurm-launcher preflight --only eval --dry-run --json",
+            "slurm-launcher preflight --job-folder run_20250101_120000 --only eval --dry-run --json",
             "slurm-launcher preflight --job-folder run_20250101_120000 --json",
         ),
     ),
@@ -286,7 +290,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "status": CommandSpec(
         summary="Show current SLURM state for tracked jobs or a single job id.",
-        agent_recommendation="Prefer `status --json` after a run; use `--job` for one-off checks without a tracking file.",
+        agent_recommendation="Prefer `status --json` after a run; use `status <job_id> --json` for one-off checks without a tracking file.",
         supports_json=True,
         json_fields=(
             "ok",
@@ -296,7 +300,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         ),
         examples=(
             "slurm-launcher status --latest --json",
-            "slurm-launcher status --job 43054508 --json",
+            "slurm-launcher status 43054508 --json",
         ),
     ),
     "monitor": CommandSpec(
