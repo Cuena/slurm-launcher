@@ -124,11 +124,9 @@ def build_settings(
     extra_rsync_args = [str(item) for item in getattr(config, "EXTRA_RSYNC_ARGS", [])]
     artifact_paths = ensure_list(getattr(config, "ARTIFACT_PATHS", []))
     require_clean_git = bool(getattr(config, "REQUIRE_CLEAN_GIT", False))
-    sync_symlinks = str(getattr(config, "SYNC_SYMLINKS", "copy-links")).strip().lower()
+    sync_symlinks = str(getattr(config, "SYNC_SYMLINKS", "preserve")).strip().lower()
     if sync_symlinks not in {"copy-links", "preserve"}:
-        raise SystemExit(
-            "ERROR: SYNC_SYMLINKS must be one of: copy-links, preserve."
-        )
+        raise SystemExit("ERROR: SYNC_SYMLINKS must be one of: copy-links, preserve.")
     local_artifact_root = getattr(config, "LOCAL_ARTIFACT_ROOT", None)
     verbose = bool(getattr(config, "VERBOSE", False))
 
@@ -168,9 +166,7 @@ def build_settings(
         require_clean_git=require_clean_git,
         sync_symlinks=sync_symlinks,
         local_artifact_root=(
-            Path(local_artifact_root).resolve()
-            if local_artifact_root
-            else None
+            Path(local_artifact_root).resolve() if local_artifact_root else None
         ),
         verbose=verbose,
     )
@@ -402,6 +398,17 @@ def collect_config_warnings(
 
     for job in jobs:
         if job.uses_sbatch_file():
+            if not job.requires:
+                warnings.append(
+                    f"Job '{job.name}' uses 'sbatch_file' but has no 'requires'. "
+                    "Preflight will fail until remote prerequisites are declared."
+                )
+            for req in job.requires:
+                if _matches_excludes(req, all_excludes):
+                    warnings.append(
+                        f"Job '{job.name}' requires '{req}', but it matches an rsync "
+                        "exclude. It will be missing on the remote workspace."
+                    )
             continue
 
         # GPU-heavy job should declare requirements.
@@ -423,7 +430,9 @@ def collect_config_warnings(
         output_dir = _extract_output_dir(job.command)
         if output_dir:
             output_normalized = output_dir.strip("/")
-            artifact_paths = [p.strip("/") for p in (job.artifacts or settings.artifact_paths)]
+            artifact_paths = [
+                p.strip("/") for p in (job.artifacts or settings.artifact_paths)
+            ]
             if output_normalized not in artifact_paths and not any(
                 output_normalized.startswith(p + "/") for p in artifact_paths
             ):
@@ -438,7 +447,9 @@ def collect_config_warnings(
                 )
 
         # Partition/account sanity check (only when sbatch keys are present).
-        partition = str(job.sbatch.get("partition", settings.default_sbatch.get("partition", "")))
+        partition = str(
+            job.sbatch.get("partition", settings.default_sbatch.get("partition", ""))
+        )
         if partition and partition not in _KNOWN_PARTITIONS:
             warnings.append(
                 f"Job '{job.name}' uses partition '{partition}' which is not in the "

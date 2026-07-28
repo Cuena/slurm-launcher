@@ -188,6 +188,10 @@ def tracking_payload_to_dict(
             continue
         job_dicts.append(job)
     return {
+        "ok": True,
+        "source": "tracking_file",
+        "content_included": False,
+        "remote_checked": False,
         "created_at": payload.created_at,
         "cluster_login": payload.cluster_login,
         "ssh_config_file": payload.ssh_config_file,

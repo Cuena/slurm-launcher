@@ -14,8 +14,14 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .core import build_rsync_ssh_command
-from .tracking import JobRecord, TrackingError, TrackingPayload, load_tracking_payload, resolve_tracking_file
+from .core import build_rsync_ssh_command, build_ssh_command
+from .tracking import (
+    JobRecord,
+    TrackingError,
+    TrackingPayload,
+    load_tracking_payload,
+    resolve_tracking_file,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -158,18 +164,89 @@ def list_artifacts(
     return entries
 
 
+def _check_remote_artifacts(
+    payload: TrackingPayload,
+    entries: list[dict[str, object]],
+) -> tuple[bool, str | None]:
+    """Annotate declared entries with remote existence metadata."""
+    if not entries:
+        return True, None
+
+    script_lines = ["set -u"]
+    for index, entry in enumerate(entries):
+        remote_path = shlex.quote(str(entry["remote_path"]))
+        script_lines.extend(
+            [
+                f"if test -e {remote_path} || test -L {remote_path}; then",
+                (
+                    f"  if test -L {remote_path}; then kind=symlink; "
+                    f"elif test -d {remote_path}; then kind=directory; "
+                    f"elif test -f {remote_path}; then kind=file; else kind=other; fi"
+                ),
+                f"  size=$(stat -c %s -- {remote_path} 2>/dev/null || printf 0)",
+                f'  printf \'{index}|true|%s|%s\\n\' "$kind" "$size"',
+                "else",
+                f"  printf '{index}|false||\\n'",
+                "fi",
+            ]
+        )
+    result = subprocess.run(
+        [
+            *build_ssh_command(
+                payload.cluster_login,
+                ssh_config_file=payload.ssh_config_file,
+                ssh_options=payload.ssh_options,
+            ),
+            "bash",
+            "-s",
+        ],
+        input="\n".join(script_lines) + "\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"SSH exited with code {result.returncode}"
+        return False, detail
+
+    for raw_line in result.stdout.splitlines():
+        parts = raw_line.strip().split("|", 3)
+        if len(parts) != 4 or not parts[0].isdigit():
+            continue
+        index = int(parts[0])
+        if index >= len(entries):
+            continue
+        exists = parts[1] == "true"
+        entries[index]["exists"] = exists
+        entries[index]["kind"] = parts[2] or None
+        entries[index]["size_bytes"] = int(parts[3]) if parts[3].isdigit() else None
+        entries[index]["remote_checked"] = True
+    unchecked = [entry for entry in entries if not entry.get("remote_checked")]
+    if unchecked:
+        return False, "Remote artifact check returned an incomplete response"
+    return True, None
+
+
 def _payload(
     tracking_file: Path | None,
     output_dir: Path,
     entries: list[dict[str, object]],
-    dry_run: bool,
+    *,
+    operation: str,
+    remote_checked: bool,
+    dry_run: bool | None = None,
     failures: int = 0,
+    error: str | None = None,
 ) -> dict[str, Any]:
-    return {
-        "ok": failures == 0,
+    result: dict[str, Any] = {
+        "ok": failures == 0 and error is None,
+        "operation": operation,
+        "source": "tracking_file",
         "tracking_file": str(tracking_file) if tracking_file else None,
         "output_dir": str(output_dir),
-        "dry_run": dry_run,
+        "remote_checked": remote_checked,
+        "declared_only": operation == "list",
+        "copy_attempted": operation == "download" and dry_run is False,
         "artifacts": [
             {
                 "job_name": entry.get("job_name"),
@@ -177,12 +254,33 @@ def _payload(
                 "path": entry["path"],
                 "remote_path": entry["remote_path"],
                 "destination": entry["destination"],
+                **(
+                    {
+                        "exists": entry.get("exists"),
+                        "kind": entry.get("kind"),
+                        "size_bytes": entry.get("size_bytes"),
+                        "remote_checked": entry.get("remote_checked", False),
+                    }
+                    if remote_checked
+                    else {}
+                ),
             }
             for entry in entries
         ],
-        "commands": [str(entry.get("command", "")) for entry in entries],
-        "failures": failures,
     }
+    if operation == "download":
+        result.update(
+            {
+                "dry_run": bool(dry_run),
+                "commands": [
+                    str(entry["command"]) for entry in entries if entry.get("command")
+                ],
+                "failures": failures,
+            }
+        )
+    if error is not None:
+        result["error"] = error
+    return result
 
 
 def print_artifact_table(entries: list[dict[str, object]]) -> None:
@@ -196,14 +294,20 @@ def print_artifact_table(entries: list[dict[str, object]]) -> None:
     table.add_column("Path")
     table.add_column("Remote")
     table.add_column("Local")
+    include_exists = any("exists" in entry for entry in entries)
+    if include_exists:
+        table.add_column("Exists")
     for entry in entries:
-        table.add_row(
+        row = [
             str(entry.get("job_name", "")),
             str(entry.get("job_id", "")),
             str(entry["path"]),
             str(entry["remote_path"]),
             str(entry["destination"]),
-        )
+        ]
+        if include_exists:
+            row.append("yes" if entry.get("exists") else "no")
+        table.add_row(*row)
     console.print(table)
 
 
@@ -218,9 +322,7 @@ def run_artifacts(
 ) -> int:
     tracking_path = resolve_tracking_file(tracking_file)
     if tracking_path is None:
-        message = (
-            "No tracking file found. Run a non-dry submission first or pass --tracking-file."
-        )
+        message = "No tracking file found. Run a non-dry submission first or pass --tracking-file."
         if json_output:
             print(json.dumps({"ok": False, "error": message}, indent=2))
         else:
@@ -237,7 +339,7 @@ def run_artifacts(
             err_console.print(f"ERROR: {message}", style="bold red")
         return 1
 
-    if not payload.cluster_login:
+    if subcommand in {"check", "download"} and not payload.cluster_login:
         message = f"Missing cluster_login in {tracking_path}"
         if json_output:
             print(json.dumps({"ok": False, "error": message}, indent=2))
@@ -264,7 +366,14 @@ def run_artifacts(
         if json_output:
             print(
                 json.dumps(
-                    _payload(tracking_path, effective_output_dir, [], dry_run),
+                    _payload(
+                        tracking_path,
+                        effective_output_dir,
+                        [],
+                        operation=subcommand,
+                        remote_checked=False,
+                        dry_run=dry_run if subcommand == "download" else None,
+                    ),
                     indent=2,
                 )
             )
@@ -281,7 +390,13 @@ def run_artifacts(
         if json_output:
             print(
                 json.dumps(
-                    _payload(tracking_path, effective_output_dir, entries, dry_run),
+                    _payload(
+                        tracking_path,
+                        effective_output_dir,
+                        entries,
+                        operation="list",
+                        remote_checked=False,
+                    ),
                     indent=2,
                 )
             )
@@ -296,10 +411,34 @@ def run_artifacts(
                         f"[bold]Local output:[/bold] {effective_output_dir}",
                     ]
                 ),
-                title="Artifacts",
+                title="Declared Artifacts",
                 border_style="cyan",
             )
         )
+        print_artifact_table(entries)
+        return 0
+
+    if subcommand == "check":
+        entries = list_artifacts(
+            payload,
+            effective_output_dir,
+            selected_jobs=selected_jobs,
+        )
+        ok, error = _check_remote_artifacts(payload, entries)
+        result_payload = _payload(
+            tracking_path,
+            effective_output_dir,
+            entries,
+            operation="check",
+            remote_checked=ok,
+            error=error,
+        )
+        if json_output:
+            print(json.dumps(result_payload, indent=2))
+            return 0 if ok else 1
+        if not ok:
+            err_console.print(f"ERROR: {error}", style="bold red")
+            return 1
         print_artifact_table(entries)
         return 0
 
@@ -335,7 +474,9 @@ def run_artifacts(
                     tracking_path,
                     effective_output_dir,
                     entries,
-                    dry_run,
+                    operation="download",
+                    remote_checked=False,
+                    dry_run=dry_run,
                     failures=failures,
                 ),
                 indent=2,
@@ -378,11 +519,13 @@ def run_artifacts(
 def add_artifacts_parser(subparsers: Any) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
         "artifacts",
-        help="List or download job artifacts tracked by slurm-launcher.",
+        help="List, check, or download job artifacts tracked by slurm-launcher.",
     )
     sub = parser.add_subparsers(dest="artifacts_command", required=True)
 
-    list_parser = sub.add_parser("list", help="List discovered artifacts.")
+    list_parser = sub.add_parser(
+        "list", help="List artifact paths declared in tracking metadata (no SSH)."
+    )
     list_parser.add_argument(
         "--tracking-file",
         help=(
@@ -405,7 +548,32 @@ def add_artifacts_parser(subparsers: Any) -> argparse.ArgumentParser:
         help="Print a machine-readable JSON result.",
     )
 
-    download_parser = sub.add_parser("download", help="Download discovered artifacts.")
+    check_parser = sub.add_parser(
+        "check", help="Check whether declared artifacts currently exist remotely."
+    )
+    check_parser.add_argument(
+        "--tracking-file",
+        help=(
+            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
+            "or the most recent slurm_output/*/jobs.json."
+        ),
+    )
+    check_parser.add_argument(
+        "--only",
+        nargs="+",
+        help="Limit to the specified job names.",
+    )
+    check_parser.add_argument(
+        "--output-dir",
+        help="Local destination root used only to show prospective destinations.",
+    )
+    check_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print existence, type, and size as machine-readable JSON.",
+    )
+
+    download_parser = sub.add_parser("download", help="Download declared artifacts.")
     download_parser.add_argument(
         "--tracking-file",
         help=(

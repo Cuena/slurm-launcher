@@ -9,6 +9,7 @@ from unittest import TestCase, mock
 
 from launcher import cli
 from launcher.core import LauncherSettings
+from launcher.status import StatusQueryResult
 from launcher.summary import update_summary_from_status
 from launcher.tracking import load_tracking_payload
 from tests.helpers import write_tracking_file
@@ -77,7 +78,9 @@ class TestSummaryUsesTrackedPaths(TestCase):
 
             with mock.patch(
                 "launcher.summary.query_job_statuses",
-                return_value=[],
+                return_value=StatusQueryResult(
+                    statuses=[], probes=[], unresolved_job_ids=[]
+                ),
             ):
                 with mock.patch(
                     "launcher.core.ssh_script",

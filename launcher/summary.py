@@ -177,14 +177,14 @@ def update_summary_from_status(
     payload: TrackingPayload,
 ) -> Path:
     """Refresh the summary file using current SLURM status."""
-    statuses = query_job_statuses(
+    status_result = query_job_statuses(
         payload.cluster_login,
         payload.jobs,
         ssh_config_file=payload.ssh_config_file,
         ssh_options=payload.ssh_options,
     )
     return write_submission_summary(
-        settings, remote_paths, payload, statuses=statuses
+        settings, remote_paths, payload, statuses=status_result.statuses
     )
 
 

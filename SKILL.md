@@ -5,12 +5,12 @@ description: "Use when the user needs an assistant to inspect or operate jobs on
 
 Use this skill when the task is about operating a SLURM cluster or a project that submits SLURM jobs through `slurm-launcher`.
 
-The CLI serves two distinct modes. Keep them separate.
+The CLI serves three command groups. Keep them separate.
 
 - Global cluster inspection:
   `doctor`, `jobs`, `job-show`, `job-log`
 - Project execution:
-  `init`, `validate`, `render`, `stage`, `submit`, `sbatch`, `run`
+  `init`, `validate`, `preflight`, `render`, `stage`, `submit`, `sbatch`, `run`
 - Project tracking and retrieval:
   `status`, `logs`, `monitor`, `download-logs`, `download-artifacts`, `artifacts`, `summary`
 
@@ -21,19 +21,37 @@ The canonical public command metadata now lives in:
 
 Keep this skill aligned with those files when the source repo changes.
 
+## Identifier Contracts
+
+Do not assume one identifier works across project commands.
+
+- `stage` creates a `job_folder` and returns its local `tracking_file`.
+- `preflight` and per-run `submit` accept `--job-folder <folder>`.
+- `status` accepts a direct SLURM job ID, `--tracking-file <jobs.json>`, or `--latest`. It does not accept `--job-folder`.
+- `logs` resolves a tracking file or the latest tracked run; `--job <job_id>` selects a job from that tracking file.
+- `monitor` resolves a tracking file or the latest tracked run.
+- `artifacts list|check|download`, `download-logs`, `download-artifacts`, and `summary` resolve a tracking file or the latest tracked run.
+- `job-show` and `job-log` accept a direct SLURM job ID and do not require launcher tracking.
+
+A job ID identifies one scheduler record. A tracking file additionally preserves the complete SSH context, multi-job membership, remote workspace, exact log paths, and declared artifacts. Prefer direct IDs for one-off inspection and tracking files for run-scoped retrieval.
+
+After a launcher upgrade, run `slurm-launcher --version` and inspect `<command> --help` before first using a command whose arguments or effects matter. Treat installed help as authoritative when it differs from remembered guidance.
+
 ## Operating Rules
 
 1. Prefer `slurm-launcher` directly.
 - Use `sl` only if that alias is already installed in the user environment.
+- Treat SSH nicknames such as `acc` as user-and-machine-local. Prefer canonical `user@host` destinations in portable configs and tracking data.
 
 2. Distinguish global commands from project commands.
 - `doctor`, `jobs`, `job-show`, and `job-log` are intended to work from any directory.
-- `init`, `validate`, `render`, `stage`, `submit`, `sbatch`, and `run` are project-scoped.
+- `init`, `validate`, `preflight`, `render`, `stage`, `submit`, `sbatch`, and `run` are project-scoped.
 
 3. Prefer JSON-capable commands for agent workflows.
 - For agents, default to `--json` whenever the command supports it.
 - Read content only after a discovery step. Example: use `job-log --json` before `job-log --follow`.
 - Do not omit `--json` because the plain text looks easier; the JSON fields are the stable contract for agents.
+- `--json` changes output format only. It does not imply `--dry-run`.
 
 4. Use dry-run before costly or risky remote actions.
 - Prefer `stage --dry-run --json`, `submit --dry-run --json`, `sbatch --dry-run --json`, or `run --dry-run --json` before live submission.
@@ -42,6 +60,8 @@ Keep this skill aligned with those files when the source repo changes.
 
 5. Treat SSH or sandbox failures as environment issues first.
 - If an SSH-backed command fails in the sandbox, retry with escalation before assuming the cluster or repo is broken.
+- For generic commands, explicit `--cluster-login` without explicit `--config` uses the caller's normal SSH configuration; it must not inherit `SSH_CONFIG_FILE` or `SSH_OPTIONS` from the generic config.
+- For tracking-backed commands, use the complete cluster login and SSH context stored in `jobs.json`; do not merge in a user-level generic config.
 
 6. Avoid raw SSH and rsync when a launcher command exists.
 - Do not run manual `ssh ... squeue`, `ssh ... sacct`, `ssh ... find`, `ssh ... du`, or `rsync` for launcher-managed jobs before trying the matching `slurm-launcher` command.
@@ -75,14 +95,18 @@ Use this quick mapping before choosing a command.
   `slurm-launcher job-show <job_id> --json`
 - “Where is the log for one job?”:
   `slurm-launcher job-log <job_id> --json`
+- “Read the latest lines for one job without downloading them”:
+  `slurm-launcher job-log <job_id> --json`
+  then `slurm-launcher job-log <job_id> --lines 50`
 - “What logs were tracked for the last launcher run?”:
   `slurm-launcher logs --json`
 - “What is the current state of tracked jobs?”:
   `slurm-launcher status --json`
 - “Are tracked jobs still queued/running?”:
   `slurm-launcher monitor --json`
-- “List or download declared artifacts for tracked jobs”:
+- “List declarations, verify existence, or download tracked artifacts”:
   `slurm-launcher artifacts list --json`
+  `slurm-launcher artifacts check --json`
   `slurm-launcher artifacts download --dry-run --json`
 - “Download tracked logs/artifacts locally”:
   `slurm-launcher download-logs --dry-run --json`
@@ -95,16 +119,16 @@ Use this quick mapping before choosing a command.
 Know what a command will do before running it.
 
 - Read-only local/config inspection:
-  `validate --json`, `render --json`, `logs --json`
+  `validate --json`, `preflight --dry-run --json`, `render --json`, `logs --json`, `artifacts list --json`
 - Read-only remote inspection over SSH:
-  `doctor --ssh --json`, `jobs --json`, `job-show --json`, `job-log --json`, `status --json`, `monitor --json`, `preflight --dry-run --json`
+  `doctor --ssh --json`, `jobs --json`, `job-show --json`, `job-log --json`, `status --json`, `monitor --json`, `artifacts check --json`, and live `preflight --json`
 - Remote write without job submission:
   `stage --json` syncs project files to the remote workspace and writes local tracking artifacts.
-  `preflight --job-folder <folder> --json` runs remote checks but does not submit jobs.
 - Remote job submission:
   `submit --json`, `sbatch --json`, and `run --json` call `sbatch` and can consume queue/GPU time.
 - Local downloads:
   `download-logs`, `download-artifacts`, and `artifacts download` copy files to local `slurm_output/...` or the chosen `--output-dir`.
+  Run them only when the user requested a local copy; a request to inspect, read, or tail remote logs does not authorize a download.
 - Summary writes:
   `summary --json` updates local `slurm_output/<job_folder>/summary.json` and writes a remote `.slurm_run/summary.json` for the tracked run.
 
@@ -126,6 +150,11 @@ Preflight is generic. It checks only each job's `requires` entries:
 - plain paths must exist
 - globs must match at least one path
 - broken symlinks fail
+
+Every selected job must declare at least one `requires` entry. An undeclared job
+returns `ok=false`, `status="not-configured"`, and a nonzero exit instead of a
+vacuous successful result. This applies equally to `command` and `sbatch_file`
+jobs.
 
 It does not know about project-specific model packages. Express those expectations as explicit `requires` paths or project-local checks outside launcher core.
 
@@ -182,10 +211,11 @@ These are the config concepts an agent should keep straight.
   `setup`
   `env`
   `sbatch`
-  `artifacts`
-  `requires`
 - `sbatch_file` jobs may also define:
   `sbatch_args`
+- Both job types may also define:
+  `artifacts`
+  `requires`
 - `RUN_JOBS` defines a default subset.
 - `--only` overrides `RUN_JOBS`.
 - `DEFAULT_ENV` and `DEFAULT_SBATCH` apply globally before per-job overrides.
@@ -205,7 +235,7 @@ Each command below lists the purpose, when to use it, recommended agent invocati
   `slurm-launcher doctor --json`
   `slurm-launcher doctor --ssh --json`
 - Key arguments:
-  `--cluster-login` to bypass config lookup.
+  `--cluster-login` to bypass config lookup and use the caller's normal SSH resolution, unless `--config` is also explicit.
   `--config` to point at a repo or user-level config.
   `--ssh` to test connectivity and `sacct`/`scontrol`/`squeue`.
   `--json` for machine-readable output.
@@ -247,7 +277,7 @@ Each command below lists the purpose, when to use it, recommended agent invocati
   `--config`
   `--json`
 - JSON fields:
-  `job_id`, `detail_level`, `resolved_via`, plus any resolved fields among `job_name`, `state`, `partition`, `command`, `work_dir`, `stdout`, `stderr`, `node_list`, `num_nodes`, `gres`, `submit_time`, `start_time`, `end_time`, optional `launcher`
+  `ok`, `job_id`, `detail_level`, `resolved_via`, plus any resolved fields among `job_name`, `state`, `partition`, `command`, `work_dir`, `stdout`, `stderr`, `node_list`, `num_nodes`, `gres`, `submit_time`, `start_time`, `end_time`, optional `launcher`; failures return `ok=false` and `error`
 - Important behavior:
   Check `detail_level` before assuming all metadata is present.
   `detail_level=log-resolution` means the command could resolve log paths and core state, but omitted unavailable fields instead of returning a large set of `null` values.
@@ -272,9 +302,11 @@ Each command below lists the purpose, when to use it, recommended agent invocati
   `--config`
   `--json`
 - JSON fields:
-  `job_id`, `job_name`, `state`, `stream`, `path`, `resolved_via`
+  On success: `ok`, `job_id`, `job_name`, `state`, `stream`, `path`, `resolved_via`, `path_verified`, `content_included`, optional `probe_errors`; failures return `ok=false`, `error`, and `probe_errors`
 - Important behavior:
-  Path resolution tries SLURM metadata first and falls back to the archive convention only when needed.
+  Path resolution tries SLURM metadata first. It uses an archive convention only when an archive directory is explicitly configured, and marks that fallback `path_verified=false`.
+  SSH transport failures return an unresolved error instead of a guessed archive path.
+  JSON discovery never includes log content; `content_included=false`.
 
 ### `init`
 
@@ -327,12 +359,14 @@ Each command below lists the purpose, when to use it, recommended agent invocati
   `--dry-run`
   `--json`
 - JSON fields:
-  `ok`, `dry_run`, `remote_workdir`, `jobs`
+  `ok`, `dry_run`, `remote_workdir`, `checks_planned`, `checks_run`, `warnings`, `jobs`
 - Important behavior:
   In `per-run` mode, `--job-folder` is required because the launcher must know which staged workspace to inspect.
   `--dry-run --json` returns the generated remote check script and does not SSH into the cluster.
   Live preflight runs remote shell checks only; it does not submit jobs.
   Checks are generic: plain paths, globs, and broken symlinks.
+  If any selected job has no `requires`, preflight reports it as
+  `status="not-configured"`, returns `ok=false`, and exits nonzero.
 
 ### `render`
 
@@ -436,54 +470,73 @@ Each command below lists the purpose, when to use it, recommended agent invocati
 - Key arguments:
   optional positional `job_id`
   `--job <job_id>`
+  `--cluster-login <user@host>` for a direct job query
   `--tracking-file`
   `--latest`
   `--config`
   `--json`
 - JSON fields:
-  `ok`, `tracking_file`, `cluster_login`, `jobs`
+  `ok`, `tracking_file`, `cluster_login`, `probes`, `unresolved_job_ids`, `jobs`; each job includes `source`
 - Important behavior:
   With no job ID, status resolves the latest tracking file.
   With a job ID, status can use config cluster settings and may enrich from a tracking file if one exists.
   Returned job entries include `state`, `derived_state`, `exit_code`, timestamps, `elapsed`, and `partition` when SLURM reports them.
+  Status merges `sacct` history with `squeue` state for jobs missing from accounting.
+  Probe failures are explicit. If they leave any job unresolved, JSON returns `ok=false` and the command exits nonzero.
+  Treat `derived_state=UNKNOWN` as inconclusive, not as evidence that a job stopped or failed. Verify with `job-show <job_id> --json`.
+  Tracking-backed status uses the complete SSH context recorded in `jobs.json`; do not mix in an unrelated generic config.
 
 ### `logs`
 
 - Purpose:
-  Read the local tracking file and show tracked stdout/stderr paths.
+  Resolve stdout/stderr paths from local tracking and optionally read their remote content.
 - Use when:
-  You want tracked paths from the latest launcher submission without querying the cluster.
+  You want paths or content for jobs from the latest or a specified launcher submission.
 - Recommended for agents:
   `slurm-launcher logs --json`
+  Then, if content was requested:
+  `slurm-launcher logs --job <job_id> --lines 50`
 - Key arguments:
   `--tracking-file`
+  `--latest`
+  `--job <job_id>`
   `--only <job...>`
+  `--stderr`
+  `--lines <n>`
+  `--follow`
+  `--full`
   `--json`
 - JSON fields:
-  `created_at`, `cluster_login`, `ssh_config_file`, `ssh_options`, `job_folder`, `remote_workdir`, `remote_logdir`, `remote_slurm_output_dir`, `jobs`
+  `ok`, `source`, `content_included`, `remote_checked`, `created_at`, `cluster_login`, `ssh_config_file`, `ssh_options`, `job_folder`, `remote_workdir`, `remote_logdir`, `remote_slurm_output_dir`, `jobs`
+- Important behavior:
+  JSON mode returns tracking metadata and resolved paths; it does not include log text.
+  Plain `logs` shows paths. Non-JSON mode reads remote content when selecting a job or passing `--stderr`, `--lines`, `--follow`, or `--full`.
 
 ### `artifacts`
 
 - Purpose:
-  List or download artifact paths declared by tracked jobs.
+  List declared artifact paths, verify them remotely, or download them.
 - Use when:
   You want the launcher to resolve declared outputs from the latest/tracked run instead of manually building `rsync` commands.
 - Recommended for agents:
   `slurm-launcher artifacts list --json`
+  `slurm-launcher artifacts check --json`
   `slurm-launcher artifacts download --dry-run --json`
 - Key arguments:
-  subcommand `list|download`
+  subcommand `list|check|download`
   `--tracking-file`
   `--only <job...>`
   `--output-dir`
   `--dry-run` for download
   `--json`
 - JSON fields:
-  `ok`, `tracking_file`, `output_dir`, `dry_run`, `artifacts`, `commands`, `failures`
+  Always: `ok`, `operation`, `source`, `tracking_file`, `output_dir`, `remote_checked`, `declared_only`, `copy_attempted`, `artifacts`; downloads also include `dry_run`, `commands`, and `failures`; checked artifacts include `exists`, `kind`, and `size_bytes`
 - Important behavior:
-  `list` does not SSH; it derives remote/local paths from the tracking file.
+  `list` does not SSH; it derives remote/local paths from the tracking file and returns `declared_only=true`, `remote_checked=false`.
+  `check` performs one read-only SSH query and reports actual remote existence, type, and size without downloading.
   `download --dry-run --json` returns the `rsync` commands without copying.
   `download` copies declared artifacts under `slurm_output/downloaded_artifacts/<job_folder>/...` unless `--output-dir` is set.
+  Do not turn an inspect/read request into a download; require the user to request a local copy.
 
 ### `monitor`
 
@@ -595,6 +648,7 @@ Each command below lists the purpose, when to use it, recommended agent invocati
 - `job-show <job_id> --json`
 - `job-log <job_id> --json`
 - `artifacts list --json`
+- `artifacts check --json` when remote existence matters
 - `download-logs --dry-run --json`
 - `download-artifacts --dry-run --json`
 - `summary --json`
@@ -605,5 +659,9 @@ Each command below lists the purpose, when to use it, recommended agent invocati
 - Do not assume project commands work outside the intended repo.
 - Do not read full logs before first resolving the path and stream intentionally.
 - Do not use raw SSH or rsync for status, log lookup, or artifact downloads until the launcher command path has been tried.
+- Do not infer command arguments from related commands; consult `<command> --help` after upgrades or when a command rejects an argument.
+- Do not interpret `UNKNOWN` as a terminal job state; verify the job with `job-show`.
+- Do not interpret `artifacts list` as proof that a path exists; use `artifacts check`.
+- Do not download logs or artifacts when the user asked only to inspect, read, or tail them remotely.
 - Do not treat launcher enrichment as required for generic cluster inspection.
 - Do not modify this source repository unless the user explicitly asks for source changes.

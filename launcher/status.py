@@ -14,7 +14,12 @@ from rich.table import Table
 
 from .core import build_ssh_command
 from .job_tools import _normalized_text
-from .tracking import JobRecord, TrackingPayload, load_tracking_payload, resolve_tracking_file
+from .tracking import (
+    JobRecord,
+    TrackingPayload,
+    load_tracking_payload,
+    resolve_tracking_file,
+)
 
 console = Console()
 err_console = Console(stderr=True)
@@ -34,7 +39,36 @@ class JobStatus:
     elapsed: str | None
     partition: str | None
     derived_state: str
+    source: str | None = None
     tracking: JobRecord | None = None
+
+
+@dataclass(frozen=True)
+class StatusProbe:
+    """Outcome of one remote SLURM status source."""
+
+    source: str
+    returncode: int
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+@dataclass(frozen=True)
+class StatusQueryResult:
+    """Statuses plus enough diagnostics to distinguish UNKNOWN from query failure."""
+
+    statuses: list[JobStatus]
+    probes: list[StatusProbe]
+    unresolved_job_ids: list[str]
+
+    @property
+    def ok(self) -> bool:
+        if not self.unresolved_job_ids:
+            return True
+        return all(probe.ok for probe in self.probes)
 
 
 def _run_ssh_capture(
@@ -61,8 +95,8 @@ def _run_ssh_capture(
     )
 
 
-def _parse_sacct_status(output: str, job_ids: set[str]) -> dict[str, dict[str, str]]:
-    """Parse sacct output into a mapping of job_id -> fields."""
+def _parse_status_output(output: str, job_ids: set[str]) -> dict[str, dict[str, str]]:
+    """Parse normalized sacct/squeue output into a mapping of job_id -> fields."""
     results: dict[str, dict[str, str]] = {}
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -102,51 +136,102 @@ def _derive_state(state: str | None, exit_code: str | None) -> str:
     return token
 
 
+def _build_sacct_script(job_ids: list[str]) -> str:
+    id_expr = ",".join(shlex.quote(job_id) for job_id in job_ids)
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            "command -v sacct >/dev/null 2>&1",
+            (
+                f"sacct -X -n -P -j {id_expr} "
+                "--format JobIDRaw,JobName,State,ExitCode,Submit,Start,End,Elapsed,Partition"
+            ),
+        ]
+    )
+
+
+def _build_squeue_script(job_ids: list[str]) -> str:
+    id_expr = ",".join(shlex.quote(job_id) for job_id in job_ids)
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            "command -v squeue >/dev/null 2>&1",
+            f'squeue -h -j {id_expr} -o "%i|%j|%T|-|%V|%S|-|%M|%P"',
+        ]
+    )
+
+
 def query_job_statuses(
     cluster_login: str,
     jobs: list[JobRecord],
     *,
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
-) -> list[JobStatus]:
+) -> StatusQueryResult:
     """Query sacct/squeue for the given tracked jobs and return status records."""
-    runnable = [job for job in jobs if job.job_id and job.job_id not in {"", "unknown", "dry-run"}]
+    runnable = [
+        job
+        for job in jobs
+        if job.job_id and job.job_id not in {"", "unknown", "dry-run"}
+    ]
     if not runnable:
-        return []
+        return StatusQueryResult(statuses=[], probes=[], unresolved_job_ids=[])
 
     job_ids = [job.job_id for job in runnable]
     id_set = set(job_ids)
-    id_expr = ",".join(shlex.quote(job_id) for job_id in job_ids)
-
-    # Prefer sacct for completed/finished state; fall back to squeue for running jobs.
-    script = "\n".join(
-        [
-            "set -euo pipefail",
-            "if command -v sacct >/dev/null 2>&1; then",
-            '  echo "__SOURCE__=sacct"',
-            f"  sacct -X -n -P -j {id_expr} ",
-            "    --format JobIDRaw,JobName,State,ExitCode,Submit,Start,End,Elapsed,Partition",
-            "else",
-            '  echo "__SOURCE__=squeue"',
-            f"  squeue -h -j {id_expr} -o \"%i|%j|%T|%P|-.|-.|-.|%M|%P\"",
-            "fi",
-        ]
-    )
-    result = _run_ssh_capture(
+    sacct_script = _build_sacct_script(job_ids)
+    sacct_result = _run_ssh_capture(
         cluster_login,
-        script,
+        sacct_script,
         ssh_config_file=ssh_config_file,
         ssh_options=ssh_options,
     )
 
+    probes = [
+        StatusProbe(
+            source="sacct",
+            returncode=sacct_result.returncode,
+            stderr=sacct_result.stderr.strip(),
+        )
+    ]
     parsed: dict[str, dict[str, str]] = {}
-    if result.returncode == 0:
-        lines = result.stdout.splitlines()
-        if lines and lines[0].startswith("__SOURCE__="):
-            output = "\n".join(lines[1:])
-        else:
-            output = result.stdout
-        parsed = _parse_sacct_status(output, id_set)
+    if sacct_result.returncode == 0:
+        parsed = _parse_status_output(sacct_result.stdout, id_set)
+        for fields in parsed.values():
+            fields["source"] = "sacct"
+
+    # sacct can omit jobs that are still live or report UNKNOWN, especially
+    # immediately after submission. Query squeue for only those unresolved
+    # IDs and merge the result without replacing richer accounting data.
+    unresolved_ids = [
+        job_id
+        for job_id in job_ids
+        if job_id not in parsed
+        or _derive_state(parsed[job_id].get("state"), parsed[job_id].get("exit_code"))
+        == "UNKNOWN"
+    ]
+    if unresolved_ids:
+        squeue_script = _build_squeue_script(unresolved_ids)
+        squeue_result = _run_ssh_capture(
+            cluster_login,
+            squeue_script,
+            ssh_config_file=ssh_config_file,
+            ssh_options=ssh_options,
+        )
+        probes.append(
+            StatusProbe(
+                source="squeue",
+                returncode=squeue_result.returncode,
+                stderr=squeue_result.stderr.strip(),
+            )
+        )
+        if squeue_result.returncode == 0:
+            squeue_parsed = _parse_status_output(
+                squeue_result.stdout, set(unresolved_ids)
+            )
+            for fields in squeue_parsed.values():
+                fields["source"] = "squeue"
+            parsed.update(squeue_parsed)
 
     # Build status records, preserving tracking file order.
     statuses: list[JobStatus] = []
@@ -167,21 +252,39 @@ def query_job_statuses(
                 elapsed=_normalized_text(fields.get("elapsed")),
                 partition=_normalized_text(fields.get("partition")),
                 derived_state=derived,
+                source=_normalized_text(fields.get("source")),
                 tracking=job,
             )
         )
-    return statuses
+    unresolved_job_ids = [
+        status.job_id for status in statuses if status.derived_state == "UNKNOWN"
+    ]
+    return StatusQueryResult(
+        statuses=statuses,
+        probes=probes,
+        unresolved_job_ids=unresolved_job_ids,
+    )
 
 
 def _status_payload(
     tracking_file: Path | None,
     cluster_login: str | None,
-    statuses: list[JobStatus],
+    result: StatusQueryResult,
 ) -> dict[str, Any]:
     return {
-        "ok": True,
+        "ok": result.ok,
         "tracking_file": str(tracking_file) if tracking_file else None,
         "cluster_login": cluster_login,
+        "probes": [
+            {
+                "source": probe.source,
+                "ok": probe.ok,
+                "returncode": probe.returncode,
+                "error": None if probe.ok else (probe.stderr or None),
+            }
+            for probe in result.probes
+        ],
+        "unresolved_job_ids": result.unresolved_job_ids,
         "jobs": [
             {
                 "job_id": status.job_id,
@@ -194,8 +297,9 @@ def _status_payload(
                 "end_time": status.end_time,
                 "elapsed": status.elapsed,
                 "partition": status.partition,
+                "source": status.source,
             }
-            for status in statuses
+            for status in result.statuses
         ],
     }
 
@@ -258,6 +362,19 @@ def print_status_table(
     console.print(table)
 
 
+def _print_probe_errors(result: StatusQueryResult) -> None:
+    if result.ok:
+        return
+    for probe in result.probes:
+        if probe.ok:
+            continue
+        detail = probe.stderr or f"exit code {probe.returncode}"
+        err_console.print(
+            f"ERROR: {probe.source} status probe failed: {detail}",
+            style="bold red",
+        )
+
+
 def run_status(
     *,
     tracking_file: str | None = None,
@@ -287,26 +404,36 @@ def run_status(
                 matched = payload.filter_jobs(ids={job_id})
                 if matched:
                     jobs = matched
-                    effective_login = payload.cluster_login or cluster_login
-                    ssh_config_file = ssh_config_file or payload.ssh_config_file
-                    ssh_options = ssh_options or payload.ssh_options
+                    if payload.cluster_login:
+                        # A tracking file owns its complete SSH context. In
+                        # particular, ssh_config_file=None means use the
+                        # caller's normal SSH config; do not combine that alias
+                        # with transport settings from an unrelated config.
+                        effective_login = payload.cluster_login
+                        ssh_config_file = payload.ssh_config_file
+                        ssh_options = payload.ssh_options
             except Exception:
                 pass
-        statuses = query_job_statuses(
+        result = query_job_statuses(
             effective_login,
             jobs,
             ssh_config_file=ssh_config_file,
             ssh_options=ssh_options,
         )
         if json_output:
-            console.print_json(data=_status_payload(resolved_tracking, effective_login, statuses))
-            return 0
-        print_status_table(resolved_tracking, effective_login, statuses)
-        return 0
+            console.print_json(
+                data=_status_payload(resolved_tracking, effective_login, result)
+            )
+            return 0 if result.ok else 1
+        print_status_table(resolved_tracking, effective_login, result.statuses)
+        _print_probe_errors(result)
+        return 0 if result.ok else 1
 
     resolved_tracking = resolve_tracking_file(tracking_file)
     if resolved_tracking is None:
-        message = "No tracking file found. Run a submission first or pass --tracking-file."
+        message = (
+            "No tracking file found. Run a submission first or pass --tracking-file."
+        )
         if json_output:
             console.print_json(data={"ok": False, "error": message})
         else:
@@ -331,14 +458,17 @@ def run_status(
             err_console.print(f"ERROR: {message}", style="bold red")
         return 1
 
-    statuses = query_job_statuses(
+    result = query_job_statuses(
         payload.cluster_login,
         payload.jobs,
-        ssh_config_file=ssh_config_file or payload.ssh_config_file,
-        ssh_options=ssh_options or payload.ssh_options,
+        ssh_config_file=payload.ssh_config_file,
+        ssh_options=payload.ssh_options,
     )
     if json_output:
-        console.print_json(data=_status_payload(resolved_tracking, payload.cluster_login, statuses))
-        return 0
-    print_status_table(resolved_tracking, payload.cluster_login, statuses)
-    return 0
+        console.print_json(
+            data=_status_payload(resolved_tracking, payload.cluster_login, result)
+        )
+        return 0 if result.ok else 1
+    print_status_table(resolved_tracking, payload.cluster_login, result.statuses)
+    _print_probe_errors(result)
+    return 0 if result.ok else 1

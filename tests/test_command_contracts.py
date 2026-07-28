@@ -46,6 +46,9 @@ class CommandContractTests(unittest.TestCase):
         self.assertIn("rsync -az --info=progress2", commands[1])
         self.assertIn("--dry-run", commands[1])
         self.assertIn("-e 'ssh -F /dev/null -o BatchMode=yes'", commands[1])
+        for cache_dir in (".cache/", ".uv-cache/", ".ruff_cache/"):
+            with self.subTest(cache_dir=cache_dir):
+                self.assertIn(f"--exclude {cache_dir}", commands[1])
         self.assertIn("source.json", commands[2])
 
     def test_command_specs_cover_public_commands(self) -> None:

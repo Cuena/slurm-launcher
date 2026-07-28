@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,38 @@ from tests.helpers import make_settings
 
 
 class CliTests(unittest.TestCase):
+    def test_version_reports_installed_package_version(self) -> None:
+        stdout = io.StringIO()
+        with patch("sys.stdout", stdout), self.assertRaises(SystemExit) as raised:
+            cli.parse_args(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(
+            stdout.getvalue().strip(), f"slurm-launcher {cli.PACKAGE_VERSION}"
+        )
+
+    @patch("launcher.cli._resolve_config_path")
+    def test_explicit_cluster_login_uses_normal_ssh_config(
+        self, mock_resolve_config_path
+    ) -> None:
+        resolved = cli._resolve_cluster_context(
+            argparse.Namespace(config=None, cluster_login="acc")
+        )
+
+        self.assertEqual(resolved, ("acc", None, None, [], None))
+        mock_resolve_config_path.assert_not_called()
+
+    @patch("launcher.cli._resolve_config_path")
+    def test_direct_status_login_uses_normal_ssh_config(
+        self, mock_resolve_config_path
+    ) -> None:
+        resolved = cli._resolve_cluster_login_from_args(
+            argparse.Namespace(config=None, cluster_login="acc")
+        )
+
+        self.assertEqual(resolved, ("acc", None, [], None))
+        mock_resolve_config_path.assert_not_called()
+
     def test_parse_args_supports_json_for_agent_facing_commands(self) -> None:
         commands = [
             "validate",
@@ -28,6 +61,7 @@ class CliTests(unittest.TestCase):
             "job-log",
             "download-logs",
             "download-artifacts",
+            "status",
         ]
         for command in commands:
             argv = ["slurm-launcher", command, "--json"]
@@ -42,6 +76,17 @@ class CliTests(unittest.TestCase):
                     args = cli.parse_args()
                 self.assertEqual(args.command, command)
                 self.assertTrue(args.json)
+
+    def test_status_accepts_explicit_cluster_login(self) -> None:
+        args = cli.parse_args(["status", "12345", "--cluster-login", "acc", "--json"])
+
+        self.assertEqual(args.job_id_arg, "12345")
+        self.assertEqual(args.cluster_login, "acc")
+
+    def test_tracking_commands_do_not_expose_unused_workspace_option(self) -> None:
+        for command in ("status", "logs"):
+            with self.subTest(command=command), self.assertRaises(SystemExit):
+                cli.parse_args([command, "--workspace", "fixed"])
 
     def test_validate_predefined_sbatch_job_rejects_path_outside_local_root(
         self,
@@ -310,7 +355,9 @@ class CliTests(unittest.TestCase):
             sbatch_command="sbatch /remote/workspaces/project_001/slurm/train.sbatch",
             sbatch_options={},
             remote_sbatch_path="/remote/workspaces/project_001/slurm/train.sbatch",
-            commands=["ssh user@cluster 'sbatch /remote/workspaces/project_001/slurm/train.sbatch'"],
+            commands=[
+                "ssh user@cluster 'sbatch /remote/workspaces/project_001/slurm/train.sbatch'"
+            ],
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -41,6 +41,8 @@ class JobLogInfo:
     stdout: str | None
     stderr: str | None
     source: str
+    verified: bool = True
+    probe_errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -384,6 +386,7 @@ def resolve_job_details(
 
 def _job_details_payload(details: JobDetails) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "ok": True,
         "job_id": details.job_id,
         "resolved_via": details.source,
         "detail_level": details.detail_level,
@@ -507,9 +510,7 @@ def _filter_recent_jobs(
         return jobs
     normalized_states = {_normalized_state_token(state) for state in states if state}
     return [
-        job
-        for job in jobs
-        if _normalized_state_token(job.state) in normalized_states
+        job for job in jobs if _normalized_state_token(job.state) in normalized_states
     ]
 
 
@@ -659,10 +660,11 @@ def show_job_details(
         ssh_options=ssh_options,
     )
     if details is None:
-        err_console.print(
-            f"ERROR: Could not resolve job details for job {job_id}.",
-            style="bold red",
-        )
+        message = f"Could not resolve job details for job {job_id}."
+        if json_output:
+            console.print_json(data={"ok": False, "job_id": job_id, "error": message})
+        else:
+            err_console.print(f"ERROR: {message}", style="bold red")
         return 1
 
     payload = _job_details_payload(details)
@@ -775,6 +777,21 @@ def resolve_job_log_info(
     else:
         probe_errors.append(f"sacct failed (rc={sacct_result.returncode})")
 
+    transport_failed = any(
+        result.returncode == 255 for result in (scontrol_result, sacct_result)
+    )
+    if transport_failed or not archive_dir:
+        return JobLogInfo(
+            job_id=job_id,
+            job_name="",
+            state="",
+            stdout=None,
+            stderr=None,
+            source="unresolved",
+            verified=False,
+            probe_errors=tuple(probe_errors),
+        )
+
     archive_root, archive_source = effective_archive_dir(archive_dir)
     archive_root = archive_root.rstrip("/")
     fallback_detail = "; ".join(probe_errors)
@@ -785,6 +802,8 @@ def resolve_job_log_info(
         stdout=f"{archive_root}/{job_id}.out",
         stderr=f"{archive_root}/{job_id}.err",
         source=f"archive:{archive_source} (fallback: {fallback_detail})",
+        verified=False,
+        probe_errors=tuple(probe_errors),
     )
 
 
@@ -822,20 +841,34 @@ def show_job_log(
 
     target_path = info.stdout if stream == "stdout" else info.stderr
     if not target_path:
-        err_console.print(
-            f"ERROR: No {stream} path available for job {job_id}.",
-            style="bold red",
-        )
+        message = f"Could not resolve a verified {stream} path for job {job_id}."
+        if json_output:
+            console.print_json(
+                data={
+                    "ok": False,
+                    "job_id": job_id,
+                    "stream": stream,
+                    "error": message,
+                    "probe_errors": list(info.probe_errors),
+                }
+            )
+        else:
+            err_console.print(f"ERROR: {message}", style="bold red")
         return 1
 
     payload = {
+        "ok": True,
         "job_id": info.job_id,
         "job_name": info.job_name or None,
         "state": info.state or None,
         "stream": stream,
         "path": target_path,
         "resolved_via": info.source,
+        "path_verified": info.verified,
+        "content_included": False,
     }
+    if info.probe_errors:
+        payload["probe_errors"] = list(info.probe_errors)
     if json_output:
         console.print_json(data=payload)
         return 0

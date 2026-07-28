@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+from posixpath import join as posix_join
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -71,8 +72,8 @@ def build_remote_check_script(
       - If it contains a glob character (*, ?, [), count matches and fail on zero.
       - Otherwise check the path exists and is not a broken symlink.
     """
-    lines = ["set -euo pipefail", f'cd {shlex.quote(remote_workdir)}']
-    lines.append('failed=0')
+    lines = ["set -euo pipefail", f"cd {shlex.quote(remote_workdir)}"]
+    lines.append("failed=0")
     for req in requirements:
         quoted = shlex.quote(req)
         lines.append(f'echo "CHECK_START|{req}"')
@@ -80,26 +81,26 @@ def build_remote_check_script(
         lines.append(
             f'if [[ {quoted} == *"*"* || {quoted} == *"?"* || {quoted} == *"["* ]]; then'
         )
-        lines.append(f'  count=$(compgen -G {quoted} 2>/dev/null | wc -l)')
+        lines.append(f"  count=$(compgen -G {quoted} 2>/dev/null | wc -l) || true")
         lines.append('  if [ "$count" -eq 0 ]; then')
         lines.append(f'    echo "CHECK_FAIL|{req}|glob matched 0 files"')
-        lines.append('    failed=1')
-        lines.append('  else')
+        lines.append("    failed=1")
+        lines.append("  else")
         lines.append(f'    echo "CHECK_OK|{req}|matched $count"')
-        lines.append('  fi')
-        lines.append('else')
+        lines.append("  fi")
+        lines.append("else")
         # Detect broken symlinks: -L without -e means a symlink pointing to a missing target.
-        lines.append(f'  if [ -e {quoted} ]; then')
+        lines.append(f"  if [ -e {quoted} ]; then")
         lines.append(f'    echo "CHECK_OK|{req}|exists"')
-        lines.append(f'  elif [ -L {quoted} ]; then')
+        lines.append(f"  elif [ -L {quoted} ]; then")
         lines.append(f'    echo "CHECK_FAIL|{req}|broken symlink"')
-        lines.append('    failed=1')
-        lines.append('  else')
+        lines.append("    failed=1")
+        lines.append("  else")
         lines.append(f'    echo "CHECK_FAIL|{req}|missing"')
-        lines.append('    failed=1')
-        lines.append('  fi')
-        lines.append('fi')
-    lines.append('exit $failed')
+        lines.append("    failed=1")
+        lines.append("  fi")
+        lines.append("fi")
+    lines.append("exit $failed")
     return "\n".join(lines)
 
 
@@ -142,11 +143,14 @@ def run_preflight_for_job(
     parsed = _parse_check_output(result.stdout)
     for req in requirements:
         ok, message = parsed.get(req, (False, "check did not return"))
+        remote_path = (
+            req if req.startswith("/") else posix_join(remote_paths.workdir, req)
+        )
         checks.append(
             PreflightCheck(
                 kind="require",
                 path=req,
-                remote_path=f"{remote_paths.workdir}/{req.lstrip('/')}",
+                remote_path=remote_path,
                 ok=ok,
                 message=message,
             )
@@ -175,23 +179,49 @@ def run_preflight(
         wanted = set(selected_jobs)
         jobs = [job for job in jobs if getattr(job, "name", "") in wanted]
 
+    missing_requirements = [
+        getattr(job, "name", "<unnamed>")
+        for job in jobs
+        if not list(getattr(job, "requires", []) or [])
+    ]
+    missing_warning_by_job = {
+        job_name: (
+            f"Job '{job_name}' has no 'requires'; preflight cannot validate its "
+            "remote prerequisites."
+        )
+        for job_name in missing_requirements
+    }
+    warnings = list(missing_warning_by_job.values())
+    if not jobs:
+        warnings.append("No jobs were selected for preflight.")
+
     dry_run_entries: list[dict[str, Any]] = []
     results: list[PreflightResult] = []
     for job in jobs:
         requirements = list(getattr(job, "requires", []) or [])
         if not requirements:
+            dry_run_entries.append(
+                {
+                    "job_name": job.name,
+                    "ok": False,
+                    "status": "not-configured",
+                    "requirements": [],
+                    "message": missing_warning_by_job[job.name],
+                }
+            )
             continue
         if dry_run:
             script = build_remote_check_script(remote_paths.workdir, requirements)
-            if json_output:
-                dry_run_entries.append(
-                    {
-                        "job_name": job.name,
-                        "requirements": requirements,
-                        "script": script,
-                    }
-                )
-            else:
+            dry_run_entries.append(
+                {
+                    "job_name": job.name,
+                    "ok": True,
+                    "status": "planned",
+                    "requirements": requirements,
+                    "script": script,
+                }
+            )
+            if not json_output:
                 console.print(
                     f"[yellow]dry-run[/yellow] preflight for {job.name}", style="dim"
                 )
@@ -208,42 +238,78 @@ def run_preflight(
         results.append(result)
 
     if dry_run:
+        ok = bool(jobs) and not missing_requirements
         if json_output:
             console.print_json(
                 data={
-                    "ok": True,
+                    "ok": ok,
                     "dry_run": True,
                     "remote_workdir": remote_paths.workdir,
+                    "checks_planned": sum(
+                        len(entry.get("requirements", []))
+                        for entry in dry_run_entries
+                        if entry.get("status") == "planned"
+                    ),
+                    "checks_run": 0,
+                    "warnings": warnings,
                     "jobs": dry_run_entries,
                 }
             )
-        return 0
+        elif warnings:
+            for warning in warnings:
+                err_console.print(warning, style="bold red")
+        return 0 if ok else 1
 
-    if json_output:
-        console.print_json(
-            data={
-                "ok": all(result.ok for result in results),
-                "remote_workdir": remote_paths.workdir,
-                "jobs": [
+    ok = (
+        bool(jobs) and not missing_requirements and all(result.ok for result in results)
+    )
+    result_by_job = {result.job_name: result for result in results}
+    live_entries: list[dict[str, Any]] = []
+    for job in jobs:
+        if job.name in missing_warning_by_job:
+            live_entries.append(
+                {
+                    "job_name": job.name,
+                    "ok": False,
+                    "status": "not-configured",
+                    "checks": [],
+                    "message": missing_warning_by_job[job.name],
+                }
+            )
+            continue
+        result = result_by_job[job.name]
+        live_entries.append(
+            {
+                "job_name": result.job_name,
+                "ok": result.ok,
+                "status": "passed" if result.ok else "failed",
+                "checks": [
                     {
-                        "job_name": result.job_name,
-                        "ok": result.ok,
-                        "checks": [
-                            {
-                                "kind": check.kind,
-                                "path": check.path,
-                                "remote_path": check.remote_path,
-                                "ok": check.ok,
-                                "message": check.message,
-                            }
-                            for check in result.checks
-                        ],
+                        "kind": check.kind,
+                        "path": check.path,
+                        "remote_path": check.remote_path,
+                        "ok": check.ok,
+                        "message": check.message,
                     }
-                    for result in results
+                    for check in result.checks
                 ],
             }
         )
-        return 0 if all(result.ok for result in results) else 1
+    if json_output:
+        console.print_json(
+            data={
+                "ok": ok,
+                "dry_run": False,
+                "remote_workdir": remote_paths.workdir,
+                "checks_planned": sum(
+                    len(list(getattr(job, "requires", []) or [])) for job in jobs
+                ),
+                "checks_run": sum(len(result.checks) for result in results),
+                "warnings": warnings,
+                "jobs": live_entries,
+            }
+        )
+        return 0 if ok else 1
 
     console.print(
         Panel.fit(
@@ -252,10 +318,6 @@ def run_preflight(
             border_style="cyan",
         )
     )
-    if not results:
-        console.print("No jobs with requirements.", style="yellow")
-        return 0
-
     for result in results:
         console.print()
         console.print(
@@ -277,8 +339,13 @@ def run_preflight(
                 )
             console.print(table)
 
-    if any(not result.ok for result in results):
-        err_console.print("\nPreflight failed. Fix issues before submitting.", style="bold red")
+    for warning in warnings:
+        err_console.print(warning, style="bold red")
+
+    if not ok:
+        err_console.print(
+            "\nPreflight failed. Fix issues before submitting.", style="bold red"
+        )
         return 1
 
     console.print("\nPreflight passed.", style="green")

@@ -297,7 +297,7 @@ class JobLogProbeTests(unittest.TestCase):
     """Tests that job-log resolution surfaces probe failures."""
 
     @patch("launcher.job_tools._run_ssh_capture")
-    def test_fallback_source_includes_probe_errors(
+    def test_missing_archive_returns_unresolved_probe_errors(
         self,
         mock_run_ssh_capture,
     ) -> None:
@@ -316,9 +316,11 @@ class JobLogProbeTests(unittest.TestCase):
 
         self.assertIsNotNone(info)
         assert info is not None
-        self.assertIn("fallback", info.source)
-        self.assertIn("scontrol failed", info.source)
-        self.assertIn("sacct failed", info.source)
+        self.assertEqual(info.source, "unresolved")
+        self.assertFalse(info.verified)
+        self.assertIsNone(info.stdout)
+        self.assertIn("scontrol failed", info.probe_errors[0])
+        self.assertIn("sacct failed", info.probe_errors[1])
 
     @patch("launcher.job_tools._run_ssh_capture")
     def test_fallback_when_scontrol_returns_no_paths(
@@ -342,6 +344,7 @@ class JobLogProbeTests(unittest.TestCase):
         assert info is not None
         self.assertIn("scontrol returned no log paths", info.source)
         self.assertIn("/custom/archive/99999.out", info.stdout or "")
+        self.assertFalse(info.verified)
 
 
 class LogsCommandWorkflowTests(unittest.TestCase):

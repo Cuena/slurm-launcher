@@ -65,6 +65,31 @@ class TestConfigWarnings(TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertIn("rsync exclude", warnings[0])
 
+    def test_sbatch_file_without_requires_warns_that_preflight_will_fail(self) -> None:
+        settings = self._settings()
+        jobs = [JobSpec(name="shared", sbatch_file="slurm/shared.sbatch")]
+
+        warnings = collect_config_warnings(settings, jobs)
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("sbatch_file", warnings[0])
+        self.assertIn("Preflight will fail", warnings[0])
+
+    def test_sbatch_file_required_path_excluded_warns(self) -> None:
+        settings = self._settings()
+        jobs = [
+            JobSpec(
+                name="shared",
+                sbatch_file="slurm/shared.sbatch",
+                requires=["data/processed"],
+            )
+        ]
+
+        warnings = collect_config_warnings(settings, jobs)
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("rsync exclude", warnings[0])
+
     def test_output_dir_not_declared_warns(self) -> None:
         settings = self._settings(artifact_paths=[])
         jobs = [

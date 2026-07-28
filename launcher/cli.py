@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -94,6 +95,11 @@ console = Console()
 err_console = Console(stderr=True)
 GENERIC_CONFIG_PATH = Path.home() / ".config" / "slurm-launcher" / "config.py"
 
+try:
+    PACKAGE_VERSION = version("slurm-launcher")
+except PackageNotFoundError:
+    PACKAGE_VERSION = "unknown"
+
 
 @dataclass(frozen=False)
 class ExecutionContext:
@@ -107,11 +113,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     parser = argparse.ArgumentParser(
         description="Submit SLURM jobs on a remote cluster"
     )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"slurm-launcher {PACKAGE_VERSION}",
+    )
     subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-    init_parser = subparsers.add_parser(
-        "init", help=COMMAND_SPECS["init"].summary
-    )
+    init_parser = subparsers.add_parser("init", help=COMMAND_SPECS["init"].summary)
     init_parser.add_argument(
         "--force", action="store_true", help="Overwrite existing config file"
     )
@@ -126,9 +135,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     )
     _add_status_args(status_parser)
 
-    logs_parser = subparsers.add_parser(
-        "logs", help=COMMAND_SPECS["logs"].summary
-    )
+    logs_parser = subparsers.add_parser("logs", help=COMMAND_SPECS["logs"].summary)
     _add_logs_args(logs_parser)
 
     add_artifacts_parser(subparsers)
@@ -150,9 +157,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     )
     _add_monitor_args(monitor_parser)
 
-    jobs_parser = subparsers.add_parser(
-        "jobs", help=COMMAND_SPECS["jobs"].summary
-    )
+    jobs_parser = subparsers.add_parser("jobs", help=COMMAND_SPECS["jobs"].summary)
     _add_jobs_args(jobs_parser)
 
     job_show_parser = subparsers.add_parser(
@@ -212,9 +217,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, argparse.ArgumentParser]:
     )
     _add_sbatch_args(sbatch_parser)
 
-    run_parser = subparsers.add_parser(
-        "run", help=COMMAND_SPECS["run"].summary
-    )
+    run_parser = subparsers.add_parser("run", help=COMMAND_SPECS["run"].summary)
     _add_run_args(run_parser)
     return parser, run_parser
 
@@ -226,7 +229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         return run_parser.parse_args([])
     if raw_args[0] in COMMAND_NAMES:
         return parser.parse_args(raw_args)
-    if raw_args[0] in {"-h", "--help"}:
+    if raw_args[0] in {"-h", "--help", "--version"}:
         return parser.parse_args(raw_args)
     return run_parser.parse_args(raw_args)
 
@@ -445,7 +448,17 @@ def _add_render_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_status_args(parser: argparse.ArgumentParser) -> None:
-    _add_config_args(parser)
+    parser.add_argument(
+        "--config",
+        help=(
+            "Optional launcher config for a direct job query. Default lookup: "
+            "repo config, then ~/.config/slurm-launcher/config.py."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-login",
+        help="Remote SSH login (user@host) for a direct job query. Overrides CLUSTER_LOGIN from config.",
+    )
     parser.add_argument(
         "job_id_arg",
         nargs="?",
@@ -476,7 +489,6 @@ def _add_status_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_logs_args(parser: argparse.ArgumentParser) -> None:
-    _add_config_args(parser)
     parser.add_argument(
         "--tracking-file",
         help=(
@@ -525,7 +537,7 @@ def _add_logs_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Print raw JSON payload",
+        help="Print tracking metadata and log paths as JSON; does not read log content.",
     )
 
 
@@ -754,7 +766,9 @@ def _prepare_configured_jobs(
     fail_duplicate_names: bool = False,
     validate_predefined_jobs: bool = True,
 ) -> list[JobSpec]:
-    jobs = prepare_jobs(config, _configured_run_only(config, args), settings.default_env)
+    jobs = prepare_jobs(
+        config, _configured_run_only(config, args), settings.default_env
+    )
     if fail_duplicate_names:
         _fail_duplicate_jobs(jobs)
     if validate_predefined_jobs:
@@ -796,8 +810,15 @@ def _resolve_cluster_context(
     args: argparse.Namespace,
 ) -> tuple[str, str | None, str | None, list[str], Path | None] | None:
     config_arg = str(args.config) if getattr(args, "config", None) else None
-    config_path = _resolve_config_path(
-        config_arg, extra_candidates=[GENERIC_CONFIG_PATH]
+    explicit_login = str(getattr(args, "cluster_login", None) or "").strip()
+    # An explicit destination is a complete request to use the caller's
+    # normal SSH resolution unless --config was also explicitly supplied.
+    # Loading the generic config here can otherwise turn `ssh acc` into
+    # `ssh -F /dev/null acc` and silently disable the requested alias.
+    config_path = (
+        _resolve_config_path(config_arg, extra_candidates=[GENERIC_CONFIG_PATH])
+        if config_arg or not explicit_login
+        else None
     )
     config = None
     if config_arg and config_path is None:
@@ -808,9 +829,7 @@ def _resolve_cluster_context(
         config = load_config(config_path)
 
     cluster_login = str(
-        getattr(args, "cluster_login", None)
-        or getattr(config, "CLUSTER_LOGIN", None)
-        or ""
+        explicit_login or getattr(config, "CLUSTER_LOGIN", None) or ""
     ).strip()
     if not cluster_login:
         err_console.print(
@@ -1778,8 +1797,11 @@ def _resolve_cluster_login_from_args(
     Returns (cluster_login, ssh_config_file, ssh_options, config_path).
     """
     config_arg = str(args.config) if getattr(args, "config", None) else None
-    config_path = _resolve_config_path(
-        config_arg, extra_candidates=[GENERIC_CONFIG_PATH]
+    explicit_login = str(getattr(args, "cluster_login", None) or "").strip()
+    config_path = (
+        _resolve_config_path(config_arg, extra_candidates=[GENERIC_CONFIG_PATH])
+        if config_arg or not explicit_login
+        else None
     )
     config = None
     if config_arg and config_path is None:
@@ -1788,9 +1810,7 @@ def _resolve_cluster_login_from_args(
         config = load_config(config_path)
 
     cluster_login = str(
-        getattr(args, "cluster_login", None)
-        or getattr(config, "CLUSTER_LOGIN", None)
-        or ""
+        explicit_login or getattr(config, "CLUSTER_LOGIN", None) or ""
     ).strip()
     ssh_config_file = getattr(config, "SSH_CONFIG_FILE", None)
     ssh_config_file_text = str(ssh_config_file).strip() if ssh_config_file else None
@@ -1804,9 +1824,6 @@ def _resolve_cluster_login_from_args(
 
 
 def do_status(args: argparse.Namespace) -> int:
-    cluster_login, ssh_config_file, ssh_options, _ = _resolve_cluster_login_from_args(
-        args
-    )
     positional_job_id = getattr(args, "job_id_arg", None)
     flag_job_id = args.job_id
     if positional_job_id and flag_job_id and positional_job_id != flag_job_id:
@@ -1815,6 +1832,13 @@ def do_status(args: argparse.Namespace) -> int:
         )
         return 1
     effective_job_id = flag_job_id or positional_job_id
+    cluster_login: str | None = None
+    ssh_config_file: str | None = None
+    ssh_options: list[str] | None = None
+    if effective_job_id:
+        cluster_login, ssh_config_file, ssh_options, _ = (
+            _resolve_cluster_login_from_args(args)
+        )
     return run_status(
         tracking_file=args.tracking_file,
         job_id=effective_job_id,
@@ -1902,9 +1926,7 @@ def _stream_tracked_logs(
     from .job_tools import build_ssh_command
 
     if not payload.cluster_login:
-        err_console.print(
-            "Missing cluster_login in tracking file.", style="bold red"
-        )
+        err_console.print("Missing cluster_login in tracking file.", style="bold red")
         return 1
 
     if len(jobs) > 1 and not full:

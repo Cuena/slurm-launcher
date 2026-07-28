@@ -23,6 +23,9 @@ DEFAULT_RSYNC_EXCLUDES = [
     "*.egg-info/",
     ".mypy_cache/",
     ".pytest_cache/",
+    ".ruff_cache/",
+    ".uv-cache/",
+    ".cache/",
     ".venv/",
     "venv/",
     ".idea/",
@@ -359,7 +362,9 @@ def sync_project(
             console.print("dry-run rsync command:", style="yellow")
             console.print(rsync_command, style="dim")
             console.print("dry-run skipping rsync execution", style="yellow")
-        commands.append(format_source_metadata_command(settings, remote_paths, source_state))
+        commands.append(
+            format_source_metadata_command(settings, remote_paths, source_state)
+        )
         return commands
     subprocess.run(cmd, check=True)
     commands.extend(write_remote_source_metadata(settings, remote_paths, source_state))
@@ -1047,7 +1052,9 @@ def inspect_source_state(repo_root: Path) -> SourceState:
     )
 
 
-def enforce_clean_git(settings: LauncherSettings, *, require_clean_git: bool = False) -> None:
+def enforce_clean_git(
+    settings: LauncherSettings, *, require_clean_git: bool = False
+) -> None:
     if not (settings.require_clean_git or require_clean_git):
         return
     source_state = inspect_source_state(settings.project_root)

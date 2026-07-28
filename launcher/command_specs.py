@@ -60,6 +60,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         agent_recommendation="Prefer `job-show <job_id> --json`; check `detail_level` before assuming every SLURM field is available, and treat launcher enrichment as optional metadata.",
         supports_json=True,
         json_fields=(
+            "ok",
             "job_id",
             "detail_level",
             "job_name",
@@ -82,9 +83,20 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "job-log": CommandSpec(
         summary="Resolve and optionally read stdout or stderr for one SLURM job ID.",
-        agent_recommendation="Use `job-log <job_id> --json` to resolve paths first; only read content after checking the returned `path` and `resolved_via` fields.",
+        agent_recommendation="Use `job-log <job_id> --json` to resolve paths first; only read content when `ok` is true and after checking `path_verified`, `path`, and `resolved_via`.",
         supports_json=True,
-        json_fields=("job_id", "job_name", "state", "stream", "path", "resolved_via"),
+        json_fields=(
+            "ok",
+            "job_id",
+            "job_name",
+            "state",
+            "stream",
+            "path",
+            "resolved_via",
+            "path_verified",
+            "content_included",
+            "probe_errors",
+        ),
         examples=(
             "slurm-launcher job-log 12345 --json",
             "slurm-launcher job-log 12345 --stream stderr --follow",
@@ -136,13 +148,17 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         summary="Check remote prerequisites for selected jobs before submitting.",
         agent_recommendation=(
             "In per-run mode, run `stage --json` first and pass its job_folder "
-            "to `preflight --job-folder ... --json`; fail loud on missing globs "
-            "or broken symlinks."
+            "to `preflight --job-folder ... --json`; every selected job must "
+            "declare `requires`, and missing paths, globs, or broken symlinks fail."
         ),
         supports_json=True,
         json_fields=(
             "ok",
+            "dry_run",
             "remote_workdir",
+            "checks_planned",
+            "checks_run",
+            "warnings",
             "jobs",
         ),
         examples=(
@@ -187,13 +203,18 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         ),
     ),
     "artifacts": CommandSpec(
-        summary="List or download job artifacts from a tracked submission.",
-        agent_recommendation="Prefer `artifacts list --json` before `artifacts download`; use `--only` to limit scope.",
+        summary="List, remotely check, or download declared artifacts from a tracked submission.",
+        agent_recommendation="Use `artifacts list --json` for declarations and `artifacts check --json` for remote existence; run `artifacts download` only when the user requested a local copy, and use `--only` to limit scope.",
         supports_json=True,
         json_fields=(
             "ok",
+            "operation",
+            "source",
             "tracking_file",
             "output_dir",
+            "remote_checked",
+            "declared_only",
+            "copy_attempted",
             "dry_run",
             "artifacts",
             "commands",
@@ -201,6 +222,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         ),
         examples=(
             "slurm-launcher artifacts list --json",
+            "slurm-launcher artifacts check --json",
             "slurm-launcher artifacts download --dry-run --json",
             "slurm-launcher artifacts download --only train eval --json",
         ),
@@ -272,10 +294,18 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
         ),
     ),
     "logs": CommandSpec(
-        summary="Show tracked stdout and stderr paths from a previous submission.",
-        agent_recommendation="Prefer `logs --json` before `monitor`, `download-logs`, or targeted manual inspection.",
+        summary="Resolve tracked log paths and optionally read their remote content.",
+        agent_recommendation=(
+            "Use `logs --json` to inspect tracking metadata without reading log content; "
+            "use non-JSON `logs --job <job_id>` with `--lines`, `--stderr`, or `--follow` "
+            "only when remote content was requested."
+        ),
         supports_json=True,
         json_fields=(
+            "ok",
+            "source",
+            "content_included",
+            "remote_checked",
             "created_at",
             "cluster_login",
             "ssh_config_file",
@@ -286,21 +316,32 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "remote_slurm_output_dir",
             "jobs",
         ),
-        examples=("slurm-launcher logs --json",),
+        examples=(
+            "slurm-launcher logs --json",
+            "slurm-launcher logs --job 43054508 --lines 50",
+            "slurm-launcher logs --job 43054508 --stderr --follow",
+        ),
     ),
     "status": CommandSpec(
         summary="Show current SLURM state for tracked jobs or a single job id.",
-        agent_recommendation="Prefer `status --json` after a run; use `status <job_id> --json` for one-off checks without a tracking file.",
+        agent_recommendation=(
+            "Prefer `status --json` after a run; use `status <job_id> --json` for "
+            "one-off checks without a tracking file. Treat UNKNOWN as inconclusive and "
+            "verify that job with `job-show <job_id> --json`."
+        ),
         supports_json=True,
         json_fields=(
             "ok",
             "tracking_file",
             "cluster_login",
+            "probes",
+            "unresolved_job_ids",
             "jobs",
         ),
         examples=(
             "slurm-launcher status --latest --json",
             "slurm-launcher status 43054508 --json",
+            "slurm-launcher status 43054508 --cluster-login user@cluster --json",
         ),
     ),
     "monitor": CommandSpec(
@@ -324,7 +365,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "download-logs": CommandSpec(
         summary="Download tracked stdout and stderr files to the local machine.",
-        agent_recommendation="Prefer `download-logs --dry-run --json` before a live download; use the returned commands instead of constructing rsync manually.",
+        agent_recommendation="Run only when the user requested a local copy. Prefer `download-logs --dry-run --json` before a live download; use the returned commands instead of constructing rsync manually.",
         supports_json=True,
         json_fields=(
             "ok",
@@ -344,7 +385,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "download-artifacts": CommandSpec(
         summary="Download configured or explicit artifact paths from the tracked remote workdir.",
-        agent_recommendation="Prefer `download-artifacts --dry-run --json` before a live download; use `--path` for targeted artifacts instead of raw rsync.",
+        agent_recommendation="Run only when the user requested a local copy. Prefer `download-artifacts --dry-run --json` before a live download; use `--path` for targeted artifacts instead of raw rsync.",
         supports_json=True,
         json_fields=(
             "ok",
