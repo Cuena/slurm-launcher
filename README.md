@@ -291,6 +291,8 @@ directly over SSH, which makes them useful even for jobs not launched by this re
 - Show generic details for one job id:
   - `slurm-launcher job-show 36114735`
   - `slurm-launcher job-show 36114735 --json`
+  - `slurm-launcher job-show 36114735 --sbatch` also retrieves the exact batch script stored by SLURM
+  - combine `--sbatch --json` to return the script in the `sbatch` field
   - successful JSON includes `ok=true`, `job_id`, `resolved_via`, and `detail_level`; failures return `ok=false`
   - when only log resolution is available, unresolved fields are omitted instead of emitted as `null`
 - Read stdout for a job id:

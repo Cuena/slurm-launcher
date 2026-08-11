@@ -641,6 +641,11 @@ def _add_job_show_args(parser: argparse.ArgumentParser) -> None:
     _add_cluster_target_args(parser)
     parser.add_argument("job_id", help="SLURM job id to inspect.")
     parser.add_argument(
+        "--sbatch",
+        action="store_true",
+        help="Also retrieve the exact batch script submitted for the job.",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Print generic job details as JSON.",
@@ -2223,6 +2228,7 @@ def do_job_show(args: argparse.Namespace) -> int:
         cluster_login,
         args.job_id,
         json_output=args.json,
+        include_sbatch=args.sbatch,
         ssh_config_file=ssh_config_file,
         ssh_options=ssh_options,
     )

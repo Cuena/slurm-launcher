@@ -9,6 +9,7 @@ from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
 from .core import build_ssh_command, resolve_log_path
@@ -384,7 +385,34 @@ def resolve_job_details(
     )
 
 
-def _job_details_payload(details: JobDetails) -> dict[str, Any]:
+def resolve_job_sbatch(
+    cluster_login: str,
+    job_id: str,
+    *,
+    ssh_config_file: str | None = None,
+    ssh_options: list[str] | None = None,
+) -> tuple[str | None, str | None]:
+    result = _run_ssh_capture(
+        cluster_login,
+        f"scontrol write batch_script {shlex.quote(job_id)} -",
+        ssh_config_file=ssh_config_file,
+        ssh_options=ssh_options,
+    )
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip() or f"scontrol exited with code {result.returncode}"
+        )
+        return None, detail
+    if not result.stdout:
+        return None, "scontrol returned an empty batch script"
+    return result.stdout, None
+
+
+def _job_details_payload(
+    details: JobDetails,
+    *,
+    sbatch: str | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": True,
         "job_id": details.job_id,
@@ -419,6 +447,8 @@ def _job_details_payload(details: JobDetails) -> dict[str, Any]:
         }
     if launcher is not None:
         payload["launcher"] = launcher
+    if sbatch is not None:
+        payload["sbatch"] = sbatch
     return payload
 
 
@@ -650,6 +680,7 @@ def show_job_details(
     job_id: str,
     *,
     json_output: bool,
+    include_sbatch: bool = False,
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
 ) -> int:
@@ -667,7 +698,25 @@ def show_job_details(
             err_console.print(f"ERROR: {message}", style="bold red")
         return 1
 
-    payload = _job_details_payload(details)
+    sbatch: str | None = None
+    if include_sbatch:
+        sbatch, sbatch_error = resolve_job_sbatch(
+            cluster_login,
+            job_id,
+            ssh_config_file=ssh_config_file,
+            ssh_options=ssh_options,
+        )
+        if sbatch_error is not None:
+            message = f"Could not retrieve sbatch for job {job_id}: {sbatch_error}"
+            if json_output:
+                payload = _job_details_payload(details)
+                payload.update({"ok": False, "error": message})
+                console.print_json(data=payload)
+            else:
+                err_console.print(f"ERROR: {message}", style="bold red")
+            return 1
+
+    payload = _job_details_payload(details, sbatch=sbatch)
     if json_output:
         console.print_json(data=payload)
         return 0
@@ -690,12 +739,17 @@ def show_job_details(
     table.add_column("Field", style="bold")
     table.add_column("Value")
     for field_name, value in payload.items():
+        if field_name == "sbatch":
+            continue
         if field_name == "launcher":
             rendered = json.dumps(value) if value is not None else "null"
         else:
             rendered = str(value) if value is not None else "-"
         table.add_row(field_name, rendered)
     console.print(table)
+    if sbatch is not None:
+        console.rule("[cyan]Submitted sbatch")
+        console.print(Syntax(sbatch.rstrip(), "bash"))
     return 0
 
 

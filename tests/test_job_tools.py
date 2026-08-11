@@ -10,17 +10,131 @@ from unittest.mock import patch
 from launcher.job_tools import (
     DEFAULT_ARCHIVE_DIR,
     JobLogInfo,
+    JobDetails,
     LauncherInfo,
     _job_log_info_from_sacct,
     _launcher_info_from_tracking,
     effective_archive_dir,
     list_recent_jobs,
+    resolve_job_sbatch,
     show_job_details,
     show_job_log,
 )
 
 
 class JobToolsTests(unittest.TestCase):
+    @patch("launcher.job_tools._run_ssh_capture")
+    def test_resolve_job_sbatch_uses_scontrol_stdout(
+        self,
+        mock_run_ssh_capture,
+    ) -> None:
+        mock_run_ssh_capture.return_value = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="#!/bin/bash\n#SBATCH --time=00:10:00\necho train\n",
+            stderr="",
+        )
+
+        sbatch, error = resolve_job_sbatch(
+            "user@cluster",
+            "38238485",
+            ssh_config_file="/dev/null",
+            ssh_options=["-o", "BatchMode=yes"],
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual(sbatch, "#!/bin/bash\n#SBATCH --time=00:10:00\necho train\n")
+        mock_run_ssh_capture.assert_called_once_with(
+            "user@cluster",
+            "scontrol write batch_script 38238485 -",
+            ssh_config_file="/dev/null",
+            ssh_options=["-o", "BatchMode=yes"],
+        )
+
+    @patch("launcher.job_tools.console.print_json")
+    @patch("launcher.job_tools.resolve_job_sbatch")
+    @patch("launcher.job_tools.resolve_job_details")
+    def test_show_job_details_json_includes_requested_sbatch(
+        self,
+        mock_resolve_job_details,
+        mock_resolve_job_sbatch,
+        mock_print_json,
+    ) -> None:
+        mock_resolve_job_details.return_value = JobDetails(
+            job_id="38238485",
+            job_name="train",
+            state="RUNNING",
+            partition="acc",
+            command="/remote/logs/train.sbatch",
+            work_dir="/remote/workdir",
+            stdout="/tmp/train.out",
+            stderr="/tmp/train.err",
+            node_list="node01",
+            num_nodes="1",
+            gres="gpu:1",
+            submit_time="2026-03-26T12:00:00",
+            start_time="2026-03-26T12:00:01",
+            end_time=None,
+            source="scontrol",
+        )
+        mock_resolve_job_sbatch.return_value = ("#!/bin/bash\necho train\n", None)
+
+        exit_code = show_job_details(
+            "user@cluster",
+            "38238485",
+            json_output=True,
+            include_sbatch=True,
+        )
+
+        self.assertEqual(exit_code, 0)
+        payload = mock_print_json.call_args.kwargs["data"]
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["sbatch"], "#!/bin/bash\necho train\n")
+
+    @patch("launcher.job_tools.console.print_json")
+    @patch("launcher.job_tools.resolve_job_sbatch")
+    @patch("launcher.job_tools.resolve_job_details")
+    def test_show_job_details_json_fails_when_requested_sbatch_is_unavailable(
+        self,
+        mock_resolve_job_details,
+        mock_resolve_job_sbatch,
+        mock_print_json,
+    ) -> None:
+        mock_resolve_job_details.return_value = JobDetails(
+            job_id="38238485",
+            job_name="train",
+            state="COMPLETED",
+            partition=None,
+            command=None,
+            work_dir=None,
+            stdout=None,
+            stderr=None,
+            node_list=None,
+            num_nodes=None,
+            gres=None,
+            submit_time=None,
+            start_time=None,
+            end_time=None,
+            source="sacct",
+        )
+        mock_resolve_job_sbatch.return_value = (
+            None,
+            "slurm_load_jobs error: Invalid job id specified",
+        )
+
+        exit_code = show_job_details(
+            "user@cluster",
+            "38238485",
+            json_output=True,
+            include_sbatch=True,
+        )
+
+        self.assertEqual(exit_code, 1)
+        payload = mock_print_json.call_args.kwargs["data"]
+        self.assertFalse(payload["ok"])
+        self.assertNotIn("sbatch", payload)
+        self.assertIn("Could not retrieve sbatch", payload["error"])
+
     def test_effective_archive_dir_defaults_when_missing(self) -> None:
         archive_dir, source = effective_archive_dir(None)
         self.assertEqual(archive_dir, str(DEFAULT_ARCHIVE_DIR))

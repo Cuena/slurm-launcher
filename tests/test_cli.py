@@ -83,6 +83,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.job_id_arg, "12345")
         self.assertEqual(args.cluster_login, "acc")
 
+    def test_job_show_accepts_sbatch_option(self) -> None:
+        args = cli.parse_args(["job-show", "12345", "--sbatch"])
+
+        self.assertEqual(args.job_id, "12345")
+        self.assertTrue(args.sbatch)
+
     def test_tracking_commands_do_not_expose_unused_workspace_option(self) -> None:
         for command in ("status", "logs"):
             with self.subTest(command=command), self.assertRaises(SystemExit):

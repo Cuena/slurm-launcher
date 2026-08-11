@@ -57,7 +57,7 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
     ),
     "job-show": CommandSpec(
         summary="Show generic details for one SLURM job ID.",
-        agent_recommendation="Prefer `job-show <job_id> --json`; check `detail_level` before assuming every SLURM field is available, and treat launcher enrichment as optional metadata.",
+        agent_recommendation="Prefer `job-show <job_id> --json`; add `--sbatch` when the submitted batch script is needed, check `detail_level` before assuming every SLURM field is available, and treat launcher enrichment as optional metadata.",
         supports_json=True,
         json_fields=(
             "ok",
@@ -78,8 +78,12 @@ COMMAND_SPECS: dict[str, CommandSpec] = {
             "end_time",
             "resolved_via",
             "launcher",
+            "sbatch",
         ),
-        examples=("slurm-launcher job-show 12345 --json",),
+        examples=(
+            "slurm-launcher job-show 12345 --json",
+            "slurm-launcher job-show 12345 --sbatch",
+        ),
     ),
     "job-log": CommandSpec(
         summary="Resolve and optionally read stdout or stderr for one SLURM job ID.",

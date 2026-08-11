@@ -275,11 +275,13 @@ Each command below lists the purpose, when to use it, recommended agent invocati
   positional `job_id`
   `--cluster-login`
   `--config`
+  `--sbatch`
   `--json`
 - JSON fields:
-  `ok`, `job_id`, `detail_level`, `resolved_via`, plus any resolved fields among `job_name`, `state`, `partition`, `command`, `work_dir`, `stdout`, `stderr`, `node_list`, `num_nodes`, `gres`, `submit_time`, `start_time`, `end_time`, optional `launcher`; failures return `ok=false` and `error`
+  `ok`, `job_id`, `detail_level`, `resolved_via`, plus any resolved fields among `job_name`, `state`, `partition`, `command`, `work_dir`, `stdout`, `stderr`, `node_list`, `num_nodes`, `gres`, `submit_time`, `start_time`, `end_time`, optional `launcher`, and `sbatch` when requested; failures return `ok=false` and `error`
 - Important behavior:
   Check `detail_level` before assuming all metadata is present.
+  `--sbatch` asks SLURM for the submitted batch script and fails if it is no longer available or the caller does not own the job.
   `detail_level=log-resolution` means the command could resolve log paths and core state, but omitted unavailable fields instead of returning a large set of `null` values.
 
 ### `job-log`
