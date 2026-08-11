@@ -53,6 +53,7 @@ class LoadTrackingPayloadTests(unittest.TestCase):
             payload = load_tracking_payload(path)
 
         self.assertEqual(payload.cluster_login, "user@cluster")
+        self.assertEqual(payload.rsync_login, "user@cluster")
         self.assertEqual(payload.ssh_config_file, "/dev/null")
         self.assertEqual(payload.ssh_options, ["-o", "BatchMode=yes"])
         self.assertEqual(payload.job_folder, "project_001")
@@ -60,6 +61,15 @@ class LoadTrackingPayloadTests(unittest.TestCase):
         self.assertEqual(payload.artifact_paths, ["outputs/"])
         self.assertEqual(len(payload.jobs), 2)
         self.assertEqual(payload.source_path, path)
+
+    def test_loads_dedicated_rsync_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = {**MINIMAL_PAYLOAD, "rsync_login": "user@transfer1"}
+            path = write_tracking_file(Path(tmpdir) / "jobs.json", data)
+            payload = load_tracking_payload(path)
+
+        self.assertEqual(payload.cluster_login, "user@cluster")
+        self.assertEqual(payload.rsync_login, "user@transfer1")
 
     def test_job_records_have_typed_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

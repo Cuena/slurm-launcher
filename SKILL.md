@@ -165,6 +165,9 @@ These are the config concepts an agent should keep straight.
 - Required for most project commands:
   `CLUSTER_LOGIN`
   `JOBS`
+- Optional dedicated rsync endpoint:
+  `RSYNC_LOGIN` controls staging and downloads while SSH/SLURM commands continue
+  to use `CLUSTER_LOGIN`; it defaults to `CLUSTER_LOGIN`.
 - Workspace mode:
   `WORKSPACE_MODE = "per-run" | "fixed"`
 - Path requirement for `per-run`:

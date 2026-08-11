@@ -266,7 +266,7 @@ def run_download_logs(args: argparse.Namespace) -> int:
     )
 
     entries = _download_entries(
-        payload.cluster_login,
+        payload.rsync_login or payload.cluster_login,
         downloads,
         output_dir,
         dry_run=args.dry_run,
@@ -276,7 +276,7 @@ def run_download_logs(args: argparse.Namespace) -> int:
 
     if json_output:
         failures = _run_downloads(
-            payload.cluster_login,
+            payload.rsync_login or payload.cluster_login,
             downloads,
             output_dir,
             dry_run=args.dry_run,
@@ -290,8 +290,7 @@ def run_download_logs(args: argparse.Namespace) -> int:
                 "tracking_file": str(tracking_path),
                 "cluster_login": payload.cluster_login,
                 "selected_jobs": [
-                    {"job_name": job.job_name, "job_id": job.job_id}
-                    for job in selected
+                    {"job_name": job.job_name, "job_id": job.job_id} for job in selected
                 ],
                 "downloads": [
                     {
@@ -319,7 +318,7 @@ def run_download_logs(args: argparse.Namespace) -> int:
         print("Dry-run mode: commands will not be executed.")
 
     failures = _run_downloads(
-        payload.cluster_login,
+        payload.rsync_login or payload.cluster_login,
         downloads,
         output_dir,
         dry_run=args.dry_run,

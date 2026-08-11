@@ -29,7 +29,11 @@ class CommandContractTests(unittest.TestCase):
         )
 
     def test_sync_project_dry_run_returns_exact_commands(self) -> None:
-        settings = make_settings(**_SSH_DEFAULTS)
+        settings = make_settings(
+            **_SSH_DEFAULTS,
+            cluster_login="user@alogin",
+            rsync_login="user@transfer1",
+        )
         commands = sync_project(
             settings,
             self._remote_paths(),
@@ -39,13 +43,14 @@ class CommandContractTests(unittest.TestCase):
 
         self.assertEqual(len(commands), 3)
         self.assertIn(
-            "ssh -F /dev/null -o BatchMode=yes user@cluster",
+            "ssh -F /dev/null -o BatchMode=yes user@alogin",
             commands[0],
         )
         self.assertIn("mkdir -p", commands[0])
         self.assertIn("rsync -az --info=progress2", commands[1])
         self.assertIn("--dry-run", commands[1])
         self.assertIn("-e 'ssh -F /dev/null -o BatchMode=yes'", commands[1])
+        self.assertIn("user@transfer1:/remote/workspaces/project_001/", commands[1])
         for cache_dir in (".cache/", ".uv-cache/", ".ruff_cache/"):
             with self.subTest(cache_dir=cache_dir):
                 self.assertIn(f"--exclude {cache_dir}", commands[1])

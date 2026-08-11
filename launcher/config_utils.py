@@ -45,6 +45,7 @@ def build_settings(
     workspace_mode_override: str | None = None,
 ) -> LauncherSettings:
     cluster_login = getattr(config, "CLUSTER_LOGIN", None)
+    rsync_login = getattr(config, "RSYNC_LOGIN", None)
     ssh_config_file = getattr(config, "SSH_CONFIG_FILE", None)
     ssh_options = ensure_list(getattr(config, "SSH_OPTIONS", []))
     remote_workspace_base = getattr(config, "REMOTE_WORKSPACE_BASE", None)
@@ -169,6 +170,7 @@ def build_settings(
             Path(local_artifact_root).resolve() if local_artifact_root else None
         ),
         verbose=verbose,
+        rsync_login=str(rsync_login) if rsync_login else str(cluster_login),
     )
 
 

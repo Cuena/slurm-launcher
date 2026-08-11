@@ -22,6 +22,17 @@ class TestBuildSettings(TestCase):
         settings = build_settings(self._minimal_config(), Path("config.py"))
 
         self.assertEqual(settings.sync_symlinks, "preserve")
+        self.assertEqual(settings.rsync_login, "user@cluster")
+
+    def test_rsync_login_can_use_a_dedicated_transfer_host(self) -> None:
+        config = self._minimal_config()
+        config.CLUSTER_LOGIN = "user@alogin"
+        config.RSYNC_LOGIN = "user@transfer1"
+
+        settings = build_settings(config, Path("config.py"))
+
+        self.assertEqual(settings.cluster_login, "user@alogin")
+        self.assertEqual(settings.rsync_login, "user@transfer1")
 
     def test_removed_copy_spelling_is_rejected(self) -> None:
         config = self._minimal_config()

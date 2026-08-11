@@ -11,7 +11,8 @@ from typing import Any
 CONFIG_DIR = Path(__file__).resolve().parent
 LOCAL_ROOT = CONFIG_DIR.parent
 
-CLUSTER_LOGIN = "your_user@transfer1.bsc.es"
+CLUSTER_LOGIN = "your_user@alogin1.bsc.es"
+RSYNC_LOGIN = "your_user@transfer1.bsc.es"
 SSH_CONFIG_FILE: str | None = None
 SSH_OPTIONS: list[str] = []
 WORKSPACE_MODE = "per-run"  # per-run | fixed

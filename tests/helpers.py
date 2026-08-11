@@ -15,6 +15,7 @@ def write_tracking_file(path: Path, data: dict) -> Path:
 def make_settings(**overrides: object) -> LauncherSettings:
     defaults: dict[str, object] = {
         "cluster_login": "user@cluster",
+        "rsync_login": None,
         "ssh_config_file": None,
         "ssh_options": [],
         "remote_workspace_base": "/remote/workspaces",

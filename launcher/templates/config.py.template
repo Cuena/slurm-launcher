@@ -14,7 +14,9 @@ LOCAL_ROOT = (
     CONFIG_DIR.parent if CONFIG_DIR.name == ".slurm" else CONFIG_DIR
 )  # Folder synced to cluster
 
-CLUSTER_LOGIN = "your_user@mn5.bsc.es"
+CLUSTER_LOGIN = "your_user@alogin1.bsc.es"
+# Optional endpoint used only by rsync. Defaults to CLUSTER_LOGIN.
+RSYNC_LOGIN: str | None = "your_user@transfer1.bsc.es"
 # Optional SSH overrides for machine-specific issues.
 # SSH_CONFIG_FILE maps to: ssh -F <path>
 # SSH_OPTIONS are appended to every launcher-managed ssh invocation.

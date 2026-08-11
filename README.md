@@ -334,6 +334,9 @@ use the repo-local config lookup.
 SSH notes:
 
 - `CLUSTER_LOGIN` is required.
+- `RSYNC_LOGIN` optionally selects a dedicated transfer endpoint for project
+  staging, source metadata, log downloads, and artifact downloads. SSH control
+  commands and SLURM submission continue to use `CLUSTER_LOGIN`.
 - Prefer a canonical `user@host` in committed examples and portable tracking data. A nickname such as `acc` is an alias from one user's `~/.ssh/config`; it may not exist for another user or machine.
 - `SSH_CONFIG_FILE` is optional and maps to `ssh -F <path>`.
 - `SSH_OPTIONS` is optional and is appended to every launcher-managed `ssh`
@@ -378,7 +381,7 @@ Optional top-level settings:
 
 - `LOCAL_ROOT`, `PROJECT_NAME`, `WORKSPACE_MODE`, `REMOTE_WORKSPACE_DIR`
 - `REMOTE_LOG_BASE_PATH`
-- `SSH_CONFIG_FILE`, `SSH_OPTIONS`
+- `RSYNC_LOGIN`, `SSH_CONFIG_FILE`, `SSH_OPTIONS`
 - `REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR`
 - `REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR`
 - `ARTIFACT_PATHS`

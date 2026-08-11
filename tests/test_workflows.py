@@ -123,9 +123,12 @@ class DownloadLogsWorkflowTests(unittest.TestCase):
 
     def test_download_logs_json_dry_run_reports_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            tracking = write_tracking_file(
-                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
-            )
+            data = {
+                **FULL_TRACKING_PAYLOAD,
+                "cluster_login": "user@alogin",
+                "rsync_login": "user@transfer1",
+            }
+            tracking = write_tracking_file(Path(tmpdir) / "jobs.json", data)
             args = argparse.Namespace(
                 tracking_file=str(tracking),
                 job_name=["train"],
@@ -145,6 +148,8 @@ class DownloadLogsWorkflowTests(unittest.TestCase):
         self.assertEqual(len(payload["downloads"]), 2)
         self.assertEqual(len(payload["commands"]), 2)
         self.assertIn("rsync -az", payload["commands"][0])
+        self.assertIn("user@transfer1:/logs/train-12345.out", payload["commands"][0])
+        self.assertNotIn("user@alogin:/logs/train-12345.out", payload["commands"][0])
         self.assertEqual(payload["dry_run"], True)
 
 

@@ -450,7 +450,7 @@ def run_artifacts(
             continue
         entries.extend(
             _artifact_entries(
-                payload.cluster_login,
+                payload.rsync_login or payload.cluster_login,
                 payload.remote_workdir,
                 job,
                 artifact_paths,
@@ -463,7 +463,7 @@ def run_artifacts(
 
     if json_output:
         failures = _run_downloads(
-            payload.cluster_login,
+            payload.rsync_login or payload.cluster_login,
             entries,
             dry_run=dry_run,
             quiet=True,
@@ -502,7 +502,7 @@ def run_artifacts(
         console.print("Dry-run mode: commands will not be executed.", style="yellow")
 
     failures = _run_downloads(
-        payload.cluster_login,
+        payload.rsync_login or payload.cluster_login,
         entries,
         dry_run=dry_run,
     )

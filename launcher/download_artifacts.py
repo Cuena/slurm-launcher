@@ -259,7 +259,7 @@ def run_download_artifacts(args: argparse.Namespace) -> int:
     )
 
     entries = _artifact_entries(
-        payload.cluster_login,
+        payload.rsync_login or payload.cluster_login,
         payload.remote_workdir,
         artifact_paths,
         output_dir,
@@ -270,7 +270,7 @@ def run_download_artifacts(args: argparse.Namespace) -> int:
 
     if json_output:
         failures = _run_downloads(
-            payload.cluster_login,
+            payload.rsync_login or payload.cluster_login,
             payload.remote_workdir,
             artifact_paths,
             output_dir,
@@ -311,7 +311,7 @@ def run_download_artifacts(args: argparse.Namespace) -> int:
         print("Dry-run mode: commands will not be executed.")
 
     failures = _run_downloads(
-        payload.cluster_login,
+        payload.rsync_login or payload.cluster_login,
         payload.remote_workdir,
         artifact_paths,
         output_dir,

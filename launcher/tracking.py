@@ -45,6 +45,7 @@ class TrackingPayload:
     singularity_image_path: str | None
     artifact_paths: list[str]
     sync_symlinks: str | None
+    rsync_login: str = ""
     jobs: list[JobRecord] = field(default_factory=list)
 
     def filter_jobs(
@@ -174,6 +175,7 @@ def load_tracking_payload(path: Path) -> TrackingPayload:
         singularity_image_path=_str_or_none(raw.get("singularity_image_path")),
         artifact_paths=_str_list(raw.get("artifact_paths")),
         sync_symlinks=_str_or_none(raw.get("sync_symlinks")),
+        rsync_login=_str_or_none(raw.get("rsync_login")) or cluster_login,
         jobs=jobs,
     )
 

@@ -111,6 +111,7 @@ class LauncherSettings:
     sync_symlinks: str
     local_artifact_root: Path | None
     verbose: bool
+    rsync_login: str | None = None
 
 
 @dataclass(frozen=True)
@@ -336,7 +337,9 @@ def sync_project(
     )
 
     excludes = DEFAULT_RSYNC_EXCLUDES + settings.extra_rsync_excludes
-    destination = f"{settings.cluster_login}:{remote_paths.workdir}/"
+    destination = (
+        f"{settings.rsync_login or settings.cluster_login}:{remote_paths.workdir}/"
+    )
     cmd = [
         "rsync",
         "-az",
@@ -892,6 +895,7 @@ def write_job_tracking_file(
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "cluster_login": settings.cluster_login,
+        "rsync_login": settings.rsync_login or settings.cluster_login,
         "ssh_config_file": settings.ssh_config_file,
         "ssh_options": settings.ssh_options,
         "job_folder": remote_paths.job_folder,
@@ -1142,7 +1146,7 @@ def write_remote_source_metadata(
             "-e",
             build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
             handle.name,
-            f"{settings.cluster_login}:{remote_path}",
+            f"{settings.rsync_login or settings.cluster_login}:{remote_path}",
         ]
         ensure_remote_directories(settings, [remote_dir], dry_run=False, quiet=True)
         subprocess.run(command, check=True)
