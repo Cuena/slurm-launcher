@@ -140,7 +140,7 @@ EXTRA_RSYNC_EXCLUDES = [
 EXTRA_RSYNC_ARGS: list[str] = []
 VERBOSE = False
 
-# Leave empty to run all jobs, or set a subset of names.
+# Optional default selection. If empty, launch with --only NAME or explicit --all.
 RUN_JOBS: list[str] = []
 
 JOBS = [

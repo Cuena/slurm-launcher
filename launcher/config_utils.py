@@ -13,6 +13,34 @@ from .core import JobSpec, LauncherSettings, resolve_local_project_path
 WORKSPACE_MODES = {"per-run", "fixed"}
 
 
+def resolve_config_path(
+    path_arg: str | None, *, extra_candidates: list[Path] | None = None
+) -> Path | None:
+    if path_arg:
+        candidate = Path(path_arg).expanduser()
+        return candidate if candidate.is_file() else None
+    candidates = [
+        Path(".slurm/remote_launcher_config.mn5.py"),
+        Path("remote_launcher_config.py"),
+        *(extra_candidates or []),
+    ]
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def configured_run_only(config: ModuleType, args: Any) -> list[str] | None:
+    only = getattr(args, "only", None)
+    if getattr(args, "all_jobs", False):
+        if only:
+            raise ValueError("--only and --all cannot be combined.")
+        return None
+    selected = only or [
+        name for name in ensure_list(getattr(config, "RUN_JOBS", None)) if name.strip()
+    ]
+    if not selected:
+        raise ValueError("Select jobs with --only, nonempty RUN_JOBS, or --all.")
+    return selected
+
+
 def load_config(config_path: Path) -> ModuleType:
     config_path = config_path.resolve()
     spec = importlib.util.spec_from_file_location("remote_launcher_config", config_path)

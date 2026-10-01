@@ -44,6 +44,10 @@ def _local_artifact_destination(
     """
     job_label = job.job_name or "unknown_job"
     job_id = job.job_id or "unknown"
+    if any(part in {".", ".."} or "/" in part for part in (job_label, job_id)):
+        raise ValueError("Invalid tracked job name or ID for artifact destination.")
+    if ".." in Path(artifact_path).parts:
+        raise ValueError("Artifact paths cannot traverse outside their destination.")
     return output_dir / job_label / job_id / Path(artifact_path.lstrip("/"))
 
 
@@ -317,12 +321,13 @@ def run_artifacts(
     tracking_file: str | None = None,
     output_dir: str | None = None,
     selected_jobs: list[str] | None = None,
+    artifact_paths: list[str] | None = None,
     dry_run: bool = False,
     json_output: bool = False,
 ) -> int:
     tracking_path = resolve_tracking_file(tracking_file)
     if tracking_path is None:
-        message = "No tracking file found. Run a non-dry submission first or pass --tracking-file."
+        message = "Run not found. Pass --run ID, a tracking path, or latest."
         if json_output:
             print(json.dumps({"ok": False, "error": message}, indent=2))
         else:
@@ -445,15 +450,19 @@ def run_artifacts(
     # download
     entries: list[dict[str, object]] = []
     for job in jobs:
-        artifact_paths = _collect_job_artifacts(payload, job)
-        if not artifact_paths:
+        paths = (
+            artifact_paths
+            if artifact_paths is not None
+            else _collect_job_artifacts(payload, job)
+        )
+        if not paths:
             continue
         entries.extend(
             _artifact_entries(
                 payload.rsync_login or payload.cluster_login,
                 payload.remote_workdir,
                 job,
-                artifact_paths,
+                paths,
                 effective_output_dir,
                 dry_run=dry_run,
                 ssh_config_file=payload.ssh_config_file,
@@ -518,88 +527,36 @@ def run_artifacts(
 
 def add_artifacts_parser(subparsers: Any) -> argparse.ArgumentParser:
     parser = subparsers.add_parser(
-        "artifacts",
-        help="List, check, or download job artifacts tracked by slurm-launcher.",
+        "artifacts", help="List, check, or download tracked outputs."
     )
     sub = parser.add_subparsers(dest="artifacts_command", required=True)
-
-    list_parser = sub.add_parser(
-        "list", help="List artifact paths declared in tracking metadata (no SSH)."
-    )
-    list_parser.add_argument(
-        "--tracking-file",
-        help=(
-            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
-            "or the most recent slurm_output/*/jobs.json."
-        ),
-    )
-    list_parser.add_argument(
-        "--only",
-        nargs="+",
-        help="Limit to the specified job names.",
-    )
-    list_parser.add_argument(
-        "--output-dir",
-        help="Local destination root. Default: slurm_output/downloaded_artifacts/<job_folder>/",
-    )
-    list_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print a machine-readable JSON result.",
-    )
-
-    check_parser = sub.add_parser(
-        "check", help="Check whether declared artifacts currently exist remotely."
-    )
-    check_parser.add_argument(
-        "--tracking-file",
-        help=(
-            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
-            "or the most recent slurm_output/*/jobs.json."
-        ),
-    )
-    check_parser.add_argument(
-        "--only",
-        nargs="+",
-        help="Limit to the specified job names.",
-    )
-    check_parser.add_argument(
-        "--output-dir",
-        help="Local destination root used only to show prospective destinations.",
-    )
-    check_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print existence, type, and size as machine-readable JSON.",
-    )
-
-    download_parser = sub.add_parser("download", help="Download declared artifacts.")
-    download_parser.add_argument(
-        "--tracking-file",
-        help=(
-            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
-            "or the most recent slurm_output/*/jobs.json."
-        ),
-    )
-    download_parser.add_argument(
-        "--only",
-        nargs="+",
-        help="Limit to the specified job names.",
-    )
-    download_parser.add_argument(
-        "--output-dir",
-        help="Local destination root. Default: slurm_output/downloaded_artifacts/<job_folder>/",
-    )
-    download_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print rsync commands without executing them.",
-    )
-    download_parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print a machine-readable JSON result.",
-    )
+    for name, description in (
+        ("list", "List declared paths; does not check remote existence."),
+        ("check", "Check remote existence, type, and size without downloading."),
+        ("download", "Copy selected outputs locally; requires a download request."),
+    ):
+        command = sub.add_parser(name, help=description, description=description)
+        command.add_argument(
+            "--run",
+            dest="tracking_file",
+            help="Run ID, tracking path, or latest (default).",
+        )
+        command.add_argument("--only", nargs="+", help="Select tracked job names.")
+        command.add_argument("--output-dir", help="Local destination root.")
+        command.add_argument(
+            "--json", action="store_true", help="Print a machine-readable result."
+        )
+        if name == "download":
+            command.add_argument(
+                "--path",
+                action="append",
+                help="Explicit artifact path instead of declarations (repeatable).",
+            )
+            command.add_argument(
+                "--dry-run",
+                action="store_true",
+                help="Show rsync commands without copying.",
+            )
     return parser
 
 
@@ -609,6 +566,7 @@ def dispatch_artifacts(args: argparse.Namespace) -> int:
         tracking_file=args.tracking_file,
         output_dir=args.output_dir,
         selected_jobs=args.only,
+        artifact_paths=getattr(args, "path", None),
         dry_run=bool(getattr(args, "dry_run", False)),
         json_output=bool(args.json),
     )

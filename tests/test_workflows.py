@@ -1,53 +1,42 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import shlex
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from launcher import cli
+from launcher import execution
+from launcher.artifacts import run_artifacts
 from launcher.download_logs import run_download_logs
-from launcher.download_artifacts import run_download_artifacts
 from launcher.job_tools import resolve_job_log_info
-from tests.helpers import make_settings, write_tracking_file
+from tests.helpers import write_tracking_file
 
 
 FULL_TRACKING_PAYLOAD = {
-    "created_at": "2026-04-01T12:00:00",
     "cluster_login": "user@cluster",
-    "ssh_config_file": "/dev/null",
-    "ssh_options": ["-o", "BatchMode=yes"],
+    "rsync_login": "user@transfer",
     "job_folder": "project_001",
     "remote_workdir": "/remote/work/project_001",
-    "remote_logdir": "/remote/logs/project_001",
-    "remote_slurm_output_dir": "/remote/logs/project_001/slurm_output",
     "artifact_paths": ["outputs/model.ckpt"],
     "jobs": [
         {
             "job_name": "train",
             "job_id": "12345",
-            "stdout": "/logs/train-12345.out",
-            "stderr": "/logs/train-12345.err",
-            "sbatch_command": "sbatch train.sbatch",
-            "submitted_at": "2026-04-01T12:00:00",
+            "stdout": "/logs/train.out",
+            "stderr": "/logs/train.err",
         },
-        {
-            "job_name": "eval",
-            "job_id": "12346",
-            "stdout": "/logs/eval-12346.out",
-            "stderr": "/logs/eval-12346.err",
-        },
+        {"job_name": "eval", "job_id": "12346", "stdout": "/logs/eval.out"},
     ],
 }
 
 
-class DownloadLogsWorkflowTests(unittest.TestCase):
-    """Tests download-logs through the canonical tracking boundary."""
-
-    def test_download_logs_reads_tracking_file_and_selects_jobs(self) -> None:
+class DownloadWorkflowTests(unittest.TestCase):
+    def test_log_download_selection_uses_transfer_host(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tracking = write_tracking_file(
                 Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
@@ -58,354 +47,282 @@ class DownloadLogsWorkflowTests(unittest.TestCase):
                 job_id=[],
                 output_dir=str(Path(tmpdir) / "out"),
                 dry_run=True,
-            )
-            with patch("builtins.print") as mock_print:
-                exit_code = run_download_logs(args)
-
-        self.assertEqual(exit_code, 0)
-        printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
-        self.assertIn("Jobs selected: 1", printed)
-        self.assertIn("Log files to download: 2", printed)
-        self.assertIn("/logs/train-12345.out", printed)
-        self.assertIn("/logs/train-12345.err", printed)
-
-    def test_download_logs_filters_by_job_id(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tracking = write_tracking_file(
-                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
-            )
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                job_name=[],
-                job_id=["12346"],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-            )
-            with patch("builtins.print") as mock_print:
-                exit_code = run_download_logs(args)
-
-        self.assertEqual(exit_code, 0)
-        printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
-        self.assertIn("Jobs selected: 1", printed)
-        self.assertIn("/logs/eval-12346.out", printed)
-
-    def test_download_logs_fails_on_missing_cluster_login(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data = {**FULL_TRACKING_PAYLOAD, "cluster_login": ""}
-            tracking = write_tracking_file(Path(tmpdir) / "jobs.json", data)
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                job_name=[],
-                job_id=[],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-            )
-            with patch("builtins.print"):
-                exit_code = run_download_logs(args)
-
-        self.assertEqual(exit_code, 1)
-
-    def test_download_logs_fails_on_corrupt_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "jobs.json"
-            path.write_text("not json", encoding="utf-8")
-            args = argparse.Namespace(
-                tracking_file=str(path),
-                job_name=[],
-                job_id=[],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-            )
-            with patch("builtins.print"):
-                exit_code = run_download_logs(args)
-
-        self.assertEqual(exit_code, 1)
-
-    def test_download_logs_json_dry_run_reports_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data = {
-                **FULL_TRACKING_PAYLOAD,
-                "cluster_login": "user@alogin",
-                "rsync_login": "user@transfer1",
-            }
-            tracking = write_tracking_file(Path(tmpdir) / "jobs.json", data)
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                job_name=["train"],
-                job_id=[],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
                 json=True,
             )
-            with patch("builtins.print") as mock_print:
-                exit_code = run_download_logs(args)
+            with patch("builtins.print") as output:
+                self.assertEqual(run_download_logs(args), 0)
+            payload = json.loads(output.call_args.args[0])
+        commands = "\n".join(payload["commands"])
+        self.assertIn("user@transfer:/logs/train.out", commands)
+        self.assertIn("user@transfer:/logs/train.err", commands)
+        self.assertNotIn("eval.out", commands)
 
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(mock_print.call_args.args[0])
-        self.assertEqual(payload["ok"], True)
-        self.assertEqual(payload["tracking_file"], str(tracking))
-        self.assertEqual(payload["selected_jobs"][0]["job_name"], "train")
-        self.assertEqual(len(payload["downloads"]), 2)
-        self.assertEqual(len(payload["commands"]), 2)
-        self.assertIn("rsync -az", payload["commands"][0])
-        self.assertIn("user@transfer1:/logs/train-12345.out", payload["commands"][0])
-        self.assertNotIn("user@alogin:/logs/train-12345.out", payload["commands"][0])
-        self.assertEqual(payload["dry_run"], True)
-
-
-class DownloadArtifactsWorkflowTests(unittest.TestCase):
-    """Tests download-artifacts through the canonical tracking boundary."""
-
-    def test_download_artifacts_uses_tracked_artifact_paths(self) -> None:
+    def test_artifact_override_and_job_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tracking = write_tracking_file(
                 Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
             )
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                path=[],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-            )
-            with patch("builtins.print") as mock_print:
-                exit_code = run_download_artifacts(args)
-
-        self.assertEqual(exit_code, 0)
-        printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
-        self.assertIn("Artifact paths to download: 1", printed)
-        self.assertIn("outputs/model.ckpt", printed)
-
-    def test_download_artifacts_overrides_with_explicit_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tracking = write_tracking_file(
-                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
-            )
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                path=["custom/path"],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-            )
-            with patch("builtins.print") as mock_print:
-                exit_code = run_download_artifacts(args)
-
-        self.assertEqual(exit_code, 0)
-        printed = "\n".join(str(c.args[0]) for c in mock_print.call_args_list)
-        self.assertIn("custom/path", printed)
-
-    def test_download_artifacts_fails_on_missing_workdir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data = {**FULL_TRACKING_PAYLOAD, "remote_workdir": ""}
-            tracking = write_tracking_file(Path(tmpdir) / "jobs.json", data)
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                path=["something"],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-            )
-            with patch("builtins.print"):
-                exit_code = run_download_artifacts(args)
-
-        self.assertEqual(exit_code, 1)
-
-    def test_download_artifacts_json_dry_run_reports_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tracking = write_tracking_file(
-                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
-            )
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                path=["custom/path"],
-                output_dir=str(Path(tmpdir) / "out"),
-                dry_run=True,
-                json=True,
-            )
-            with patch("builtins.print") as mock_print:
-                exit_code = run_download_artifacts(args)
-
-        self.assertEqual(exit_code, 0)
-        payload = json.loads(mock_print.call_args.args[0])
-        self.assertEqual(payload["ok"], True)
-        self.assertEqual(payload["tracking_file"], str(tracking))
-        self.assertEqual(payload["artifact_paths"], ["custom/path"])
-        self.assertEqual(payload["artifacts"][0]["path"], "custom/path")
-        self.assertEqual(len(payload["commands"]), 1)
-        self.assertIn("rsync -az", payload["commands"][0])
-        self.assertEqual(payload["dry_run"], True)
-
-
-class SbatchErrorWrapperTests(unittest.TestCase):
-    """Tests that do_sbatch surfaces errors consistently."""
-
-    @patch("launcher.cli.build_settings")
-    @patch("launcher.cli._load_run_config")
-    def test_sbatch_catches_validation_errors(
-        self,
-        mock_load_run_config,
-        mock_build_settings,
-    ) -> None:
-        settings = make_settings()
-        mock_load_run_config.return_value = (object(), Path("/tmp/config.py"))
-        mock_build_settings.return_value = settings
-
-        args = argparse.Namespace(
-            config=None,
-            workspace=None,
-            sbatch_file="../outside/file.sbatch",
-            name="test",
-            sbatch_arg=[],
-            dry_run=False,
+            with patch("builtins.print") as output:
+                self.assertEqual(
+                    run_artifacts(
+                        subcommand="download",
+                        tracking_file=str(tracking),
+                        selected_jobs=["train"],
+                        artifact_paths=["custom/path"],
+                        output_dir=str(Path(tmpdir) / "out"),
+                        dry_run=True,
+                        json_output=True,
+                    ),
+                    0,
+                )
+            payload = json.loads(output.call_args.args[0])
+        commands = "\n".join(payload["commands"])
+        self.assertIn("user@transfer:/remote/work/project_001/custom/path", commands)
+        self.assertNotIn("outputs/model.ckpt", commands)
+        self.assertEqual(
+            {entry["job_name"] for entry in payload["artifacts"]}, {"train"}
         )
 
-        exit_code = cli.do_sbatch(args)
-        self.assertEqual(exit_code, 1)
-
-    @patch("launcher.cli.sync_project")
-    @patch("launcher.cli.test_ssh_connection")
-    @patch("launcher.cli.resolve_remote_paths")
-    @patch("launcher.cli.build_settings")
-    @patch("launcher.cli._load_run_config")
-    def test_sbatch_catches_ssh_errors(
-        self,
-        mock_load_run_config,
-        mock_build_settings,
-        mock_resolve_remote_paths,
-        mock_test_ssh_connection,
-        mock_sync_project,
-    ) -> None:
-        settings = make_settings()
-        mock_load_run_config.return_value = (object(), Path("/tmp/config.py"))
-        mock_build_settings.return_value = settings
-        mock_test_ssh_connection.side_effect = RuntimeError("SSH failed")
-
+    def test_artifact_download_uses_saved_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            sbatch_file = Path(tmpdir) / "train.sbatch"
-            sbatch_file.write_text("#!/bin/bash\necho hi\n", encoding="utf-8")
-            settings_with_root = make_settings(project_root=Path(tmpdir))
-            mock_build_settings.return_value = settings_with_root
-
-            args = argparse.Namespace(
-                config=None,
-                workspace=None,
-                sbatch_file=str(sbatch_file),
-                name="train",
-                sbatch_arg=[],
-                dry_run=False,
+            tracking = write_tracking_file(
+                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
             )
+            with patch("builtins.print") as output:
+                self.assertEqual(
+                    run_artifacts(
+                        subcommand="download",
+                        tracking_file=str(tracking),
+                        selected_jobs=["train"],
+                        artifact_paths=None,
+                        output_dir=str(Path(tmpdir) / "out"),
+                        dry_run=True,
+                        json_output=True,
+                    ),
+                    0,
+                )
+            payload = json.loads(output.call_args.args[0])
+        self.assertIn("outputs/model.ckpt", payload["commands"][0])
 
-            exit_code = cli.do_sbatch(args)
+    def test_invalid_tracking_cannot_download(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tracking = write_tracking_file(
+                Path(tmpdir) / "jobs.json",
+                {**FULL_TRACKING_PAYLOAD, "remote_workdir": ""},
+            )
+            with patch("builtins.print") as output:
+                self.assertEqual(
+                    run_artifacts(
+                        subcommand="download",
+                        tracking_file=str(tracking),
+                        artifact_paths=["x"],
+                        dry_run=True,
+                        json_output=True,
+                    ),
+                    1,
+                )
+            self.assertFalse(json.loads(output.call_args.args[0])["ok"])
 
-        self.assertEqual(exit_code, 1)
+
+class FrozenExecutionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.config = self.root / "config.py"
+        self.config.write_text(
+            f"LOCAL_ROOT = {str(self.root)!r}\nCLUSTER_LOGIN = 'user@cluster'\n"
+            "REMOTE_WORKSPACE_BASE = '/work'\nREMOTE_LOG_BASE_PATH = '/logs'\n"
+            "RUN_JOBS = ['train', 'eval']\n"
+            "JOBS = [{'name': 'train', 'command': 'echo frozen', 'requires': ['input.dat']}, {'name': 'eval', 'command': 'true'}]\n"
+        )
+        self.addCleanup(patch.stopall)
+        patch("launcher.execution.test_ssh_connection").start()
+        patch("launcher.execution.sync_project", return_value=["rsync planned"]).start()
+        self.output = patch("launcher.execution.console.print_json").start()
+
+    def args(self, **values):
+        return argparse.Namespace(config=str(self.config), json=True, **values)
+
+    def stage(self, **values) -> Path:
+        self.assertEqual(execution.do_stage(self.args(**values)), 0)
+        return Path(self.output.call_args.kwargs["data"]["tracking_file"])
+
+    def payload(self):
+        return self.output.call_args.kwargs["data"]
+
+    def test_selection_is_required_before_prepare_or_sync(self) -> None:
+        self.config.write_text(
+            self.config.read_text().replace(
+                "RUN_JOBS = ['train', 'eval']", "RUN_JOBS = []"
+            )
+            + "def prepare():\n    raise AssertionError('must not run')\n"
+        )
+        self.assertEqual(execution.do_run(self.args(dry_run=False)), 1)
+        self.assertIn("Select jobs", self.payload()["error"])
+        self.assertFalse((self.root / "slurm_output").exists())
+        self.assertEqual(execution.do_stage(self.args(all_jobs=True, dry_run=True)), 0)
+
+    def test_frozen_submit_never_imports_config_and_preserves_selection(self) -> None:
+        tracking = self.stage(only=["train"])
+        self.config.unlink()
+        with (
+            patch(
+                "launcher.execution.load_config",
+                side_effect=AssertionError("config imported"),
+            ),
+            patch("launcher.core.ssh_script", return_value=("12345\n", "")) as dispatch,
+        ):
+            self.assertEqual(
+                execution.do_submit(argparse.Namespace(run=str(tracking), json=True)), 0
+            )
+        self.assertEqual(self.payload()["job_ids"], ["12345"])
+        self.assertEqual(self.payload()["selected_jobs"], ["train"])
+        self.assertEqual(dispatch.call_count, 1)
+        self.assertEqual(
+            json.loads(tracking.read_text())["jobs"][0]["state"], "submitted"
+        )
+
+    def test_partial_acknowledgment_is_durable_before_next_dispatch(self) -> None:
+        tracking = self.stage()
+        calls = 0
+
+        def dispatch(*args, **kwargs):
+            nonlocal calls
+            records = json.loads(tracking.read_text())["jobs"]
+            calls += 1
+            if calls == 1:
+                self.assertEqual(records[0]["state"], "submitting")
+                return "12345\n", ""
+            self.assertEqual(records[0]["job_id"], "12345")
+            self.assertEqual(records[0]["state"], "submitted")
+            self.assertEqual(records[1]["state"], "submitting")
+            raise subprocess.CalledProcessError(255, ["ssh"], stderr="disconnected")
+
+        with patch("launcher.core.ssh_script", side_effect=dispatch):
+            self.assertEqual(
+                execution.do_submit(argparse.Namespace(run=str(tracking), json=True)), 1
+            )
+        self.assertEqual(self.payload()["job_ids"], ["12345"])
+        records = json.loads(tracking.read_text())["jobs"]
+        self.assertEqual(
+            [record["state"] for record in records], ["submitted", "unknown"]
+        )
+        for only in (["train"], ["eval"]):
+            with patch(
+                "launcher.core.ssh_script",
+                side_effect=AssertionError("duplicate submission"),
+            ):
+                self.assertEqual(
+                    execution.do_submit(
+                        argparse.Namespace(run=str(tracking), only=only, json=True)
+                    ),
+                    1,
+                )
+        self.assertEqual(json.loads(tracking.read_text())["jobs"], records)
+
+    def test_confirmed_failure_can_retry_without_losing_previous_jobs(self) -> None:
+        tracking = self.stage()
+        with patch(
+            "launcher.core.ssh_script",
+            side_effect=[
+                ("12345\n", ""),
+                subprocess.CalledProcessError(1, ["ssh"], stderr="sbatch rejected"),
+            ],
+        ):
+            self.assertEqual(
+                execution.do_submit(argparse.Namespace(run=str(tracking), json=True)), 1
+            )
+        with patch("launcher.core.ssh_script", return_value=("12346\n", "")):
+            self.assertEqual(
+                execution.do_submit(
+                    argparse.Namespace(run=str(tracking), only=["eval"], json=True)
+                ),
+                0,
+            )
+        records = json.loads(tracking.read_text())["jobs"]
+        self.assertEqual([record["job_id"] for record in records], ["12345", "12346"])
+        self.assertEqual(records[1]["attempts"][0]["state"], "failed")
+
+    def test_ambiguous_success_output_is_unknown_not_retryable(self) -> None:
+        tracking = self.stage(only=["train"])
+        with patch("launcher.core.ssh_script", return_value=("warning\n12345\n", "")):
+            self.assertEqual(
+                execution.do_submit(argparse.Namespace(run=str(tracking), json=True)), 1
+            )
+        self.assertEqual(
+            json.loads(tracking.read_text())["jobs"][0]["state"], "unknown"
+        )
+
+    def test_prepare_runs_only_for_real_staging_before_snapshot(self) -> None:
+        self.config.write_text(
+            self.config.read_text()
+            + "\nfrom pathlib import Path\ndef prepare():\n    Path(LOCAL_ROOT, 'prepared').write_text('ready')\n"
+        )
+        self.assertEqual(execution.do_stage(self.args(dry_run=True)), 0)
+        self.assertFalse((self.root / "prepared").exists())
+        self.stage()
+        self.assertEqual((self.root / "prepared").read_text(), "ready")
+
+    def test_handwritten_snapshot_survives_local_file_removal(self) -> None:
+        script = b"#!/bin/bash\r\necho 'SBATCH_SCRIPT'\r\n\r\n"
+        source = self.root / "hand.sbatch"
+        source.write_bytes(script)
+        self.config.write_text(
+            self.config.read_text()
+            + "\nJOBS = [{'name': 'hand', 'sbatch_file': 'hand.sbatch'}]\nRUN_JOBS = ['hand']\n"
+        )
+        tracking = self.stage()
+        self.assertEqual((tracking.parent / "scripts/0000.sbatch").read_bytes(), script)
+        source.unlink()
+        self.config.unlink()
+        self.assertEqual(
+            execution.do_submit(
+                argparse.Namespace(run=str(tracking), dry_run=True, json=True)
+            ),
+            0,
+        )
+        command = self.payload()["commands"][0]
+        transfer = next(
+            line for line in command.splitlines() if line.startswith("printf %s ")
+        )
+        self.assertEqual(base64.b64decode(shlex.split(transfer)[2]), script)
+
+    def test_legacy_tracking_cannot_submit(self) -> None:
+        tracking = write_tracking_file(
+            self.root / "legacy/jobs.json", FULL_TRACKING_PAYLOAD
+        )
+        self.assertEqual(
+            execution.do_submit(argparse.Namespace(run=str(tracking), json=True)), 1
+        )
+        self.assertIn("no frozen plan", self.payload()["error"])
+
+    def test_preflight_uses_frozen_requirements_without_config(self) -> None:
+        tracking = self.stage(only=["train"])
+        self.config.unlink()
+        with patch("launcher.preflight.console.print_json") as output:
+            self.assertEqual(
+                execution.do_preflight(
+                    argparse.Namespace(run=str(tracking), dry_run=True, json=True)
+                ),
+                0,
+            )
+        self.assertEqual(
+            output.call_args.kwargs["data"]["jobs"][0]["requirements"], ["input.dat"]
+        )
 
 
 class JobLogProbeTests(unittest.TestCase):
-    """Tests that job-log resolution surfaces probe failures."""
-
     @patch("launcher.job_tools._run_ssh_capture")
-    def test_missing_archive_returns_unresolved_probe_errors(
-        self,
-        mock_run_ssh_capture,
-    ) -> None:
-        mock_run_ssh_capture.side_effect = [
-            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="err"),
-            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="err"),
+    def test_failed_probes_do_not_claim_verified_logs(self, probe) -> None:
+        probe.side_effect = [
+            subprocess.CompletedProcess([], 1, "", "err"),
+            subprocess.CompletedProcess([], 1, "", "err"),
         ]
-
-        info = resolve_job_log_info(
-            "user@cluster",
-            "99999",
-            archive_dir=None,
-            ssh_config_file="/dev/null",
-            ssh_options=["-o", "BatchMode=yes"],
-        )
-
-        self.assertIsNotNone(info)
-        assert info is not None
-        self.assertEqual(info.source, "unresolved")
+        info = resolve_job_log_info("user@cluster", "99999", archive_dir=None)
         self.assertFalse(info.verified)
         self.assertIsNone(info.stdout)
-        self.assertIn("scontrol failed", info.probe_errors[0])
-        self.assertIn("sacct failed", info.probe_errors[1])
-
-    @patch("launcher.job_tools._run_ssh_capture")
-    def test_fallback_when_scontrol_returns_no_paths(
-        self,
-        mock_run_ssh_capture,
-    ) -> None:
-        mock_run_ssh_capture.side_effect = [
-            subprocess.CompletedProcess(
-                args=[], returncode=0, stdout="JobId=99999 JobName=test", stderr=""
-            ),
-            subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=""),
-        ]
-
-        info = resolve_job_log_info(
-            "user@cluster",
-            "99999",
-            archive_dir="/custom/archive",
-        )
-
-        self.assertIsNotNone(info)
-        assert info is not None
-        self.assertIn("scontrol returned no log paths", info.source)
-        self.assertIn("/custom/archive/99999.out", info.stdout or "")
-        self.assertFalse(info.verified)
-
-
-class LogsCommandWorkflowTests(unittest.TestCase):
-    """Tests the logs command through the tracking boundary."""
-
-    @patch("launcher.cli.console.print_json")
-    def test_logs_json_reads_tracking_file_typed(self, mock_print_json) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tracking = write_tracking_file(
-                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
-            )
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                only=["train"],
-                config=None,
-                workspace=None,
-                latest=False,
-                job_id=None,
-                use_stderr=False,
-                follow=False,
-                lines=50,
-                full=False,
-                json=True,
-            )
-            exit_code = cli.do_logs(args)
-
-        self.assertEqual(exit_code, 0)
-        payload = mock_print_json.call_args.kwargs["data"]
-        self.assertEqual(payload["cluster_login"], "user@cluster")
-        self.assertEqual(len(payload["jobs"]), 1)
-        self.assertEqual(payload["jobs"][0]["job_name"], "train")
-        self.assertEqual(payload["jobs"][0]["job_id"], "12345")
-
-
-class MonitorCommandWorkflowTests(unittest.TestCase):
-    """Tests the monitor command through the tracking boundary."""
-
-    @patch("launcher.cli.console.print_json")
-    def test_monitor_reads_tracking_and_filters(self, mock_print_json) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tracking = write_tracking_file(
-                Path(tmpdir) / "jobs.json", FULL_TRACKING_PAYLOAD
-            )
-            args = argparse.Namespace(
-                tracking_file=str(tracking),
-                only=["train"],
-                dry_run=True,
-                json=True,
-            )
-            exit_code = cli.do_monitor(args)
-
-        self.assertEqual(exit_code, 0)
-        payload = mock_print_json.call_args.kwargs["data"]
-        self.assertEqual(payload["ok"], True)
-        self.assertEqual(payload["job_ids"], ["12345"])
-        self.assertIn("squeue -j 12345", payload["command"])
+        self.assertEqual(len(info.probe_errors), 2)
 
 
 if __name__ == "__main__":

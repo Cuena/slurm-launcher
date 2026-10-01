@@ -1,7 +1,7 @@
 """Minimal demo launcher config.
 
 Use this file with dry-run:
-    uv run slurm-launcher --config examples/remote_launcher_config.demo.py --dry-run
+    uv run slurm-launcher run --config examples/remote_launcher_config.demo.py --only train --dry-run
 """
 
 from __future__ import annotations

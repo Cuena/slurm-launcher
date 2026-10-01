@@ -382,6 +382,7 @@ def run_status(
     cluster_login: str | None = None,
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
+    selected_jobs: list[str] | None = None,
     json_output: bool = False,
 ) -> int:
     """Project-scoped status command.
@@ -396,24 +397,6 @@ def run_status(
         # Direct cluster query for a single job id.
         jobs = [JobRecord(job_name="", job_id=job_id)]
         effective_login = cluster_login
-        # Try to enrich with tracking file if available.
-        resolved_tracking = resolve_tracking_file(tracking_file)
-        if resolved_tracking is not None:
-            try:
-                payload = load_tracking_payload(resolved_tracking)
-                matched = payload.filter_jobs(ids={job_id})
-                if matched:
-                    jobs = matched
-                    if payload.cluster_login:
-                        # A tracking file owns its complete SSH context. In
-                        # particular, ssh_config_file=None means use the
-                        # caller's normal SSH config; do not combine that alias
-                        # with transport settings from an unrelated config.
-                        effective_login = payload.cluster_login
-                        ssh_config_file = payload.ssh_config_file
-                        ssh_options = payload.ssh_options
-            except Exception:
-                pass
         result = query_job_statuses(
             effective_login,
             jobs,
@@ -431,9 +414,7 @@ def run_status(
 
     resolved_tracking = resolve_tracking_file(tracking_file)
     if resolved_tracking is None:
-        message = (
-            "No tracking file found. Run a submission first or pass --tracking-file."
-        )
+        message = "Run not found. Pass --run ID, a tracking path, or latest."
         if json_output:
             console.print_json(data={"ok": False, "error": message})
         else:
@@ -458,9 +439,18 @@ def run_status(
             err_console.print(f"ERROR: {message}", style="bold red")
         return 1
 
+    jobs = payload.filter_jobs(names=set(selected_jobs) if selected_jobs else None)
+    missing = set(selected_jobs or ()) - {job.job_name for job in jobs}
+    if missing:
+        message = f"Jobs not found in run: {', '.join(sorted(missing))}"
+        if json_output:
+            console.print_json(data={"ok": False, "error": message})
+        else:
+            err_console.print(message)
+        return 1
     result = query_job_statuses(
         payload.cluster_login,
-        payload.jobs,
+        jobs,
         ssh_config_file=payload.ssh_config_file,
         ssh_options=payload.ssh_options,
     )

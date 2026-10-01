@@ -209,7 +209,6 @@ squeue() {
 
             exit_code = run_status(
                 tracking_file=str(tracking),
-                job_id="123",
                 cluster_login="user@cluster",
                 ssh_config_file="/dev/null",
                 ssh_options=["-o", "BatchMode=yes"],

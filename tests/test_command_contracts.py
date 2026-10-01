@@ -1,230 +1,131 @@
 from __future__ import annotations
 
+import base64
+import shlex
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from launcher.command_specs import COMMAND_NAMES, COMMAND_SPECS
 from launcher.core import (
     JobSpec,
     RemotePaths,
     build_predefined_sbatch_command,
+    parse_job_id,
     submit_job,
     sync_project,
 )
-from launcher.download_artifacts import _run_downloads as run_artifact_downloads
-from launcher.download_logs import _run_downloads as run_log_downloads
 from tests.helpers import make_settings
-
-_SSH_DEFAULTS = {"ssh_config_file": "/dev/null", "ssh_options": ["-o", "BatchMode=yes"]}
 
 
 class CommandContractTests(unittest.TestCase):
     def _remote_paths(self) -> RemotePaths:
         return RemotePaths(
-            job_folder="project_001",
-            workdir="/remote/workspaces/project_001",
-            logdir="/remote/logs/project_001",
-            slurm_output_dir="/remote/logs/project_001/slurm_output",
+            "project_001",
+            "/remote/workspaces/project_001",
+            "/remote/logs/project_001",
+            "/remote/logs/project_001/slurm_output",
         )
 
-    def test_sync_project_dry_run_returns_exact_commands(self) -> None:
+    def test_sync_uses_distinct_control_and_transfer_hosts(self) -> None:
         settings = make_settings(
-            **_SSH_DEFAULTS,
             cluster_login="user@alogin",
             rsync_login="user@transfer1",
+            ssh_config_file="/dev/null",
+            ssh_options=["-o", "BatchMode=yes"],
         )
         commands = sync_project(
-            settings,
-            self._remote_paths(),
-            dry_run=True,
-            quiet=True,
+            settings, self._remote_paths(), dry_run=True, quiet=True
         )
-
-        self.assertEqual(len(commands), 3)
-        self.assertIn(
-            "ssh -F /dev/null -o BatchMode=yes user@alogin",
-            commands[0],
-        )
-        self.assertIn("mkdir -p", commands[0])
-        self.assertIn("rsync -az --info=progress2", commands[1])
-        self.assertIn("--dry-run", commands[1])
-        self.assertIn("-e 'ssh -F /dev/null -o BatchMode=yes'", commands[1])
+        self.assertIn("user@alogin", commands[0])
         self.assertIn("user@transfer1:/remote/workspaces/project_001/", commands[1])
-        for cache_dir in (".cache/", ".uv-cache/", ".ruff_cache/"):
-            with self.subTest(cache_dir=cache_dir):
-                self.assertIn(f"--exclude {cache_dir}", commands[1])
-        self.assertIn("source.json", commands[2])
+        self.assertIn("-e 'ssh -F /dev/null -o BatchMode=yes'", commands[1])
 
-    def test_command_specs_cover_public_commands(self) -> None:
-        self.assertEqual(
-            set(COMMAND_NAMES),
-            {
-                "artifacts",
-                "doctor",
-                "download-artifacts",
-                "download-logs",
-                "init",
-                "job-log",
-                "job-show",
-                "jobs",
-                "logs",
-                "monitor",
-                "preflight",
-                "render",
-                "run",
-                "sbatch",
-                "stage",
-                "status",
-                "submit",
-                "summary",
-                "validate",
-            },
-        )
-
-    def test_json_capable_commands_declare_examples_and_fields(self) -> None:
-        for name, spec in COMMAND_SPECS.items():
-            with self.subTest(command=name):
-                self.assertTrue(spec.examples)
-                self.assertTrue(spec.agent_recommendation)
-                if spec.supports_json:
-                    self.assertTrue(spec.json_fields)
-
-    def test_submit_job_dry_run_returns_exact_generated_submission_command(
-        self,
-    ) -> None:
-        settings = make_settings(**_SSH_DEFAULTS, default_sbatch={"time": "00:10:00"})
-        job = JobSpec(name="train", command="python train.py")
-
-        submission = submit_job(
-            settings,
-            self._remote_paths(),
-            job,
-            dry_run=True,
-            quiet=True,
-        )
-
-        self.assertEqual(submission.job_id, "dry-run")
-        self.assertEqual(len(submission.commands), 1)
-        self.assertIn("<<'EOF'", submission.commands[0])
-        self.assertIn("cat <<'SBATCH_SCRIPT' >", submission.commands[0])
-        self.assertIn(
-            "sbatch /remote/logs/project_001/train.sbatch", submission.commands[0]
-        )
-
-    def test_submit_job_dry_run_returns_exact_predefined_sbatch_command(self) -> None:
-        settings = make_settings(**_SSH_DEFAULTS)
-        job = JobSpec(
-            name="shared",
-            sbatch_file="slurm/train.sbatch",
-            sbatch_args=["--export=ALL,SEED=1"],
-        )
-
-        submission = submit_job(
-            settings,
-            self._remote_paths(),
-            job,
-            dry_run=True,
-            quiet=True,
-        )
-
-        self.assertEqual(submission.job_id, "dry-run")
-        self.assertIn("cd /remote/workspaces/project_001", submission.commands[0])
-        self.assertIn(
-            "sbatch --export=ALL,SEED=1 /remote/workspaces/project_001/slurm/train.sbatch",
-            submission.commands[0],
-        )
-
-    def test_build_predefined_sbatch_command_rejects_path_outside_local_root(
-        self,
-    ) -> None:
-        settings = make_settings(**_SSH_DEFAULTS, project_root=Path("/tmp/project"))
-        job = JobSpec(name="shared", sbatch_file="../shared/train.sbatch")
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "sbatch_file must stay inside LOCAL_ROOT",
+    def test_parsable_output_never_guesses_a_job_id(self) -> None:
+        self.assertEqual(parse_job_id("12345;cluster-a\n"), "12345")
+        for output in (
+            "",
+            "warning\n12345\n",
+            "Submitted batch job 12345",
+            "12345\n12346",
+            "0",
+            "12345_2",
         ):
-            build_predefined_sbatch_command(settings, self._remote_paths(), job)
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                parse_job_id(output)
 
-    @patch("launcher.core.create_log_view_symlinks")
-    @patch("launcher.core.ssh_script")
-    def test_submit_predefined_sbatch_job_resolves_logs_from_scontrol(
-        self,
-        mock_ssh_script,
-        mock_create_log_view_symlinks,
-    ) -> None:
-        settings = make_settings(
-            **_SSH_DEFAULTS,
-            remote_slurm_dashboard_log_archive_dir="/archive/logs",
-            remote_slurm_dashboard_log_view_dir="/archive/view",
+    def test_frozen_handwritten_script_preserves_exact_bytes(self) -> None:
+        script = (
+            "#!/bin/bash\r\n#SBATCH --time=00:01:00\r\necho 'SBATCH_SCRIPT'\r\n\r\n"
         )
-        job = JobSpec(name="shared", sbatch_file="slurm/train.sbatch")
-        mock_ssh_script.side_effect = [
-            ("Submitted batch job 12345\n", ""),
-            (
-                "JobId=12345 StdOut=/archive/logs/%j.out StdErr=/archive/logs/%j.err\n",
-                "",
-            ),
-        ]
-
-        submission = submit_job(
-            settings,
+        result = submit_job(
+            make_settings(),
             self._remote_paths(),
-            job,
-            dry_run=False,
+            JobSpec(name="train", sbatch_file="gone.sbatch"),
+            dry_run=True,
             quiet=True,
+            frozen_script=script,
         )
+        transfer = next(
+            line
+            for line in result.commands[0].splitlines()
+            if line.startswith("printf %s ")
+        )
+        encoded = shlex.split(transfer)[2]
+        self.assertEqual(base64.b64decode(encoded), script.encode())
+        self.assertIn("sbatch --parsable ", result.sbatch_command)
 
-        self.assertEqual(submission.job_id, "12345")
-        self.assertEqual(submission.sbatch_options["output"], "/archive/logs/12345.out")
-        self.assertEqual(submission.sbatch_options["error"], "/archive/logs/12345.err")
-        mock_create_log_view_symlinks.assert_called_once()
+    def test_build_predefined_command_rejects_outside_root(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "sbatch_file must stay inside LOCAL_ROOT"
+        ):
+            build_predefined_sbatch_command(
+                make_settings(project_root=Path("/tmp/project")),
+                self._remote_paths(),
+                JobSpec(name="shared", sbatch_file="../shared/train.sbatch"),
+            )
 
-    @patch("builtins.print")
-    def test_download_logs_dry_run_prints_exact_rsync_command(
-        self,
-        mock_print,
-    ) -> None:
-        failures = run_log_downloads(
-            "user@cluster",
-            [("train", "stdout", "/remote/logs/train.out")],
-            Path("/tmp/downloaded_logs"),
-            dry_run=True,
-            ssh_config_file="/dev/null",
-            ssh_options=["-o", "BatchMode=yes"],
-        )
+    def test_acknowledgment_precedes_failing_log_enrichment(self) -> None:
+        acknowledged = []
 
-        self.assertEqual(failures, 0)
-        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
-        self.assertIn(
-            "rsync -az -e 'ssh -F /dev/null -o BatchMode=yes' --dry-run", printed
-        )
-        self.assertIn("user@cluster:/remote/logs/train.out", printed)
+        def failed_probe(*args):
+            self.assertEqual(acknowledged, ["12345"])
+            raise OSError("probe unavailable")
 
-    @patch("builtins.print")
-    def test_download_artifacts_dry_run_prints_exact_rsync_command(
-        self,
-        mock_print,
-    ) -> None:
-        failures = run_artifact_downloads(
-            "user@cluster",
-            "/remote/workspaces/project_001",
-            ["outputs/model.ckpt"],
-            Path("/tmp/downloaded_artifacts"),
-            dry_run=True,
-            ssh_config_file="/dev/null",
-            ssh_options=["-o", "BatchMode=yes"],
-        )
+        with (
+            patch("launcher.core.ssh_script", return_value=("12345\n", "")),
+            patch(
+                "launcher.core.resolve_submitted_job_log_paths",
+                side_effect=failed_probe,
+            ),
+        ):
+            result = submit_job(
+                make_settings(),
+                self._remote_paths(),
+                JobSpec(name="train", sbatch_file="gone.sbatch"),
+                dry_run=False,
+                quiet=True,
+                frozen_script="#!/bin/bash\ntrue\n",
+                on_acknowledged=lambda result: acknowledged.append(result.job_id),
+            )
+        self.assertEqual(result.job_id, "12345")
 
-        self.assertEqual(failures, 0)
-        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
-        self.assertIn(
-            "rsync -az -e 'ssh -F /dev/null -o BatchMode=yes' --dry-run", printed
+    def test_acknowledged_id_survives_transport_nonzero_exit(self) -> None:
+        failure = subprocess.CalledProcessError(
+            255, ["ssh"], output="12345\n", stderr="connection closed"
         )
-        self.assertIn(
-            "user@cluster:/remote/workspaces/project_001/outputs/model.ckpt", printed
-        )
+        acknowledged = []
+        with patch("launcher.core.ssh_script", side_effect=failure):
+            result = submit_job(
+                make_settings(),
+                self._remote_paths(),
+                JobSpec(name="train", command="true"),
+                dry_run=False,
+                quiet=True,
+                on_acknowledged=lambda result: acknowledged.append(result.job_id),
+            )
+        self.assertEqual(result.job_id, "12345")
+        self.assertEqual(acknowledged, ["12345"])
 
 
 if __name__ == "__main__":

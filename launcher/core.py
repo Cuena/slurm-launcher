@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from uuid import uuid4
 
 from rich.console import Console
 from rich.syntax import Syntax
@@ -369,7 +372,7 @@ def sync_project(
             format_source_metadata_command(settings, remote_paths, source_state)
         )
         return commands
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, stdout=sys.stderr if quiet else None)
     commands.extend(write_remote_source_metadata(settings, remote_paths, source_state))
     if not quiet:
         console.print("Sync complete", style="green")
@@ -506,13 +509,11 @@ def format_sbatch_options(
 
 
 def parse_job_id(output: str) -> str:
-    for line in output.splitlines():
-        line = line.strip()
-        if "Submitted batch job" in line:
-            parts = line.split()
-            if parts:
-                return parts[-1]
-    return output.strip() or "unknown"
+    """Accept only sbatch --parsable's job ID (and optional cluster suffix)."""
+    match = re.fullmatch(r"([1-9][0-9]*)(?:;[A-Za-z0-9_.-]+)?", output.strip())
+    if match is None:
+        raise ValueError(f"Ambiguous sbatch response: {output!r}")
+    return match.group(1)
 
 
 def _sanitize_log_view_component(value: str, fallback: str) -> str:
@@ -588,104 +589,110 @@ def submit_job(
     *,
     dry_run: bool,
     quiet: bool = False,
+    frozen_script: str | None = None,
+    frozen_options: dict[str, Any] | None = None,
+    on_acknowledged: Callable[[SubmissionResult], None] | None = None,
 ) -> SubmissionResult:
-    if job.uses_sbatch_file():
-        return submit_predefined_sbatch_job(
-            settings,
-            remote_paths,
-            job,
-            dry_run=dry_run,
-            quiet=quiet,
+    """Dispatch one exact script; persist acknowledgment before optional probes."""
+    if not job.name or Path(job.name).name != job.name or job.name in {".", ".."}:
+        raise ValueError(f"Job name must be a single path component: {job.name!r}")
+    options = frozen_options
+    if options is None:
+        options = (
+            {}
+            if job.uses_sbatch_file()
+            else format_sbatch_options(job, settings, remote_paths)
         )
-
-    sbatch_options = format_sbatch_options(job, settings, remote_paths)
-    job_script = build_job_script(job, settings, remote_paths)
-    sbatch_script = build_sbatch_script(
-        job_script,
-        sbatch_options,
-        launcher_metadata=build_launcher_metadata(job, settings),
-    )
+    script = frozen_script
+    if script is None:
+        if job.sbatch_file:
+            local_path = resolve_local_project_path(
+                settings.project_root, job.sbatch_file
+            )
+            if local_path is None:
+                raise ValueError("sbatch_file must stay inside LOCAL_ROOT")
+            script = local_path.read_bytes().decode("utf-8")
+        else:
+            script = build_sbatch_script(
+                build_job_script(job, settings, remote_paths),
+                options,
+                launcher_metadata=build_launcher_metadata(job, settings),
+            )
     remote_sbatch_path = f"{remote_paths.logdir}/{job.name}.sbatch"
-    sbatch_cmd = " ".join(["sbatch", shlex.quote(remote_sbatch_path)])
-
-    if (settings.verbose or dry_run) and not quiet:
-        console.print()
-        console.rule(f"[cyan]{job.name} script")
-        console.print(Syntax(sbatch_script.rstrip(), "bash"))
-        console.rule(f"[cyan]{job.name} sbatch")
-        console.print(Syntax(sbatch_cmd, "bash"))
-
-    if not dry_run:
-        write_local_submission_artifacts(
-            settings,
-            remote_paths,
-            job,
-            job_script=job_script,
-            sbatch_script=sbatch_script,
-            sbatch_command=sbatch_cmd,
-        )
-
-    mkdir_targets = [remote_paths.slurm_output_dir]
-    if settings.remote_slurm_dashboard_log_archive_dir:
-        mkdir_targets.append(settings.remote_slurm_dashboard_log_archive_dir)
-    if settings.remote_slurm_dashboard_log_view_dir:
-        mkdir_targets.append(settings.remote_slurm_dashboard_log_view_dir)
-    mkdir_command = (
-        f"mkdir -p {' '.join(shlex.quote(path) for path in sorted(set(mkdir_targets)))}"
+    sbatch_cmd = shlex.join(
+        ["sbatch", "--parsable", *job.sbatch_args, remote_sbatch_path]
     )
-
-    script_lines = [
-        "set -euo pipefail",
-        mkdir_command,
-        f"cat <<'SBATCH_SCRIPT' > {shlex.quote(remote_sbatch_path)}",
-        sbatch_script.rstrip("\n"),
-        "SBATCH_SCRIPT",
-        f"chmod +x {shlex.quote(remote_sbatch_path)}",
-        sbatch_cmd,
-    ]
-    submission_script = "\n".join(script_lines)
-    submission_command = format_ssh_script_command(
+    # Base64 preserves exact bytes and cannot collide with a script heredoc delimiter.
+    encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    directories = [remote_paths.logdir, remote_paths.slurm_output_dir]
+    if settings.remote_slurm_dashboard_log_archive_dir:
+        directories.append(settings.remote_slurm_dashboard_log_archive_dir)
+    submission_script = "\n".join(
+        [
+            "set -euo pipefail",
+            f"mkdir -p {' '.join(shlex.quote(path) for path in directories)}",
+            f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_sbatch_path)}",
+            f"cd {shlex.quote(remote_paths.workdir)}",
+            sbatch_cmd,
+        ]
+    )
+    command = format_ssh_script_command(
         settings.cluster_login,
         submission_script,
         ssh_config_file=settings.ssh_config_file,
         ssh_options=settings.ssh_options,
     )
     if dry_run:
-        ssh_script(
+        return SubmissionResult(
+            "dry-run", sbatch_cmd, options, remote_sbatch_path, [command]
+        )
+    try:
+        stdout, _ = ssh_script(
             settings.cluster_login,
             submission_script,
-            dry_run=True,
+            dry_run=False,
             ssh_config_file=settings.ssh_config_file,
             ssh_options=settings.ssh_options,
             quiet=quiet,
         )
-        return SubmissionResult(
-            job_id="dry-run",
-            sbatch_command=sbatch_cmd,
-            sbatch_options=sbatch_options,
-            remote_sbatch_path=remote_sbatch_path,
-            commands=[submission_command],
-        )
-
-    stdout, _ = ssh_script(
-        settings.cluster_login,
-        submission_script,
-        dry_run=False,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
-        quiet=quiet,
-    )
-    job_id = parse_job_id(stdout)
-    if not quiet:
-        console.print(f"Submitted {job.name} -> {job_id}", style="bold green")
+    except (RuntimeError, subprocess.CalledProcessError) as exc:
+        cause = exc.__cause__ if exc.__cause__ is not None else exc
+        if not isinstance(cause, subprocess.CalledProcessError):
+            raise
+        stdout = cause.stdout or ""
+        try:
+            parse_job_id(stdout)
+        except ValueError:
+            raise exc
     submission = SubmissionResult(
-        job_id=job_id,
-        sbatch_command=sbatch_cmd,
-        sbatch_options=sbatch_options,
-        remote_sbatch_path=remote_sbatch_path,
-        commands=[submission_command],
+        parse_job_id(stdout),
+        sbatch_cmd,
+        dict(options),
+        remote_sbatch_path,
+        [command],
     )
-    create_log_view_symlinks(settings, job, submission, quiet=quiet)
+    if on_acknowledged is not None:
+        on_acknowledged(submission)
+    try:
+        if job.uses_sbatch_file():
+            stdout_path, stderr_path = resolve_submitted_job_log_paths(
+                settings, submission.job_id
+            )
+            if stdout_path:
+                submission.sbatch_options["output"] = stdout_path
+            if stderr_path:
+                submission.sbatch_options["error"] = stderr_path
+        create_log_view_symlinks(settings, job, submission, quiet=quiet)
+    except Exception as exc:
+        if not quiet:
+            console.print(
+                f"WARNING: Submitted {submission.job_id}; log enrichment failed: {exc}",
+                style="yellow",
+            )
+    if not quiet:
+        console.print(
+            f"Submitted {job.name} -> {submission.job_id}", style="bold green"
+        )
     return submission
 
 
@@ -718,85 +725,10 @@ def build_predefined_sbatch_command(
     remote_sbatch_path = resolve_remote_sbatch_path(
         settings, remote_paths, job.sbatch_file
     )
-    sbatch_cmd = shlex.join(["sbatch", *job.sbatch_args, remote_sbatch_path])
+    sbatch_cmd = shlex.join(
+        ["sbatch", "--parsable", *job.sbatch_args, remote_sbatch_path]
+    )
     return remote_sbatch_path, sbatch_cmd
-
-
-def submit_predefined_sbatch_job(
-    settings: LauncherSettings,
-    remote_paths: RemotePaths,
-    job: JobSpec,
-    *,
-    dry_run: bool,
-    quiet: bool = False,
-) -> SubmissionResult:
-    remote_sbatch_path, sbatch_cmd = build_predefined_sbatch_command(
-        settings, remote_paths, job
-    )
-    if (settings.verbose or dry_run) and not quiet:
-        console.print()
-        console.rule(f"[cyan]{job.name} sbatch")
-        console.print(Syntax(sbatch_cmd, "bash"))
-
-    sbatch_options: dict[str, Any] = {}
-    script = "\n".join(
-        [
-            "set -euo pipefail",
-            f"cd {shlex.quote(remote_paths.workdir)}",
-            sbatch_cmd,
-        ]
-    )
-    submission_command = format_ssh_script_command(
-        settings.cluster_login,
-        script,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
-    )
-    if dry_run:
-        ssh_script(
-            settings.cluster_login,
-            script,
-            dry_run=True,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
-            quiet=quiet,
-        )
-        return SubmissionResult(
-            job_id="dry-run",
-            sbatch_command=sbatch_cmd,
-            sbatch_options=sbatch_options,
-            remote_sbatch_path=remote_sbatch_path,
-            commands=[submission_command],
-        )
-
-    stdout, _ = ssh_script(
-        settings.cluster_login,
-        script,
-        dry_run=False,
-        ssh_config_file=settings.ssh_config_file,
-        ssh_options=settings.ssh_options,
-        quiet=quiet,
-    )
-    job_id = parse_job_id(stdout)
-    stdout_field, stderr_field = resolve_submitted_job_log_paths(
-        settings,
-        job_id,
-    )
-    if stdout_field:
-        sbatch_options["output"] = stdout_field
-    if stderr_field:
-        sbatch_options["error"] = stderr_field
-    if not quiet:
-        console.print(f"Submitted {job.name} -> {job_id}", style="bold green")
-    submission = SubmissionResult(
-        job_id=job_id,
-        sbatch_command=sbatch_cmd,
-        sbatch_options=sbatch_options,
-        remote_sbatch_path=remote_sbatch_path,
-        commands=[submission_command],
-    )
-    create_log_view_symlinks(settings, job, submission, quiet=quiet)
-    return submission
 
 
 def _read_scontrol_field(output: str, field_name: str) -> str | None:
@@ -865,108 +797,59 @@ def build_job_record(
     }
 
 
-def write_local_submission_artifacts(
-    settings: LauncherSettings,
-    remote_paths: RemotePaths,
-    job: JobSpec,
-    *,
-    job_script: str,
-    sbatch_script: str,
-    sbatch_command: str,
-) -> Path:
-    artifacts_dir = settings.project_root / "slurm_output" / remote_paths.job_folder
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    (artifacts_dir / f"{job.name}.sh").write_text(job_script, encoding="utf-8")
-    (artifacts_dir / f"{job.name}.sbatch").write_text(sbatch_script, encoding="utf-8")
-    (artifacts_dir / f"{job.name}.sbatch.cmd").write_text(
-        sbatch_command.rstrip() + "\n", encoding="utf-8"
-    )
-    return artifacts_dir
-
-
 def write_job_tracking_file(
     settings: LauncherSettings,
     remote_paths: RemotePaths,
     job_records: list[dict[str, Any]],
 ) -> Path:
-    root_tracking_dir = settings.project_root / "slurm_output"
-    tracking_dir = root_tracking_dir / remote_paths.job_folder
-    tracking_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "cluster_login": settings.cluster_login,
-        "rsync_login": settings.rsync_login or settings.cluster_login,
-        "ssh_config_file": settings.ssh_config_file,
-        "ssh_options": settings.ssh_options,
-        "job_folder": remote_paths.job_folder,
-        "remote_workdir": remote_paths.workdir,
-        "remote_logdir": remote_paths.logdir,
-        "remote_slurm_output_dir": remote_paths.slurm_output_dir,
-        "remote_slurm_dashboard_log_archive_dir": settings.remote_slurm_dashboard_log_archive_dir,
-        "remote_slurm_dashboard_log_view_dir": settings.remote_slurm_dashboard_log_view_dir,
-        "runtime_mode": settings.runtime_mode,
-        "venv_python_executable": settings.venv_python_executable,
-        "singularity_image_path": settings.singularity_image_path,
-        "artifact_paths": settings.artifact_paths,
-        "sync_symlinks": settings.sync_symlinks,
-        "jobs": job_records,
-    }
-    output_path = tracking_dir / "jobs.json"
-    output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    latest_tracking_path = root_tracking_dir / "latest_jobs.json"
-    latest_tracking_path.write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    """Atomically merge progress without dropping earlier acknowledgments."""
+    from .tracking import atomic_write, atomic_write_json
+
+    root = settings.project_root / "slurm_output"
+    output_path = root / remote_paths.job_folder / "jobs.json"
+    payload = (
+        json.loads(output_path.read_text())
+        if output_path.exists()
+        else {
+            "created_at": datetime.now().isoformat(),
+            "run_id": remote_paths.job_folder,
+            "cluster_login": settings.cluster_login,
+            "rsync_login": settings.rsync_login or settings.cluster_login,
+            "ssh_config_file": settings.ssh_config_file,
+            "ssh_options": settings.ssh_options,
+            "job_folder": remote_paths.job_folder,
+            "remote_workdir": remote_paths.workdir,
+            "remote_logdir": remote_paths.logdir,
+            "remote_slurm_output_dir": remote_paths.slurm_output_dir,
+            "remote_slurm_dashboard_log_archive_dir": settings.remote_slurm_dashboard_log_archive_dir,
+            "remote_slurm_dashboard_log_view_dir": settings.remote_slurm_dashboard_log_view_dir,
+            "runtime_mode": settings.runtime_mode,
+            "venv_python_executable": settings.venv_python_executable,
+            "singularity_image_path": settings.singularity_image_path,
+            "artifact_paths": settings.artifact_paths,
+            "sync_symlinks": settings.sync_symlinks,
+            "workspace_mode": settings.workspace_mode,
+            "workspace_mutable": settings.workspace_mode == "fixed",
+            "jobs": [],
+        }
     )
-    latest_run_path = root_tracking_dir / "latest_run.txt"
-    latest_run_path.write_text(remote_paths.job_folder + "\n", encoding="utf-8")
-
-    # Write local + remote summary
-    try:
-        from .summary import write_submission_summary
-
-        write_submission_summary(settings, remote_paths, _tracking_payload(payload))
-    except Exception:
-        # Summary is best-effort; do not fail submission.
-        pass
-
+    records = {record["job_name"]: record for record in payload["jobs"]}
+    for record in job_records:
+        previous = records.get(record["job_name"], {})
+        if previous.get("job_id") and previous.get("job_id") not in {
+            "unknown",
+            "dry-run",
+        }:
+            if record.get("job_id") != previous["job_id"]:
+                raise ValueError(
+                    f"Refusing to replace acknowledged job {record['job_name']}"
+                )
+        records[record["job_name"]] = {**previous, **record}
+    payload["jobs"] = list(records.values())
+    atomic_write_json(output_path, payload)
+    atomic_write_json(root / "latest_jobs.json", payload)
+    atomic_write(root / "latest_run.txt", remote_paths.job_folder + "\n")
     return output_path
-
-
-def _tracking_payload(raw_payload: dict[str, Any]):
-    # Local import to avoid circular dependency.
-    from .tracking import TrackingPayload, _parse_job_record, _str_list, _str_or_none
-
-    raw_jobs = raw_payload.get("jobs", [])
-    jobs = [
-        rec
-        for item in (raw_jobs if isinstance(raw_jobs, list) else [])
-        if (rec := _parse_job_record(item)) is not None
-    ]
-    return TrackingPayload(
-        source_path=Path("."),
-        created_at=raw_payload.get("created_at"),
-        cluster_login=str(raw_payload.get("cluster_login") or ""),
-        ssh_config_file=_str_or_none(raw_payload.get("ssh_config_file")),
-        ssh_options=_str_list(raw_payload.get("ssh_options")),
-        job_folder=str(raw_payload.get("job_folder", "unknown_job_folder")),
-        remote_workdir=_str_or_none(raw_payload.get("remote_workdir")),
-        remote_logdir=_str_or_none(raw_payload.get("remote_logdir")),
-        remote_slurm_output_dir=_str_or_none(
-            raw_payload.get("remote_slurm_output_dir")
-        ),
-        remote_slurm_dashboard_log_archive_dir=_str_or_none(
-            raw_payload.get("remote_slurm_dashboard_log_archive_dir")
-        ),
-        remote_slurm_dashboard_log_view_dir=_str_or_none(
-            raw_payload.get("remote_slurm_dashboard_log_view_dir")
-        ),
-        runtime_mode=_str_or_none(raw_payload.get("runtime_mode")),
-        venv_python_executable=_str_or_none(raw_payload.get("venv_python_executable")),
-        singularity_image_path=_str_or_none(raw_payload.get("singularity_image_path")),
-        artifact_paths=_str_list(raw_payload.get("artifact_paths")),
-        sync_symlinks=_str_or_none(raw_payload.get("sync_symlinks")),
-        jobs=jobs,
-    )
 
 
 def render_runtime_command(job: JobSpec, settings: LauncherSettings) -> str:
@@ -985,11 +868,11 @@ def render_runtime_command(job: JobSpec, settings: LauncherSettings) -> str:
 
 
 def create_job_folder_name(prefix: str, repo_root: Path) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     source_state = inspect_source_state(repo_root)
     git_hash = source_state.git_short_commit or "nogit"
     suffix = "_dirty" if source_state.git_dirty else ""
-    return f"{prefix}_{timestamp}_{git_hash}{suffix}"
+    return f"{prefix}_{timestamp}_{git_hash}{suffix}_{uuid4().hex[:8]}"
 
 
 def query_git_hash(repo_root: Path) -> str:

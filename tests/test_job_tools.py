@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 from launcher.job_tools import (
     DEFAULT_ARCHIVE_DIR,
-    JobLogInfo,
     JobDetails,
     LauncherInfo,
     _job_log_info_from_sacct,
@@ -18,7 +17,6 @@ from launcher.job_tools import (
     list_recent_jobs,
     resolve_job_sbatch,
     show_job_details,
-    show_job_log,
 )
 
 
@@ -359,126 +357,6 @@ class JobToolsTests(unittest.TestCase):
                 entry_command="python train.py",
             ),
         )
-
-    @patch("launcher.job_tools.subprocess.run")
-    @patch("launcher.job_tools.console.print_json")
-    @patch("launcher.job_tools.resolve_job_log_info")
-    def test_show_job_log_json_prints_resolution_only(
-        self,
-        mock_resolve_job_log_info,
-        mock_print_json,
-        mock_subprocess_run,
-    ) -> None:
-        mock_resolve_job_log_info.return_value = JobLogInfo(
-            job_id="38238485",
-            job_name="job",
-            state="RUNNING",
-            stdout="/tmp/job.out",
-            stderr="/tmp/job.err",
-            source="sacct",
-        )
-
-        exit_code = show_job_log(
-            "user@cluster",
-            "38238485",
-            stream="stdout",
-            lines=5,
-            follow=False,
-            full=False,
-            path_only=False,
-            json_output=True,
-            archive_dir=None,
-            ssh_config_file="/dev/null",
-            ssh_options=["-o", "BatchMode=yes"],
-        )
-
-        self.assertEqual(exit_code, 0)
-        mock_subprocess_run.assert_not_called()
-        payload = mock_print_json.call_args.kwargs["data"]
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["path"], "/tmp/job.out")
-        self.assertEqual(payload["resolved_via"], "sacct")
-        self.assertTrue(payload["path_verified"])
-        self.assertFalse(payload["content_included"])
-
-    @patch("launcher.job_tools.console.print_json")
-    @patch("launcher.job_tools.resolve_job_log_info")
-    def test_show_job_log_json_fails_when_probes_are_unresolved(
-        self,
-        mock_resolve_job_log_info,
-        mock_print_json,
-    ) -> None:
-        mock_resolve_job_log_info.return_value = JobLogInfo(
-            job_id="38238485",
-            job_name="",
-            state="",
-            stdout=None,
-            stderr=None,
-            source="unresolved",
-            verified=False,
-            probe_errors=("scontrol failed (rc=255)", "sacct failed (rc=255)"),
-        )
-
-        exit_code = show_job_log(
-            "acc",
-            "38238485",
-            stream="stdout",
-            lines=5,
-            follow=False,
-            full=False,
-            path_only=False,
-            json_output=True,
-            archive_dir="/remote/archive",
-        )
-
-        self.assertEqual(exit_code, 1)
-        payload = mock_print_json.call_args.kwargs["data"]
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["job_id"], "38238485")
-        self.assertEqual(len(payload["probe_errors"]), 2)
-
-    @patch("launcher.job_tools.subprocess.run")
-    @patch("launcher.job_tools.resolve_job_log_info")
-    def test_show_job_log_passes_ssh_settings_to_tail(
-        self,
-        mock_resolve_job_log_info,
-        mock_subprocess_run,
-    ) -> None:
-        mock_resolve_job_log_info.return_value = JobLogInfo(
-            job_id="38238485",
-            job_name="job",
-            state="RUNNING",
-            stdout="/tmp/job.out",
-            stderr="/tmp/job.err",
-            source="sacct",
-        )
-        mock_subprocess_run.return_value = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-        )
-
-        exit_code = show_job_log(
-            "user@cluster",
-            "38238485",
-            stream="stdout",
-            lines=5,
-            follow=False,
-            full=False,
-            path_only=False,
-            json_output=False,
-            archive_dir=None,
-            ssh_config_file="/dev/null",
-            ssh_options=["-o", "BatchMode=yes"],
-        )
-
-        self.assertEqual(exit_code, 0)
-        mock_subprocess_run.assert_called_once()
-        command = mock_subprocess_run.call_args.args[0]
-        self.assertEqual(
-            command[:6],
-            ["ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "user@cluster"],
-        )
-        self.assertEqual(command[-1], "tail -n 5 /tmp/job.out")
 
 
 if __name__ == "__main__":

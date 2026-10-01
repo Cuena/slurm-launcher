@@ -18,11 +18,9 @@ from .tracking import (
 
 def add_download_logs_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--tracking-file",
-        help=(
-            "Path to a jobs.json file. Defaults to slurm_output/latest_jobs.json, "
-            "or the most recent slurm_output/*/jobs.json."
-        ),
+        "--run",
+        dest="tracking_file",
+        help="Run ID, tracking path, or latest (default).",
     )
     parser.add_argument(
         "--job-name",
@@ -189,7 +187,7 @@ def run_download_logs(args: argparse.Namespace) -> int:
     if tracking_path is None:
         message = (
             "No tracking file found. "
-            "Run a non-dry submission first or pass --tracking-file."
+            "Run a submission first or pass --run ID or a tracking path."
         )
         if json_output:
             return _emit_json_error(message, tracking_file=args.tracking_file)

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+from contextlib import chdir
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from launcher.tracking import (
     JobRecord,
@@ -10,6 +13,7 @@ from launcher.tracking import (
     TrackingPayload,
     load_tracking_payload,
     resolve_tracking_file,
+    atomic_write_json,
 )
 from tests.helpers import write_tracking_file
 
@@ -260,10 +264,39 @@ class ResolveTrackingFileTests(unittest.TestCase):
         result = resolve_tracking_file("/nonexistent/custom.json")
         self.assertIsNone(result)
 
-    def test_returns_none_when_no_files_exist(self) -> None:
-        result = resolve_tracking_file(None)
-        # May or may not be None depending on cwd — just verify it doesn't crash.
-        self.assertIsInstance(result, (Path, type(None)))
+    def test_named_latest_directory_and_tracking_path_resolve_same_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, chdir(tmpdir):
+            self.assertIsNone(resolve_tracking_file(None))
+            path = write_tracking_file(
+                Path("slurm_output/run_001/jobs.json"), {"run_id": "run_001"}
+            )
+            for selector in (
+                "run_001",
+                "slurm_output/run_001",
+                str(path),
+                "latest",
+                None,
+            ):
+                with self.subTest(selector=selector):
+                    self.assertEqual(resolve_tracking_file(selector), path)
+
+
+class AtomicTrackingTests(unittest.TestCase):
+    def test_failed_replace_preserves_previous_complete_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "jobs.json"
+            atomic_write_json(path, {"jobs": [{"job_id": "12345"}]})
+            with patch(
+                "launcher.tracking.os.replace", side_effect=OSError("disk error")
+            ):
+                with self.assertRaises(OSError):
+                    atomic_write_json(
+                        path, {"jobs": [{"job_id": "12345"}, {"job_id": "12346"}]}
+                    )
+            self.assertEqual(
+                json.loads(path.read_text()), {"jobs": [{"job_id": "12345"}]}
+            )
+            self.assertEqual(list(Path(tmpdir).iterdir()), [path])
 
 
 if __name__ == "__main__":

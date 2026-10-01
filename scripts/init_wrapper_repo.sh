@@ -94,7 +94,7 @@ Next steps:
    uv add --editable "$launcher_root"
 2) Edit: $private_cfg
 3) Dry-run:
-   uv run slurm-launcher --dry-run
+   uv run slurm-launcher run --only train --dry-run
 4) Submit:
-   uv run slurm-launcher
+   uv run slurm-launcher run --only train
 EOF

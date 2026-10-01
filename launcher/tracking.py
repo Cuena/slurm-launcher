@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,6 +25,7 @@ class JobRecord:
     launcher: dict[str, object] | None = None
     artifacts: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
+    state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,7 @@ class TrackingPayload:
     sync_symlinks: str | None
     rsync_login: str = ""
     jobs: list[JobRecord] = field(default_factory=list)
+    run_id: str | None = None
 
     def filter_jobs(
         self,
@@ -74,22 +78,64 @@ class TrackingPayload:
 
 
 def resolve_tracking_file(path_arg: str | None) -> Path | None:
-    if path_arg:
-        candidate = Path(path_arg)
-        return candidate if candidate.exists() else None
+    if path_arg and path_arg != "latest":
+        candidate = Path(path_arg).expanduser()
+        if candidate.is_dir():
+            candidate /= "jobs.json"
+        elif len(candidate.parts) == 1 and candidate.suffix != ".json":
+            candidate = Path("slurm_output") / candidate / "jobs.json"
+        return candidate if candidate.is_file() else None
 
     latest = Path("slurm_output/latest_jobs.json")
-    if latest.exists():
+    if latest.is_file():
         return latest
-
     candidates = sorted(
         Path("slurm_output").glob("*/jobs.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
-    if candidates:
-        return candidates[0]
-    return None
+    return candidates[0] if candidates else None
+
+
+def resolve_run_directory(path_arg: str | None) -> Path:
+    tracking_file = resolve_tracking_file(path_arg)
+    if tracking_file is None:
+        raise TrackingError("Run not found. Stage first, then pass --run ID or PATH.")
+    if tracking_file.name == "latest_jobs.json":
+        payload = load_tracking_payload(tracking_file)
+        run_id = payload.run_id or payload.job_folder
+        if not run_id or Path(run_id).name != run_id or run_id in {".", ".."}:
+            raise TrackingError("Invalid run ID in latest tracking file.")
+        return tracking_file.parent / run_id
+    return tracking_file.parent
+
+
+def atomic_write(path: Path, content: str) -> None:
+    """Replace one local state file without exposing a partial write."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    atomic_write(path, json.dumps(payload, indent=2) + "\n")
 
 
 def _str_or_none(value: object) -> str | None:
@@ -128,6 +174,7 @@ def _parse_job_record(raw: object) -> JobRecord | None:
         launcher=launcher,
         artifacts=_str_list(raw.get("artifacts")),
         requires=_str_list(raw.get("requires")),
+        state=_str_or_none(raw.get("state")),
     )
 
 
@@ -177,23 +224,8 @@ def load_tracking_payload(path: Path) -> TrackingPayload:
         sync_symlinks=_str_or_none(raw.get("sync_symlinks")),
         rsync_login=_str_or_none(raw.get("rsync_login")) or cluster_login,
         jobs=jobs,
+        run_id=_str_or_none(raw.get("run_id")),
     )
-
-
-def _str_or_none(value: object) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _str_list(value: object) -> list[str]:
-    if isinstance(value, list):
-        return [str(item) for item in value if str(item).strip()]
-    if value is None:
-        return []
-    text = str(value).strip()
-    return [text] if text else []
 
 
 def all_tracking_files() -> list[Path]:
