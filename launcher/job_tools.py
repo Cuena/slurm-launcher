@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
-import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +12,9 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from .core import build_ssh_command, resolve_log_path
+from .core import resolve_log_path
 from .tracking import all_tracking_files, load_tracking_payload
+from .transport import run_ssh_capture
 
 console = Console()
 err_console = Console(stderr=True)
@@ -44,6 +45,8 @@ class JobLogInfo:
     source: str
     verified: bool = True
     probe_errors: tuple[str, ...] = ()
+    stdout_source: str | None = None
+    stderr_source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -79,18 +82,29 @@ def _normalized_text(value: Any) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
-    if not text or text in {"(null)", "None", "N/A"}:
+    if not text or text.casefold() in {
+        "(null)",
+        "(none)",
+        "null",
+        "none",
+        "n/a",
+        "unknown",
+    }:
         return None
     return text
 
 
 def _parse_one_line_fields(output: str) -> dict[str, str]:
+    # Slurm separates fields with whitespace, but values may contain whitespace.
+    boundaries = list(re.finditer(r"(?:^|\s)([A-Z][A-Za-z0-9_]*)=", output))
     fields: dict[str, str] = {}
-    for token in output.strip().split():
-        if "=" not in token:
-            continue
-        key, value = token.split("=", 1)
-        fields[key] = value
+    for index, boundary in enumerate(boundaries):
+        end = (
+            boundaries[index + 1].start()
+            if index + 1 < len(boundaries)
+            else len(output)
+        )
+        fields[boundary.group(1)] = output[boundary.end() : end].strip()
     return fields
 
 
@@ -162,38 +176,6 @@ def _job_details_from_sacct(output: str, job_id: str) -> JobDetails | None:
     return None
 
 
-def _merge_job_details(primary: JobDetails, secondary: JobDetails) -> JobDetails:
-    def pick(first: str | None, second: str | None) -> str | None:
-        return first if first else second
-
-    source = primary.source
-    if secondary.source and secondary.source != primary.source:
-        source = f"{primary.source}+{secondary.source}"
-    return JobDetails(
-        job_id=pick(primary.job_id, secondary.job_id) or secondary.job_id,
-        job_name=pick(primary.job_name, secondary.job_name),
-        state=pick(primary.state, secondary.state),
-        partition=pick(primary.partition, secondary.partition),
-        command=pick(primary.command, secondary.command),
-        work_dir=pick(primary.work_dir, secondary.work_dir),
-        stdout=pick(primary.stdout, secondary.stdout),
-        stderr=pick(primary.stderr, secondary.stderr),
-        node_list=pick(primary.node_list, secondary.node_list),
-        num_nodes=pick(primary.num_nodes, secondary.num_nodes),
-        gres=pick(primary.gres, secondary.gres),
-        submit_time=pick(primary.submit_time, secondary.submit_time),
-        start_time=pick(primary.start_time, secondary.start_time),
-        end_time=pick(primary.end_time, secondary.end_time),
-        source=source,
-        detail_level=(
-            "full"
-            if "full" in {primary.detail_level, secondary.detail_level}
-            else primary.detail_level
-        ),
-        launcher=primary.launcher or secondary.launcher,
-    )
-
-
 def _job_details_from_log_info(info: JobLogInfo) -> JobDetails:
     return JobDetails(
         job_id=info.job_id,
@@ -227,15 +209,31 @@ def _launcher_info_from_payload(payload: dict[str, Any]) -> LauncherInfo | None:
     )
 
 
-def _launcher_info_from_tracking(job_id: str) -> LauncherInfo | None:
+def _launcher_info_from_tracking(
+    cluster_login: str,
+    job_id: str,
+    *,
+    command: str | None = None,
+) -> LauncherInfo | None:
     for tracking_file in all_tracking_files():
         try:
             payload = load_tracking_payload(tracking_file)
         except Exception:
             continue
+        if payload.cluster_login.strip() != cluster_login.strip():
+            continue
         for job in payload.jobs:
             if job.job_id.strip() != job_id:
                 continue
+            if command:
+                if command.startswith("sbatch ") and job.sbatch_command:
+                    try:
+                        if shlex.split(command) != shlex.split(job.sbatch_command):
+                            continue
+                    except ValueError:
+                        continue
+                elif job.remote_sbatch and command != job.remote_sbatch:
+                    continue
             if job.launcher:
                 parsed = _launcher_info_from_payload(job.launcher)
                 if parsed is not None:
@@ -277,7 +275,7 @@ def _launcher_info_from_script(
     command_path = _normalized_text(command)
     if not command_path or not command_path.endswith(".sbatch"):
         return None
-    result = _run_ssh_capture(
+    result = run_ssh_capture(
         cluster_login,
         f"test -f {shlex.quote(command_path)} && sed -n '1,20p' {shlex.quote(command_path)}",
         ssh_config_file=ssh_config_file,
@@ -299,7 +297,7 @@ def resolve_job_details(
     scontrol_details: JobDetails | None = None
     sacct_details: JobDetails | None = None
 
-    scontrol_result = _run_ssh_capture(
+    scontrol_result = run_ssh_capture(
         cluster_login,
         f"scontrol show job -o {shlex.quote(job_id)}",
         ssh_config_file=ssh_config_file,
@@ -308,7 +306,7 @@ def resolve_job_details(
     if scontrol_result.returncode == 0:
         scontrol_details = _job_details_from_scontrol(scontrol_result.stdout, job_id)
 
-    sacct_result = _run_ssh_capture(
+    sacct_result = run_ssh_capture(
         cluster_login,
         (
             "command -v sacct >/dev/null 2>&1 && "
@@ -324,39 +322,41 @@ def resolve_job_details(
 
     details = scontrol_details or sacct_details
     if details is None:
-        scontrol_log_info = (
-            _job_log_info_from_scontrol(scontrol_result.stdout, job_id)
-            if scontrol_result.returncode == 0
-            else None
+        sacct_log_result = run_ssh_capture(
+            cluster_login,
+            (
+                "command -v sacct >/dev/null 2>&1 && "
+                f"sacct -X -n -P -j {shlex.quote(job_id)} "
+                "--format JobIDRaw,JobName,State,StdOut,StdErr"
+            ),
+            ssh_config_file=ssh_config_file,
+            ssh_options=ssh_options,
         )
-        if scontrol_log_info is not None:
-            details = _job_details_from_log_info(scontrol_log_info)
-        else:
-            sacct_log_result = _run_ssh_capture(
-                cluster_login,
-                (
-                    "command -v sacct >/dev/null 2>&1 && "
-                    f"sacct -X -n -P -j {shlex.quote(job_id)} "
-                    "--format JobIDRaw,JobName,State,StdOut,StdErr"
-                ),
-                ssh_config_file=ssh_config_file,
-                ssh_options=ssh_options,
+        if sacct_log_result.returncode == 0:
+            sacct_log_info = _job_log_info_from_sacct(
+                sacct_log_result.stdout,
+                job_id,
             )
-            if sacct_log_result.returncode == 0:
-                sacct_log_info = _job_log_info_from_sacct(
-                    sacct_log_result.stdout,
-                    job_id,
-                )
-                if sacct_log_info is not None:
-                    details = _job_details_from_log_info(sacct_log_info)
+            if sacct_log_info is not None:
+                details = _job_details_from_log_info(sacct_log_info)
         if details is None:
             return None
     if scontrol_details is not None and sacct_details is not None:
-        details = _merge_job_details(scontrol_details, sacct_details)
+        details = replace(
+            scontrol_details,
+            **{
+                field.name: getattr(sacct_details, field.name)
+                for field in fields(JobDetails)
+                if getattr(scontrol_details, field.name) is None
+            },
+            source="scontrol+sacct",
+        )
     if not enrich_launcher:
         return details
 
-    launcher = _launcher_info_from_tracking(job_id)
+    launcher = _launcher_info_from_tracking(
+        cluster_login, job_id, command=details.command
+    )
     if launcher is None:
         launcher = _launcher_info_from_script(
             cluster_login,
@@ -364,25 +364,7 @@ def resolve_job_details(
             ssh_config_file=ssh_config_file,
             ssh_options=ssh_options,
         )
-    return JobDetails(
-        job_id=details.job_id,
-        job_name=details.job_name,
-        state=details.state,
-        partition=details.partition,
-        command=details.command,
-        work_dir=details.work_dir,
-        stdout=details.stdout,
-        stderr=details.stderr,
-        node_list=details.node_list,
-        num_nodes=details.num_nodes,
-        gres=details.gres,
-        submit_time=details.submit_time,
-        start_time=details.start_time,
-        end_time=details.end_time,
-        source=details.source,
-        detail_level=details.detail_level,
-        launcher=launcher,
-    )
+    return replace(details, launcher=launcher)
 
 
 def resolve_job_sbatch(
@@ -392,7 +374,7 @@ def resolve_job_sbatch(
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
 ) -> tuple[str | None, str | None]:
-    result = _run_ssh_capture(
+    result = run_ssh_capture(
         cluster_login,
         f"scontrol write batch_script {shlex.quote(job_id)} -",
         ssh_config_file=ssh_config_file,
@@ -437,16 +419,8 @@ def _job_details_payload(
     for field_name, value in optional_fields.items():
         if value is not None:
             payload[field_name] = value
-    launcher = None
     if details.launcher is not None:
-        launcher = {
-            "managed": details.launcher.managed,
-            "runtime_kind": details.launcher.runtime_kind,
-            "runtime_artifact": details.launcher.runtime_artifact,
-            "entry_command": details.launcher.entry_command,
-        }
-    if launcher is not None:
-        payload["launcher"] = launcher
+        payload["launcher"] = asdict(details.launcher)
     if sbatch is not None:
         payload["sbatch"] = sbatch
     return payload
@@ -458,30 +432,6 @@ def effective_archive_dir(archive_dir: str | None) -> tuple[str, str]:
     return str(DEFAULT_ARCHIVE_DIR), "default"
 
 
-def _run_ssh_capture(
-    cluster_login: str,
-    script: str,
-    *,
-    ssh_config_file: str | None = None,
-    ssh_options: list[str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            *build_ssh_command(
-                cluster_login,
-                ssh_config_file=ssh_config_file,
-                ssh_options=ssh_options,
-            ),
-            "bash",
-            "-s",
-        ],
-        input=script.rstrip() + "\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
 def _parse_recent_jobs(output: str, *, source: str) -> list[RecentJob]:
     jobs: list[RecentJob] = []
     for raw_line in output.splitlines():
@@ -490,6 +440,7 @@ def _parse_recent_jobs(output: str, *, source: str) -> list[RecentJob]:
             continue
         parts = [part.strip() for part in line.split("|")]
         if source == "sacct":
+            parts = [_normalized_text(part) or "" for part in parts]
             if len(parts) < 8:
                 continue
             jobs.append(
@@ -544,10 +495,6 @@ def _filter_recent_jobs(
     ]
 
 
-def _recent_jobs_sort_key(job: RecentJob) -> tuple[str, str, str, str]:
-    return (job.submit, job.start, job.end, job.job_id)
-
-
 def list_recent_jobs(
     cluster_login: str,
     *,
@@ -584,7 +531,7 @@ def list_recent_jobs(
             "fi",
         ]
     )
-    result = _run_ssh_capture(
+    result = run_ssh_capture(
         cluster_login,
         script,
         ssh_config_file=ssh_config_file,
@@ -607,7 +554,7 @@ def list_recent_jobs(
 
     jobs = _parse_recent_jobs(output, source=source)
     jobs = _filter_recent_jobs(jobs, states=states)
-    jobs.sort(key=_recent_jobs_sort_key, reverse=True)
+    jobs.sort(key=lambda job: (job.submit, job.start, job.end, job.job_id), reverse=True)
     jobs = jobs[:limit]
 
     payload = {
@@ -618,16 +565,7 @@ def list_recent_jobs(
         "states": sorted(states) if states else [],
         "source": source,
         "jobs": [
-            {
-                "job_id": job.job_id,
-                "job_name": job.job_name,
-                "state": job.state,
-                "partition": job.partition,
-                "submit": job.submit,
-                "start": job.start,
-                "end": job.end,
-                "elapsed": job.elapsed,
-            }
+            {key: value for key, value in asdict(job).items() if key != "source"}
             for job in jobs
         ],
     }
@@ -780,10 +718,10 @@ def _job_log_info_from_sacct(output: str, job_id: str) -> JobLogInfo | None:
             continue
         return JobLogInfo(
             job_id=record_job_id,
-            job_name=parts[1],
-            state=parts[2],
-            stdout=resolve_log_path(parts[3] or None, job_id),
-            stderr=resolve_log_path(parts[4] or None, job_id),
+            job_name=_normalized_text(parts[1]) or "",
+            state=_normalized_text(parts[2]) or "",
+            stdout=resolve_log_path(_normalized_text(parts[3]), job_id),
+            stderr=resolve_log_path(_normalized_text(parts[4]), job_id),
             source="sacct",
         )
     return None
@@ -796,66 +734,87 @@ def resolve_job_log_info(
     archive_dir: str | None,
     ssh_config_file: str | None = None,
     ssh_options: list[str] | None = None,
-) -> JobLogInfo | None:
+) -> JobLogInfo:
     probe_errors: list[str] = []
-
-    scontrol_result = _run_ssh_capture(
-        cluster_login,
-        f"scontrol show job -o {shlex.quote(job_id)}",
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
-    )
-    if scontrol_result.returncode == 0:
-        info = _job_log_info_from_scontrol(scontrol_result.stdout, job_id)
-        if info and (info.stdout or info.stderr):
-            return info
-        probe_errors.append("scontrol returned no log paths")
-    else:
-        probe_errors.append(f"scontrol failed (rc={scontrol_result.returncode})")
-
-    sacct_result = _run_ssh_capture(
-        cluster_login,
+    infos: list[JobLogInfo] = []
+    stdout: str | None = None
+    stderr: str | None = None
+    stdout_source: str | None = None
+    stderr_source: str | None = None
+    transport_failed = False
+    probes = (
+        ("scontrol", f"scontrol show job -o {shlex.quote(job_id)}"),
         (
+            "sacct",
             "command -v sacct >/dev/null 2>&1 && "
             f"sacct -X -n -P -j {shlex.quote(job_id)} "
-            "--format JobIDRaw,JobName,State,StdOut,StdErr"
+            "--format JobIDRaw,JobName,State,StdOut,StdErr",
         ),
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
     )
-    if sacct_result.returncode == 0:
-        info = _job_log_info_from_sacct(sacct_result.stdout, job_id)
-        if info and (info.stdout or info.stderr):
-            return info
-        probe_errors.append("sacct returned no log paths")
-    else:
-        probe_errors.append(f"sacct failed (rc={sacct_result.returncode})")
-
-    transport_failed = any(
-        result.returncode == 255 for result in (scontrol_result, sacct_result)
-    )
-    if transport_failed or not archive_dir:
-        return JobLogInfo(
-            job_id=job_id,
-            job_name="",
-            state="",
-            stdout=None,
-            stderr=None,
-            source="unresolved",
-            verified=False,
-            probe_errors=tuple(probe_errors),
+    for source, script in probes:
+        result = run_ssh_capture(
+            cluster_login,
+            script,
+            ssh_config_file=ssh_config_file,
+            ssh_options=ssh_options,
         )
+        if result.returncode != 0:
+            detail = result.stderr.strip()
+            if len(detail) > 1024:
+                detail = detail[:1024] + "..."
+            error = f"{source} failed (rc={result.returncode})"
+            if detail:
+                error += f": {detail}"
+            probe_errors.append(error)
+            transport_failed |= result.returncode == 255
+            continue
+        parser = (
+            _job_log_info_from_scontrol
+            if source == "scontrol"
+            else _job_log_info_from_sacct
+        )
+        info = parser(result.stdout, job_id)
+        if info is not None:
+            infos.append(info)
+            if stdout is None and info.stdout is not None:
+                stdout, stdout_source = info.stdout, source
+            if stderr is None and info.stderr is not None:
+                stderr, stderr_source = info.stderr, source
+        if stdout is not None and stderr is not None:
+            break
+        missing = [
+            stream
+            for stream, path in (
+                ("stdout", info.stdout if info else None),
+                ("stderr", info.stderr if info else None),
+            )
+            if path is None
+        ]
+        probe_errors.append(f"{source} returned no {'/'.join(missing)} paths")
 
-    archive_root, archive_source = effective_archive_dir(archive_dir)
-    archive_root = archive_root.rstrip("/")
-    fallback_detail = "; ".join(probe_errors)
+    verified = stdout is not None and stderr is not None
+    if not verified and archive_dir and not transport_failed:
+        archive_root, archive_source = effective_archive_dir(archive_dir)
+        archive_root = archive_root.rstrip("/")
+        if stdout is None:
+            stdout = f"{archive_root}/{job_id}.out"
+            stdout_source = f"archive:{archive_source}"
+        if stderr is None:
+            stderr = f"{archive_root}/{job_id}.err"
+            stderr_source = f"archive:{archive_source}"
+
+    sources = list(
+        dict.fromkeys(source for source in (stdout_source, stderr_source) if source)
+    )
     return JobLogInfo(
         job_id=job_id,
-        job_name="",
-        state="",
-        stdout=f"{archive_root}/{job_id}.out",
-        stderr=f"{archive_root}/{job_id}.err",
-        source=f"archive:{archive_source} (fallback: {fallback_detail})",
-        verified=False,
+        job_name=next((info.job_name for info in infos if info.job_name), ""),
+        state=next((info.state for info in infos if info.state), ""),
+        stdout=stdout,
+        stderr=stderr,
+        source="+".join(sources) or "unresolved",
+        verified=verified,
         probe_errors=tuple(probe_errors),
+        stdout_source=stdout_source,
+        stderr_source=stderr_source,
     )

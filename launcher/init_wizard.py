@@ -380,4 +380,6 @@ def init_config(
         _ensure_gitignore_line(cwd, "!.slurm/*.example.py")
     else:
         _ensure_gitignore_line(cwd, dest_path.name)
+    _ensure_gitignore_line(cwd, "__pycache__/")
+    _ensure_gitignore_line(cwd, "slurm_output/")
     return dest_path, answers

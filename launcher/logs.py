@@ -11,7 +11,8 @@ import time
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .core import build_ssh_command, resolve_log_path
+from .core import resolve_log_path
+from .transport import build_ssh_command
 from .job_tools import resolve_job_log_info
 from .tracking import TrackingError, load_tracking_payload, resolve_tracking_file
 
@@ -77,11 +78,14 @@ def add_logs_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _encode_cursor(state: dict[str, Any]) -> str:
-    return (
+    token = (
         base64.urlsafe_b64encode(json.dumps(state, separators=(",", ":")).encode())
         .decode()
         .rstrip("=")
     )
+    if len(token) > MAX_CURSOR:
+        raise ValueError("Cursor is too large.")
+    return token
 
 
 def _validate_options(options: dict[str, Any]) -> None:
@@ -145,22 +149,46 @@ def _decode_cursor(token: str) -> dict[str, Any]:
         for spec in files:
             for key in ("job_id", "job_name", "stream", "source", "path", "root"):
                 value = spec.get(key)
-                if value is not None and (not isinstance(value, str) or "\0" in value):
+                if value is not None and (
+                    not isinstance(value, str) or "\0" in value or len(value) > 4096
+                ):
                     raise ValueError("Invalid cursor file identity.")
             if spec.get("stream") not in ("stdout", "stderr", "application"):
                 raise ValueError("Invalid cursor stream.")
+            errors = spec.get("resolution_errors", [])
+            if not isinstance(errors, list) or len(errors) > 32 or not all(
+                isinstance(error, str) and len(error) <= 4096 for error in errors
+            ):
+                raise ValueError("Invalid cursor resolution errors.")
             position = spec.get("position", {})
             if not isinstance(position, dict):
                 raise ValueError("Invalid cursor position.")
-            for key in ("offset", "emitted", "pending_end", "anchor_length"):
+            for key in (
+                "offset", "emitted", "pending_end", "anchor_length",
+                "boundary_start", "boundary_length",
+            ):
                 value = position.get(key, 0)
                 if type(value) is not int or not 0 <= value <= (
-                    64 if key == "anchor_length" else 2**63 - 1
+                    64 if key in ("anchor_length", "boundary_length") else 2**63 - 1
                 ):
                     raise ValueError("Invalid cursor offset.")
-            for key in ("identity", "anchor"):
-                if key in position and not isinstance(position[key], str):
-                    raise ValueError("Invalid cursor identity.")
+            if "identity" in position and (
+                not isinstance(position["identity"], str) or len(position["identity"]) > 128
+            ):
+                raise ValueError("Invalid cursor identity.")
+            for key in ("anchor", "boundary"):
+                if key in position and (
+                    not isinstance(position[key], str)
+                    or len(position[key]) != 64
+                    or any(c not in "0123456789abcdef" for c in position[key])
+                ):
+                    raise ValueError("Invalid cursor fingerprint.")
+            if "boundary" in position and (
+                "boundary_start" not in position or "boundary_length" not in position
+                or position["boundary_start"] + position["boundary_length"]
+                != position.get("offset", 0)
+            ):
+                raise ValueError("Invalid cursor boundary.")
         return state
     except (
         ValueError,
@@ -214,10 +242,11 @@ def _initial_state(args: argparse.Namespace, cluster_context) -> dict[str, Any]:
             files.append(
                 {
                     "job_id": args.job_id,
-                    "job_name": info.job_name if info else None,
+                    "job_name": info.job_name,
                     "stream": stream,
-                    "path": getattr(info, stream) if info else None,
-                    "source": info.source if info else "unresolved",
+                    "path": getattr(info, stream),
+                    "source": getattr(info, stream + "_source") or "unresolved",
+                    "resolution_errors": list(info.probe_errors),
                 }
             )
     else:
@@ -262,14 +291,33 @@ def _initial_state(args: argparse.Namespace, cluster_context) -> dict[str, Any]:
             )
         else:
             for job in jobs:
+                saved_paths = {
+                    stream: resolve_log_path(getattr(job, stream), job.job_id)
+                    for stream in streams
+                }
+                info = None
+                if any(path is None for path in saved_paths.values()):
+                    info = resolve_job_log_info(
+                        context["cluster_login"], job.job_id,
+                        archive_dir=context["archive_dir"],
+                        ssh_config_file=context["ssh_config_file"],
+                        ssh_options=context["ssh_options"],
+                    )
                 for stream in streams:
+                    saved_path = saved_paths[stream]
+                    path = saved_path if saved_path is not None else getattr(info, stream)
+                    source = (
+                        "tracking" if saved_path is not None
+                        else getattr(info, stream + "_source") or "unresolved"
+                    )
                     files.append(
                         {
                             "job_id": job.job_id,
                             "job_name": job.job_name,
                             "stream": stream,
-                            "path": resolve_log_path(getattr(job, stream), job.job_id),
-                            "source": "tracking",
+                            "path": path,
+                            "source": source,
+                            "resolution_errors": list(info.probe_errors) if info else [],
                         }
                     )
     state = {
@@ -340,6 +388,9 @@ def _emit(payload: dict[str, Any], json_output: bool, path_only: bool) -> None:
             sys.stdout.write(file["content"])
             if file["content"] and not file["content"].endswith("\n"):
                 sys.stdout.write("\n")
+            print(f"Source: {file['source'] or 'unresolved'}")
+        for error in file.get("resolution_errors") or []:
+            print(f"Resolution: {error}", file=sys.stderr)
         if file["error"]:
             print(file["error"], file=sys.stderr)
         if file["reset"]:

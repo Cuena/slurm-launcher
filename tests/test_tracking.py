@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-from contextlib import chdir
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from launcher.tracking import (
-    JobRecord,
     TrackingError,
     TrackingPayload,
     load_tracking_payload,
@@ -65,6 +64,14 @@ class LoadTrackingPayloadTests(unittest.TestCase):
         self.assertEqual(payload.artifact_paths, ["outputs/"])
         self.assertEqual(len(payload.jobs), 2)
         self.assertEqual(payload.source_path, path)
+        train = payload.jobs[0]
+        self.assertEqual(train.job_name, "train")
+        self.assertEqual(train.job_id, "12345")
+        self.assertEqual(train.stdout, "/logs/12345.out")
+        self.assertEqual(train.stderr, "/logs/12345.err")
+        self.assertEqual(train.sbatch_command, "sbatch train.sbatch")
+        self.assertEqual(train.submitted_at, "2026-04-01T12:00:00")
+        self.assertTrue(train.launcher["managed"])
 
     def test_loads_dedicated_rsync_login(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -74,21 +81,6 @@ class LoadTrackingPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload.cluster_login, "user@cluster")
         self.assertEqual(payload.rsync_login, "user@transfer1")
-
-    def test_job_records_have_typed_fields(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = write_tracking_file(Path(tmpdir) / "jobs.json", MINIMAL_PAYLOAD)
-            payload = load_tracking_payload(path)
-
-        train = payload.jobs[0]
-        self.assertEqual(train.job_name, "train")
-        self.assertEqual(train.job_id, "12345")
-        self.assertEqual(train.stdout, "/logs/12345.out")
-        self.assertEqual(train.stderr, "/logs/12345.err")
-        self.assertEqual(train.sbatch_command, "sbatch train.sbatch")
-        self.assertEqual(train.submitted_at, "2026-04-01T12:00:00")
-        self.assertIsNotNone(train.launcher)
-        self.assertTrue(train.launcher["managed"])
 
     def test_raises_on_nonexistent_file(self) -> None:
         with self.assertRaises(TrackingError):
@@ -149,18 +141,6 @@ class LoadTrackingPayloadTests(unittest.TestCase):
 
         self.assertEqual(payload.ssh_options, [])
 
-    def test_artifact_paths_from_various_types(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            data = {
-                "cluster_login": "u@h",
-                "artifact_paths": ["a/", "b/"],
-                "jobs": [],
-            }
-            path = write_tracking_file(Path(tmpdir) / "jobs.json", data)
-            payload = load_tracking_payload(path)
-
-        self.assertEqual(payload.artifact_paths, ["a/", "b/"])
-
 
 class FilterJobsTests(unittest.TestCase):
     def _payload(self) -> TrackingPayload:
@@ -168,88 +148,19 @@ class FilterJobsTests(unittest.TestCase):
             path = write_tracking_file(Path(tmpdir) / "jobs.json", MINIMAL_PAYLOAD)
             return load_tracking_payload(path)
 
-    def test_no_filter_returns_all(self) -> None:
+    def test_filter_selection(self) -> None:
         payload = self._payload()
-        self.assertEqual(len(payload.filter_jobs()), 2)
-
-    def test_filter_by_name(self) -> None:
-        payload = self._payload()
-        result = payload.filter_jobs(names={"train"})
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].job_name, "train")
-
-    def test_filter_by_id(self) -> None:
-        payload = self._payload()
-        result = payload.filter_jobs(ids={"12346"})
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0].job_name, "eval")
-
-    def test_filter_by_name_and_id(self) -> None:
-        payload = self._payload()
-        result = payload.filter_jobs(names={"train"}, ids={"12346"})
-        self.assertEqual(len(result), 2)
-
-    def test_filter_nonexistent_returns_empty(self) -> None:
-        payload = self._payload()
-        result = payload.filter_jobs(names={"nonexistent"})
-        self.assertEqual(len(result), 0)
-
-
-class RunnableJobIdsTests(unittest.TestCase):
-    def test_excludes_special_ids(self) -> None:
-        jobs = [
-            JobRecord(job_name="a", job_id="12345"),
-            JobRecord(job_name="b", job_id="dry-run"),
-            JobRecord(job_name="c", job_id="unknown"),
-            JobRecord(job_name="d", job_id=""),
-            JobRecord(job_name="e", job_id="67890"),
-        ]
-        payload = TrackingPayload(
-            source_path=Path("/fake"),
-            created_at=None,
-            cluster_login="u@h",
-            ssh_config_file=None,
-            ssh_options=[],
-            job_folder="run",
-            remote_workdir=None,
-            remote_logdir=None,
-            remote_slurm_output_dir=None,
-            remote_slurm_dashboard_log_archive_dir=None,
-            remote_slurm_dashboard_log_view_dir=None,
-            runtime_mode=None,
-            venv_python_executable=None,
-            singularity_image_path=None,
-            artifact_paths=[],
-            sync_symlinks=None,
-            jobs=jobs,
-        )
-        self.assertEqual(payload.runnable_job_ids(), ["12345", "67890"])
-
-    def test_runnable_from_subset(self) -> None:
-        jobs = [
-            JobRecord(job_name="a", job_id="12345"),
-            JobRecord(job_name="b", job_id="dry-run"),
-        ]
-        payload = TrackingPayload(
-            source_path=Path("/fake"),
-            created_at=None,
-            cluster_login="u@h",
-            ssh_config_file=None,
-            ssh_options=[],
-            job_folder="run",
-            remote_workdir=None,
-            remote_logdir=None,
-            remote_slurm_output_dir=None,
-            remote_slurm_dashboard_log_archive_dir=None,
-            remote_slurm_dashboard_log_view_dir=None,
-            runtime_mode=None,
-            venv_python_executable=None,
-            singularity_image_path=None,
-            artifact_paths=[],
-            sync_symlinks=None,
-            jobs=jobs,
-        )
-        self.assertEqual(payload.runnable_job_ids([jobs[1]]), [])
+        for filters, expected in (
+            ({}, ["train", "eval"]),
+            ({"names": {"train"}}, ["train"]),
+            ({"ids": {"12346"}}, ["eval"]),
+            ({"names": {"train"}, "ids": {"12346"}}, ["train", "eval"]),
+            ({"names": {"nonexistent"}}, []),
+        ):
+            with self.subTest(filters=filters):
+                self.assertEqual(
+                    [job.job_name for job in payload.filter_jobs(**filters)], expected
+                )
 
 
 class ResolveTrackingFileTests(unittest.TestCase):
@@ -265,20 +176,23 @@ class ResolveTrackingFileTests(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_named_latest_directory_and_tracking_path_resolve_same_run(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir, chdir(tmpdir):
-            self.assertIsNone(resolve_tracking_file(None))
-            path = write_tracking_file(
-                Path("slurm_output/run_001/jobs.json"), {"run_id": "run_001"}
-            )
-            for selector in (
-                "run_001",
-                "slurm_output/run_001",
-                str(path),
-                "latest",
-                None,
-            ):
-                with self.subTest(selector=selector):
-                    self.assertEqual(resolve_tracking_file(selector), path)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.addCleanup(os.chdir, Path.cwd())
+        os.chdir(temporary.name)
+        self.assertIsNone(resolve_tracking_file(None))
+        path = write_tracking_file(
+            Path("slurm_output/run_001/jobs.json"), {"run_id": "run_001"}
+        )
+        for selector in (
+            "run_001",
+            "slurm_output/run_001",
+            str(path),
+            "latest",
+            None,
+        ):
+            with self.subTest(selector=selector):
+                self.assertEqual(resolve_tracking_file(selector), path)
 
 
 class AtomicTrackingTests(unittest.TestCase):

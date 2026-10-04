@@ -5,16 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
-import subprocess
-import sys
 from pathlib import Path
+from posixpath import normpath
 from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from .core import build_rsync_ssh_command, build_ssh_command
+from .transport import build_rsync_ssh_command, run_ssh_capture
+from .transfers import destination_component, run_downloads
 from .tracking import (
     JobRecord,
     TrackingError,
@@ -27,10 +27,18 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _emit_error(message: str, *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps({"ok": False, "error": message}, indent=2))
+    else:
+        err_console.print(f"ERROR: {message}", style="bold red")
+    return 1
+
+
 def _resolve_remote_artifact_path(remote_workdir: str, artifact_path: str) -> str:
     if artifact_path.startswith("/"):
-        return artifact_path
-    return f"{remote_workdir.rstrip('/')}/{artifact_path.lstrip('/')}"
+        return normpath(artifact_path)
+    return normpath(f"{remote_workdir.rstrip('/')}/{artifact_path}")
 
 
 def _local_artifact_destination(
@@ -42,13 +50,14 @@ def _local_artifact_destination(
 
     Layout: output_dir / job_name / job_id / artifact_path
     """
-    job_label = job.job_name or "unknown_job"
-    job_id = job.job_id or "unknown"
-    if any(part in {".", ".."} or "/" in part for part in (job_label, job_id)):
-        raise ValueError("Invalid tracked job name or ID for artifact destination.")
-    if ".." in Path(artifact_path).parts:
-        raise ValueError("Artifact paths cannot traverse outside their destination.")
-    return output_dir / job_label / job_id / Path(artifact_path.lstrip("/"))
+    job_label = destination_component(job.job_name or "unknown_job", "tracked job name")
+    job_id = destination_component(job.job_id or "unknown", "tracked job ID")
+    relative_path = Path(artifact_path.lstrip("/"))
+    if ".." in relative_path.parts or not relative_path.parts:
+        raise ValueError("Artifact paths must name an artifact without traversal.")
+    for part in relative_path.parts:
+        destination_component(part, "artifact path component")
+    return output_dir / job_label / job_id / relative_path
 
 
 def _artifact_entries(
@@ -63,9 +72,16 @@ def _artifact_entries(
     ssh_options: list[str] | None = None,
 ) -> list[dict[str, object]]:
     entries: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
     for artifact_path in artifact_paths:
-        remote_path = _resolve_remote_artifact_path(remote_workdir, artifact_path)
+        remote_path = _resolve_remote_artifact_path(
+            remote_workdir, artifact_path
+        ).rstrip("/")
         local_path = _local_artifact_destination(output_dir, job, artifact_path)
+        identity = (remote_path, str(local_path))
+        if identity in seen:
+            continue
+        seen.add(identity)
         source = f"{cluster_login}:{remote_path}"
         cmd = [
             "rsync",
@@ -75,7 +91,9 @@ def _artifact_entries(
         ]
         if dry_run:
             cmd.append("--dry-run")
-        cmd.extend([source, str(local_path)])
+        # A named source copied into its existing parent works for both files and
+        # directories, including repeat downloads. Never pre-create the artifact.
+        cmd.extend(["--protect-args", source, str(local_path.parent) + "/"])
         entries.append(
             {
                 "job_name": job.job_name,
@@ -90,54 +108,9 @@ def _artifact_entries(
     return entries
 
 
-def _run_downloads(
-    cluster_login: str,
-    entries: list[dict[str, object]],
-    *,
-    dry_run: bool,
-    quiet: bool = False,
-) -> int:
-    failures = 0
-    for entry in entries:
-        artifact_path = str(entry["path"])
-        remote_path = str(entry["remote_path"])
-        destination = Path(str(entry["destination"]))
-        cmd = list(entry["argv"])
-
-        if not quiet:
-            print(f"{artifact_path} -> {remote_path}")
-            print(f"  -> {destination}")
-            print(f"  $ {entry['command']}")
-
-        if dry_run:
-            continue
-
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if quiet:
-            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        else:
-            result = subprocess.run(cmd, check=False)
-        if result.returncode != 0:
-            failures += 1
-            if not quiet:
-                print(
-                    f"ERROR: rsync failed ({result.returncode}) for {artifact_path}: {remote_path}",
-                    file=sys.stderr,
-                )
-    return failures
-
-
 def _collect_job_artifacts(payload: TrackingPayload, job: JobRecord) -> list[str]:
     """Artifact paths for a job, preferring job-specific declarations."""
-    paths = job.artifacts if job.artifacts else payload.artifact_paths
-    seen: set[str] = set()
-    unique: list[str] = []
-    for path in paths:
-        if path in seen:
-            continue
-        seen.add(path)
-        unique.append(path)
-    return unique
+    return list(dict.fromkeys(job.artifacts or payload.artifact_paths))
 
 
 def list_artifacts(
@@ -194,20 +167,11 @@ def _check_remote_artifacts(
                 "fi",
             ]
         )
-    result = subprocess.run(
-        [
-            *build_ssh_command(
-                payload.cluster_login,
-                ssh_config_file=payload.ssh_config_file,
-                ssh_options=payload.ssh_options,
-            ),
-            "bash",
-            "-s",
-        ],
-        input="\n".join(script_lines) + "\n",
-        capture_output=True,
-        text=True,
-        check=False,
+    result = run_ssh_capture(
+        payload.cluster_login,
+        "\n".join(script_lines) + "\n",
+        ssh_config_file=payload.ssh_config_file,
+        ssh_options=payload.ssh_options,
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or f"SSH exited with code {result.returncode}"
@@ -258,6 +222,11 @@ def _payload(
                 "path": entry["path"],
                 "remote_path": entry["remote_path"],
                 "destination": entry["destination"],
+                **{
+                    key: entry[key]
+                    for key in ("returncode", "stderr")
+                    if key in entry
+                },
                 **(
                     {
                         "exists": entry.get("exists"),
@@ -327,44 +296,36 @@ def run_artifacts(
 ) -> int:
     tracking_path = resolve_tracking_file(tracking_file)
     if tracking_path is None:
-        message = "Run not found. Pass --run ID, a tracking path, or latest."
-        if json_output:
-            print(json.dumps({"ok": False, "error": message}, indent=2))
-        else:
-            err_console.print(f"ERROR: {message}", style="bold red")
-        return 1
+        return _emit_error(
+            "Run not found. Pass --run ID, a tracking path, or latest.",
+            json_output=json_output,
+        )
 
     try:
         payload = load_tracking_payload(tracking_path)
     except TrackingError as exc:
-        message = f"Cannot load tracking file: {exc}"
-        if json_output:
-            print(json.dumps({"ok": False, "error": message}, indent=2))
-        else:
-            err_console.print(f"ERROR: {message}", style="bold red")
-        return 1
+        return _emit_error(f"Cannot load tracking file: {exc}", json_output=json_output)
 
     if subcommand in {"check", "download"} and not payload.cluster_login:
-        message = f"Missing cluster_login in {tracking_path}"
-        if json_output:
-            print(json.dumps({"ok": False, "error": message}, indent=2))
-        else:
-            err_console.print(f"ERROR: {message}", style="bold red")
-        return 1
+        return _emit_error(
+            f"Missing cluster_login in {tracking_path}", json_output=json_output
+        )
 
     if not payload.remote_workdir:
-        message = f"Missing remote_workdir in {tracking_path}"
-        if json_output:
-            print(json.dumps({"ok": False, "error": message}, indent=2))
-        else:
-            err_console.print(f"ERROR: {message}", style="bold red")
-        return 1
+        return _emit_error(
+            f"Missing remote_workdir in {tracking_path}", json_output=json_output
+        )
 
-    effective_output_dir = (
-        Path(output_dir)
-        if output_dir
-        else Path("slurm_output") / "downloaded_artifacts" / payload.job_folder
-    )
+    try:
+        effective_output_dir = (
+            Path(output_dir)
+            if output_dir
+            else Path("slurm_output")
+            / "downloaded_artifacts"
+            / destination_component(payload.job_folder, "tracked job folder")
+        )
+    except ValueError as exc:
+        return _emit_error(str(exc), json_output=json_output)
 
     jobs = payload.filter_jobs(names=set(selected_jobs) if selected_jobs else None)
     if not jobs:
@@ -386,12 +347,53 @@ def run_artifacts(
             console.print("No matching jobs.", style="yellow")
         return 0
 
-    if subcommand == "list":
-        entries = list_artifacts(
-            payload,
-            effective_output_dir,
-            selected_jobs=selected_jobs,
+    try:
+        if subcommand == "download":
+            entries: list[dict[str, object]] = []
+            for job in jobs:
+                paths = (
+                    artifact_paths
+                    if artifact_paths is not None
+                    else _collect_job_artifacts(payload, job)
+                )
+                entries.extend(
+                    _artifact_entries(
+                        payload.rsync_login or payload.cluster_login,
+                        payload.remote_workdir,
+                        job,
+                        paths,
+                        effective_output_dir,
+                        dry_run=dry_run,
+                        ssh_config_file=payload.ssh_config_file,
+                        ssh_options=payload.ssh_options,
+                    )
+                )
+        else:
+            entries = list_artifacts(
+                payload, effective_output_dir, selected_jobs=selected_jobs
+            )
+    except ValueError as exc:
+        return _emit_error(str(exc), json_output=json_output)
+
+    if not json_output and subcommand != "check":
+        console.print(
+            Panel.fit(
+                "\n".join(
+                    [
+                        f"[bold]Tracking file:[/bold] {tracking_path}",
+                        f"[bold]Cluster:[/bold] {payload.cluster_login}",
+                        f"[bold]Remote workdir:[/bold] {payload.remote_workdir}",
+                        f"[bold]Local output:[/bold] {effective_output_dir}",
+                    ]
+                ),
+                title=(
+                    "Declared Artifacts" if subcommand == "list" else "Download Artifacts"
+                ),
+                border_style="cyan",
+            )
         )
+
+    if subcommand == "list":
         if json_output:
             print(
                 json.dumps(
@@ -406,29 +408,10 @@ def run_artifacts(
                 )
             )
             return 0
-        console.print(
-            Panel.fit(
-                "\n".join(
-                    [
-                        f"[bold]Tracking file:[/bold] {tracking_path}",
-                        f"[bold]Cluster:[/bold] {payload.cluster_login}",
-                        f"[bold]Remote workdir:[/bold] {payload.remote_workdir}",
-                        f"[bold]Local output:[/bold] {effective_output_dir}",
-                    ]
-                ),
-                title="Declared Artifacts",
-                border_style="cyan",
-            )
-        )
         print_artifact_table(entries)
         return 0
 
     if subcommand == "check":
-        entries = list_artifacts(
-            payload,
-            effective_output_dir,
-            selected_jobs=selected_jobs,
-        )
         ok, error = _check_remote_artifacts(payload, entries)
         result_payload = _payload(
             tracking_path,
@@ -447,36 +430,10 @@ def run_artifacts(
         print_artifact_table(entries)
         return 0
 
-    # download
-    entries: list[dict[str, object]] = []
-    for job in jobs:
-        paths = (
-            artifact_paths
-            if artifact_paths is not None
-            else _collect_job_artifacts(payload, job)
-        )
-        if not paths:
-            continue
-        entries.extend(
-            _artifact_entries(
-                payload.rsync_login or payload.cluster_login,
-                payload.remote_workdir,
-                job,
-                paths,
-                effective_output_dir,
-                dry_run=dry_run,
-                ssh_config_file=payload.ssh_config_file,
-                ssh_options=payload.ssh_options,
-            )
-        )
-
+    if not json_output and dry_run:
+        console.print("Dry-run mode: commands will not be executed.", style="yellow")
+    failures = run_downloads(entries, dry_run=dry_run, quiet=json_output)
     if json_output:
-        failures = _run_downloads(
-            payload.rsync_login or payload.cluster_login,
-            entries,
-            dry_run=dry_run,
-            quiet=True,
-        )
         print(
             json.dumps(
                 _payload(
@@ -491,38 +448,13 @@ def run_artifacts(
                 indent=2,
             )
         )
-        return 0 if failures == 0 else 1
-
-    console.print(
-        Panel.fit(
-            "\n".join(
-                [
-                    f"[bold]Tracking file:[/bold] {tracking_path}",
-                    f"[bold]Cluster:[/bold] {payload.cluster_login}",
-                    f"[bold]Remote workdir:[/bold] {payload.remote_workdir}",
-                    f"[bold]Local output:[/bold] {effective_output_dir}",
-                ]
-            ),
-            title="Download Artifacts",
-            border_style="cyan",
-        )
-    )
-    if dry_run:
-        console.print("Dry-run mode: commands will not be executed.", style="yellow")
-
-    failures = _run_downloads(
-        payload.rsync_login or payload.cluster_login,
-        entries,
-        dry_run=dry_run,
-    )
-    if failures:
+    elif failures:
         err_console.print(
             f"Completed with {failures} failed download(s).", style="bold red"
         )
-        return 1
-
-    console.print("Download complete.", style="green")
-    return 0
+    else:
+        console.print("Download complete.", style="green")
+    return 0 if failures == 0 else 1
 
 
 def add_artifacts_parser(subparsers: Any) -> argparse.ArgumentParser:

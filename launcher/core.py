@@ -18,6 +18,8 @@ from uuid import uuid4
 from rich.console import Console
 from rich.syntax import Syntax
 
+from . import transport
+
 DEFAULT_RSYNC_EXCLUDES = [
     ".git/",
     "__pycache__/",
@@ -112,8 +114,6 @@ class LauncherSettings:
     artifact_paths: list[str]
     require_clean_git: bool
     sync_symlinks: str
-    local_artifact_root: Path | None
-    verbose: bool
     rsync_login: str | None = None
 
 
@@ -134,6 +134,25 @@ class SubmissionResult:
     commands: list[str] = field(default_factory=list)
 
 
+class SubmissionError(RuntimeError):
+    """A rejected or uncertain dispatch, retaining its transport evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        rejected: bool = False,
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.rejected = rejected
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
 def resolve_local_project_path(project_root: Path, configured_path: str) -> Path | None:
     candidate = Path(configured_path)
     if candidate.is_absolute():
@@ -145,71 +164,6 @@ def resolve_local_project_path(project_root: Path, configured_path: str) -> Path
     except ValueError:
         return None
     return resolved
-
-
-def build_ssh_transport_args(
-    ssh_config_file: str | None,
-    ssh_options: list[str] | None = None,
-) -> list[str]:
-    args: list[str] = []
-    if ssh_config_file:
-        args.extend(["-F", ssh_config_file])
-    if ssh_options:
-        args.extend(ssh_options)
-    return args
-
-
-def build_ssh_command(
-    cluster_login: str,
-    *,
-    ssh_config_file: str | None = None,
-    ssh_options: list[str] | None = None,
-) -> list[str]:
-    return [
-        "ssh",
-        *build_ssh_transport_args(ssh_config_file, ssh_options),
-        cluster_login,
-    ]
-
-
-def format_ssh_command(
-    cluster_login: str,
-    *,
-    ssh_config_file: str | None = None,
-    ssh_options: list[str] | None = None,
-    remote_command: str | None = None,
-) -> str:
-    command = build_ssh_command(
-        cluster_login,
-        ssh_config_file=ssh_config_file,
-        ssh_options=ssh_options,
-    )
-    if remote_command is not None:
-        command.append(remote_command)
-    return shlex.join(command)
-
-
-def format_ssh_script_command(
-    cluster_login: str,
-    script: str,
-    *,
-    ssh_config_file: str | None = None,
-    ssh_options: list[str] | None = None,
-) -> str:
-    return "\n".join(
-        [
-            f"{format_ssh_command(cluster_login, ssh_config_file=ssh_config_file, ssh_options=ssh_options)} <<'EOF'",
-            script.rstrip(),
-            "EOF",
-        ]
-    )
-
-
-def build_rsync_ssh_command(
-    ssh_config_file: str | None,
-    ssh_options: list[str] | None = None,
-) -> str:
-    return shlex.join(["ssh", *build_ssh_transport_args(ssh_config_file, ssh_options)])
 
 
 def ssh_script(
@@ -226,31 +180,24 @@ def ssh_script(
         if not quiet:
             console.print(
                 f"[yellow]dry-run[/yellow] "
-                f"{format_ssh_command(cluster_login, ssh_config_file=ssh_config_file, ssh_options=ssh_options)} <<'EOF'"
+                f"{transport.format_ssh_command(cluster_login, ssh_config_file=ssh_config_file, ssh_options=ssh_options)} <<'EOF'"
             )
             console.print(Syntax(script.rstrip(), "bash"))
             console.print("EOF")
         return "", ""
-    try:
-        result = subprocess.run(
-            [
-                *build_ssh_command(
-                    cluster_login,
-                    ssh_config_file=ssh_config_file,
-                    ssh_options=ssh_options,
-                ),
-                "bash",
-                "-s",
-            ],
-            input=script,
-            text=True,
-            capture_output=True,
-            check=True,
+    result = transport.run_ssh_capture(
+        cluster_login,
+        script,
+        ssh_config_file=ssh_config_file,
+        ssh_options=ssh_options,
+    )
+    if result.returncode:
+        cause = subprocess.CalledProcessError(
+            result.returncode, result.args, output=result.stdout, stderr=result.stderr
         )
-    except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            f"SSH command failed with exit code {exc.returncode}: {exc.stderr.strip()}"
-        ) from exc
+            f"SSH command failed with exit code {result.returncode}: {result.stderr.strip()}"
+        ) from cause
     return result.stdout, result.stderr
 
 
@@ -294,7 +241,7 @@ def ensure_remote_directories(
         return []
 
     mkdir_cmd = f"mkdir -p {' '.join(shlex.quote(p) for p in unique_paths)}"
-    command = format_ssh_command(
+    command = transport.format_ssh_command(
         settings.cluster_login,
         ssh_config_file=settings.ssh_config_file,
         ssh_options=settings.ssh_options,
@@ -322,8 +269,9 @@ def sync_project(
     *,
     include_logging_dirs: bool = True,
     quiet: bool = False,
+    source_state: SourceState | None = None,
 ) -> list[str]:
-    source_state = inspect_source_state(settings.project_root)
+    source_state = source_state or inspect_source_state(settings.project_root)
     remote_directories = [remote_paths.workdir]
     if include_logging_dirs:
         remote_directories.extend([remote_paths.logdir, remote_paths.slurm_output_dir])
@@ -348,7 +296,7 @@ def sync_project(
         "-az",
         "--info=progress2",
         "-e",
-        build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
+        transport.build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
     ]
     if settings.sync_symlinks == "copy-links":
         cmd.append("--copy-links")
@@ -399,7 +347,7 @@ def build_job_script(
         activate = venv_bin / "activate"
         lines.extend(
             [
-                f"test -f {shlex.quote(str(activate))} || (echo 'ERROR: venv activate script not found: {shlex.quote(str(activate))}' && exit 1)",
+                f"test -f {shlex.quote(str(activate))} || {{ printf '%s\\n' {shlex.quote(f'ERROR: venv activate script not found: {activate}')} >&2; exit 1; }}",
                 f"source {shlex.quote(str(activate))}",
             ]
         )
@@ -462,35 +410,15 @@ def build_sbatch_script(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _parse_int(value: object) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def format_sbatch_options(
     job: JobSpec, settings: LauncherSettings, remote_paths: RemotePaths
 ) -> dict[str, Any]:
     options = {**settings.default_sbatch, **job.sbatch}
     if "chdir" in options or "ch_dir" in options:
-        raise SystemExit(
+        raise ValueError(
             "ERROR: sbatch 'chdir' is not supported. "
             "The launcher always runs from its managed remote workdir."
         )
-
-    # Ensure ntasks is compatible with nodes x ntasks-per-node when both are set.
-    nodes = _parse_int(options.get("nodes"))
-    ntasks_per_node = _parse_int(
-        options.get("ntasks-per-node", options.get("ntasks_per_node"))
-    )
-    ntasks = _parse_int(options.get("ntasks"))
-    if nodes and ntasks_per_node:
-        expected = nodes * ntasks_per_node
-        if ntasks is None or ntasks < expected:
-            options["ntasks"] = expected
 
     options.setdefault("job-name", job.name)
     archive_dir = settings.remote_slurm_dashboard_log_archive_dir
@@ -624,6 +552,7 @@ def submit_job(
     )
     # Base64 preserves exact bytes and cannot collide with a script heredoc delimiter.
     encoded = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    frame = f"__SLURM_LAUNCHER_{uuid4().hex}__"
     directories = [remote_paths.logdir, remote_paths.slurm_output_dir]
     if settings.remote_slurm_dashboard_log_archive_dir:
         directories.append(settings.remote_slurm_dashboard_log_archive_dir)
@@ -633,10 +562,18 @@ def submit_job(
             f"mkdir -p {' '.join(shlex.quote(path) for path in directories)}",
             f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_sbatch_path)}",
             f"cd {shlex.quote(remote_paths.workdir)}",
-            sbatch_cmd,
+            # exec makes this status belong to sbatch, never a subshell EXIT trap.
+            f"if sbatch_stdout=$(trap - EXIT ERR; exec {sbatch_cmd}); then",
+            "    sbatch_status=0",
+            "else",
+            "    sbatch_status=$?",
+            "fi",
+            "printf '%s\\n' \"$sbatch_stdout\"",
+            "sbatch_encoded=$(trap - EXIT ERR; printf %s \"$sbatch_stdout\" | base64 | tr -d '\\n')",
+            f"printf '\\n{frame}:%s:%s\\n' \"$sbatch_status\" \"$sbatch_encoded\"",
         ]
     )
-    command = format_ssh_script_command(
+    command = transport.format_ssh_script_command(
         settings.cluster_login,
         submission_script,
         ssh_config_file=settings.ssh_config_file,
@@ -647,25 +584,51 @@ def submit_job(
             "dry-run", sbatch_cmd, options, remote_sbatch_path, [command]
         )
     try:
-        stdout, _ = ssh_script(
+        result = transport.run_ssh_capture(
             settings.cluster_login,
             submission_script,
-            dry_run=False,
             ssh_config_file=settings.ssh_config_file,
             ssh_options=settings.ssh_options,
-            quiet=quiet,
         )
-    except (RuntimeError, subprocess.CalledProcessError) as exc:
-        cause = exc.__cause__ if exc.__cause__ is not None else exc
-        if not isinstance(cause, subprocess.CalledProcessError):
-            raise
-        stdout = cause.stdout or ""
-        try:
-            parse_job_id(stdout)
-        except ValueError:
-            raise exc
+    except subprocess.CalledProcessError as exc:
+        result = subprocess.CompletedProcess(
+            exc.cmd, exc.returncode, exc.stdout or "", exc.stderr or ""
+        )
+    frames = re.findall(
+        rf"^{re.escape(frame)}:([0-9]+):([A-Za-z0-9+/=]*)$",
+        result.stdout,
+        flags=re.MULTILINE,
+    )
+    evidence = dict(
+        stdout=result.stdout, stderr=result.stderr, returncode=result.returncode
+    )
+    if len(frames) != 1:
+        raise SubmissionError(
+            "Submission outcome is unknown: missing or ambiguous sbatch acknowledgement.",
+            **evidence,
+        )
+    status_text, encoded_response = frames[0]
+    try:
+        response = base64.b64decode(encoded_response, validate=True).decode("utf-8")
+    except (ValueError, UnicodeError) as exc:
+        raise SubmissionError(
+            "Submission outcome is unknown: invalid sbatch acknowledgement.", **evidence
+        ) from exc
+    status = int(status_text)
+    try:
+        job_id = parse_job_id(response)
+    except ValueError as exc:
+        if status and not response.strip():
+            raise SubmissionError(
+                f"sbatch rejected the submission (exit {status}): {result.stderr.strip()}",
+                rejected=True,
+                **evidence,
+            ) from exc
+        raise SubmissionError(
+            f"Submission outcome is unknown: {exc}", **evidence
+        ) from exc
     submission = SubmissionResult(
-        parse_job_id(stdout),
+        job_id,
         sbatch_cmd,
         dict(options),
         remote_sbatch_path,
@@ -675,13 +638,19 @@ def submit_job(
         on_acknowledged(submission)
     try:
         if job.uses_sbatch_file():
-            stdout_path, stderr_path = resolve_submitted_job_log_paths(
-                settings, submission.job_id
+            from .job_tools import resolve_job_log_info
+
+            info = resolve_job_log_info(
+                settings.cluster_login,
+                submission.job_id,
+                archive_dir=None,
+                ssh_config_file=settings.ssh_config_file,
+                ssh_options=settings.ssh_options,
             )
-            if stdout_path:
-                submission.sbatch_options["output"] = stdout_path
-            if stderr_path:
-                submission.sbatch_options["error"] = stderr_path
+            if info.stdout:
+                submission.sbatch_options["output"] = info.stdout
+            if info.stderr:
+                submission.sbatch_options["error"] = info.stderr
         create_log_view_symlinks(settings, job, submission, quiet=quiet)
     except Exception as exc:
         if not quiet:
@@ -694,69 +663,6 @@ def submit_job(
             f"Submitted {job.name} -> {submission.job_id}", style="bold green"
         )
     return submission
-
-
-def job_artifact_paths(settings: LauncherSettings, job: JobSpec) -> list[str]:
-    """Return artifact paths for a job, preferring job-specific declarations."""
-    return job.artifacts if job.artifacts else settings.artifact_paths
-
-
-def resolve_remote_sbatch_path(
-    settings: LauncherSettings, remote_paths: RemotePaths, sbatch_file: str
-) -> str:
-    resolved = resolve_local_project_path(settings.project_root, sbatch_file)
-    if resolved is None:
-        raise ValueError(
-            f"Job sbatch_file must stay inside LOCAL_ROOT. Got: {sbatch_file!r}"
-        )
-    relative = resolved.relative_to(settings.project_root.resolve())
-    return f"{remote_paths.workdir}/{relative.as_posix()}"
-
-
-def build_predefined_sbatch_command(
-    settings: LauncherSettings,
-    remote_paths: RemotePaths,
-    job: JobSpec,
-) -> tuple[str, str]:
-    if not job.sbatch_file:
-        raise ValueError(
-            f"Job '{job.name}' does not define 'sbatch_file' for predefined submission."
-        )
-    remote_sbatch_path = resolve_remote_sbatch_path(
-        settings, remote_paths, job.sbatch_file
-    )
-    sbatch_cmd = shlex.join(
-        ["sbatch", "--parsable", *job.sbatch_args, remote_sbatch_path]
-    )
-    return remote_sbatch_path, sbatch_cmd
-
-
-def _read_scontrol_field(output: str, field_name: str) -> str | None:
-    match = re.search(rf"(?:^|\s){field_name}=([^\s]+)", output.strip())
-    if match is None:
-        return None
-    value = match.group(1).strip()
-    return value or None
-
-
-def resolve_submitted_job_log_paths(
-    settings: LauncherSettings,
-    job_id: str,
-) -> tuple[str | None, str | None]:
-    try:
-        stdout, _ = ssh_script(
-            settings.cluster_login,
-            f"scontrol show job -o {shlex.quote(job_id)}",
-            dry_run=False,
-            ssh_config_file=settings.ssh_config_file,
-            ssh_options=settings.ssh_options,
-            quiet=True,
-        )
-    except RuntimeError:
-        return None, None
-    stdout_path = resolve_log_path(_read_scontrol_field(stdout, "StdOut"), job_id)
-    stderr_path = resolve_log_path(_read_scontrol_field(stdout, "StdErr"), job_id)
-    return stdout_path, stderr_path
 
 
 def resolve_log_path(template: str | None, job_id: str) -> str | None:
@@ -794,6 +700,11 @@ def build_job_record(
         "launcher": launcher,
         "artifacts": job.artifacts,
         "requires": job.requires,
+        "array_spec": (
+            str(submission.sbatch_options["array"])
+            if submission.sbatch_options.get("array") is not None
+            else None
+        ),
     }
 
 
@@ -801,12 +712,15 @@ def write_job_tracking_file(
     settings: LauncherSettings,
     remote_paths: RemotePaths,
     job_records: list[dict[str, Any]],
+    *,
+    run_dir: Path | None = None,
 ) -> Path:
     """Atomically merge progress without dropping earlier acknowledgments."""
-    from .tracking import atomic_write, atomic_write_json
+    from .tracking import atomic_write_json
 
     root = settings.project_root / "slurm_output"
-    output_path = root / remote_paths.job_folder / "jobs.json"
+    selected_run_dir = run_dir or root / remote_paths.job_folder
+    output_path = selected_run_dir / "jobs.json"
     payload = (
         json.loads(output_path.read_text())
         if output_path.exists()
@@ -847,8 +761,8 @@ def write_job_tracking_file(
         records[record["job_name"]] = {**previous, **record}
     payload["jobs"] = list(records.values())
     atomic_write_json(output_path, payload)
-    atomic_write_json(root / "latest_jobs.json", payload)
-    atomic_write(root / "latest_run.txt", remote_paths.job_folder + "\n")
+    if selected_run_dir.parent.name == "slurm_output":
+        atomic_write_json(selected_run_dir.parent / "latest_jobs.json", payload)
     return output_path
 
 
@@ -860,33 +774,29 @@ def render_runtime_command(job: JobSpec, settings: LauncherSettings) -> str:
         raise SystemExit(
             "ERROR: SINGULARITY_IMAGE_PATH missing while RUNTIME_MODE='singularity'."
         )
-    parts = ["singularity", "exec"]
-    parts.extend(shlex.quote(arg) for arg in settings.singularity_exec_flags)
-    parts.append(shlex.quote(settings.singularity_image_path))
-    parts.append(base_command)
-    return " ".join(parts)
+    return shlex.join(
+        [
+            "singularity",
+            "exec",
+            *settings.singularity_exec_flags,
+            settings.singularity_image_path,
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            base_command,
+        ]
+    )
 
 
-def create_job_folder_name(prefix: str, repo_root: Path) -> str:
+def create_job_folder_name(
+    prefix: str, repo_root: Path, *, source_state: SourceState | None = None
+) -> str:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    source_state = inspect_source_state(repo_root)
+    source_state = source_state or inspect_source_state(repo_root)
     git_hash = source_state.git_short_commit or "nogit"
     suffix = "_dirty" if source_state.git_dirty else ""
     return f"{prefix}_{timestamp}_{git_hash}{suffix}_{uuid4().hex[:8]}"
-
-
-def query_git_hash(repo_root: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-            cwd=repo_root,
-        )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return "nogit"
 
 
 @dataclass(frozen=True)
@@ -899,6 +809,9 @@ class SourceState:
     git_status_porcelain: str
     git_diff_stat: str
     untracked_files: list[str]
+    captured_at: str = field(
+        default_factory=lambda: datetime.now().isoformat(timespec="seconds")
+    )
 
 
 def _git_output(repo_root: Path, args: list[str]) -> str | None:
@@ -940,11 +853,14 @@ def inspect_source_state(repo_root: Path) -> SourceState:
 
 
 def enforce_clean_git(
-    settings: LauncherSettings, *, require_clean_git: bool = False
+    settings: LauncherSettings,
+    *,
+    require_clean_git: bool = False,
+    source_state: SourceState | None = None,
 ) -> None:
     if not (settings.require_clean_git or require_clean_git):
         return
-    source_state = inspect_source_state(settings.project_root)
+    source_state = source_state or inspect_source_state(settings.project_root)
     if not source_state.git_available:
         raise SystemExit(
             "ERROR: Git state is unavailable and clean git state is required."
@@ -965,7 +881,7 @@ def build_source_metadata(
     source_state: SourceState,
 ) -> dict[str, Any]:
     return {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": source_state.captured_at,
         "job_folder": remote_paths.job_folder,
         "remote_workdir": remote_paths.workdir,
         "local_project_root": str(settings.project_root),
@@ -1003,7 +919,7 @@ def format_source_metadata_command(
             "SOURCE_METADATA_JSON",
         ]
     )
-    return format_ssh_script_command(
+    return transport.format_ssh_script_command(
         settings.cluster_login,
         script,
         ssh_config_file=settings.ssh_config_file,
@@ -1027,7 +943,7 @@ def write_remote_source_metadata(
             "rsync",
             "-az",
             "-e",
-            build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
+            transport.build_rsync_ssh_command(settings.ssh_config_file, settings.ssh_options),
             handle.name,
             f"{settings.rsync_login or settings.cluster_login}:{remote_path}",
         ]
@@ -1036,16 +952,14 @@ def write_remote_source_metadata(
     return [shlex.join(command)]
 
 
-def resolve_remote_paths(settings: LauncherSettings) -> RemotePaths:
-    return resolve_remote_paths_for_job_folder(settings, job_folder=None)
-
-
-def resolve_remote_paths_for_job_folder(
+def resolve_remote_paths(
     settings: LauncherSettings,
-    job_folder: str | None,
+    *,
+    job_folder: str | None = None,
+    source_state: SourceState | None = None,
 ) -> RemotePaths:
     effective_job_folder = job_folder or create_job_folder_name(
-        settings.project_prefix, settings.project_root
+        settings.project_prefix, settings.project_root, source_state=source_state
     )
     remote_log_base = settings.remote_log_base_path.rstrip("/")
     if settings.workspace_mode == "fixed":

@@ -23,10 +23,7 @@ class TestBuildSettings(TestCase):
         config = self._minimal_config()
         config.SYNC_SYMLINKS = "copy"
 
-        with self.assertRaisesRegex(
-            SystemExit,
-            "SYNC_SYMLINKS must be one of: copy-links, preserve",
-        ):
+        with self.assertRaises(ValueError):
             build_settings(config, Path("config.py"))
 
 

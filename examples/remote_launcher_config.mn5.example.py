@@ -1,7 +1,4 @@
-# examples/remote_launcher_config.mn5.example.py
-# What: MN5-oriented launcher config with reusable sbatch helper functions.
-# Why: Keeps a shareable MN5 example while personal credentials stay local-only.
-# RELEVANT FILES: examples/remote_launcher_config.mn5.py, launcher/templates/config.py.template, launcher/cli.py, README.md
+"""Shareable MN5 config; replace account, SSH hosts, remote paths, and project scripts."""
 
 from __future__ import annotations
 
@@ -68,6 +65,7 @@ def mn5_multinode_accel_sbatch(
         "qos": qos,
         "time": job_time,
         "nodes": max(1, nodes),
+        "ntasks": max(1, nodes),
         "ntasks-per-node": 1,
         "cpus-per-task": max(1, cpus_per_task),
         "gres": f"gpu:{max(1, gpus_per_node)}",
@@ -98,7 +96,6 @@ DEFAULT_SBATCH = {
 }
 EXTRA_RSYNC_EXCLUDES = [".git/", ".venv/", "slurm_output/"]
 EXTRA_RSYNC_ARGS: list[str] = []
-VERBOSE = True
 
 RUN_JOBS: list[str] = ["train_gpu"]
 

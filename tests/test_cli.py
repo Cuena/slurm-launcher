@@ -45,5 +45,5 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = make_settings(project_root=Path(tmpdir))
             job = JobSpec(name="shared", sbatch_file="../shared/train.sbatch")
-            with self.assertRaises(SystemExit):
+            with self.assertRaises(ValueError):
                 validate_predefined_sbatch_file_job(settings, job)

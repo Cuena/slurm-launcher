@@ -26,6 +26,7 @@ class JobRecord:
     artifacts: list[str] = field(default_factory=list)
     requires: list[str] = field(default_factory=list)
     state: str | None = None
+    array_spec: str | None = None
 
 
 @dataclass(frozen=True)
@@ -60,20 +61,10 @@ class TrackingPayload:
     ) -> list[JobRecord]:
         if not names and not ids:
             return list(self.jobs)
-        result: list[JobRecord] = []
-        for job in self.jobs:
-            if names and job.job_name in names:
-                result.append(job)
-            elif ids and job.job_id in ids:
-                result.append(job)
-        return result
-
-    def runnable_job_ids(self, jobs: list[JobRecord] | None = None) -> list[str]:
-        source = jobs if jobs is not None else self.jobs
         return [
-            job.job_id
-            for job in source
-            if job.job_id and job.job_id not in {"", "unknown", "dry-run"}
+            job
+            for job in self.jobs
+            if (names and job.job_name in names) or (ids and job.job_id in ids)
         ]
 
 
@@ -175,6 +166,7 @@ def _parse_job_record(raw: object) -> JobRecord | None:
         artifacts=_str_list(raw.get("artifacts")),
         requires=_str_list(raw.get("requires")),
         state=_str_or_none(raw.get("state")),
+        array_spec=_str_or_none(raw.get("array_spec")),
     )
 
 
@@ -235,13 +227,11 @@ def all_tracking_files() -> list[Path]:
     latest = tracking_root / "latest_jobs.json"
     if latest.exists():
         files.append(latest)
-    if tracking_root.exists():
-        candidates = sorted(
+    files.extend(
+        sorted(
             tracking_root.glob("*/jobs.json"),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
-        for candidate in candidates:
-            if candidate not in files:
-                files.append(candidate)
+    )
     return files

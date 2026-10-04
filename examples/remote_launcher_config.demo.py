@@ -21,7 +21,6 @@ REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 
 PROJECT_NAME = "slurm-launcher-demo"
 ARTIFACT_PATHS: list[str] = ["outputs"]
-LOCAL_ARTIFACT_ROOT: str | None = None
 SYNC_SYMLINKS: str | None = "preserve"
 
 RUNTIME_MODE = "native"  # native | venv | singularity
@@ -42,7 +41,6 @@ DEFAULT_SBATCH = {
 
 EXTRA_RSYNC_EXCLUDES = [".git/", "slurm_output/", ".venv/"]
 EXTRA_RSYNC_ARGS: list[str] = []
-VERBOSE = True
 
 RUN_JOBS: list[str] = []
 

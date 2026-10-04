@@ -7,9 +7,7 @@ from typing import Any
 
 
 def error_payload(message: str, **extra: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"ok": False, "error": message}
-    payload.update(extra)
-    return payload
+    return {"ok": False, "error": message, **extra}
 
 
 def validate_payload(

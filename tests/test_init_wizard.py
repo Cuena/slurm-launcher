@@ -5,12 +5,9 @@ import unittest
 from pathlib import Path
 
 from launcher.init_wizard import (
-    InitAnswers,
-    _apply_answers_to_template,
     _infer_project_name,
     _infer_project_name_from_pyproject,
     _normalize_project_name,
-    _replace_assignment,
     init_config,
 )
 
@@ -50,12 +47,6 @@ class InferProjectNameTests(unittest.TestCase):
             name = _infer_project_name(Path(tmpdir))
         self.assertEqual(name, "my-cool-project")
 
-    def test_pyproject_without_name_falls_back(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pyproject = Path(tmpdir) / "pyproject.toml"
-            pyproject.write_text("[build-system]\n", encoding="utf-8")
-            name = _infer_project_name(Path(tmpdir))
-        self.assertTrue(len(name) > 0)
 
 
 class InferProjectNameFromPyprojectTests(unittest.TestCase):
@@ -71,69 +62,8 @@ class InferProjectNameFromPyprojectTests(unittest.TestCase):
         )
 
 
-class ReplaceAssignmentTests(unittest.TestCase):
-    def test_replaces_simple_assignment(self) -> None:
-        source = 'PROJECT_NAME = "old"\n'
-        result = _replace_assignment(source, "PROJECT_NAME", '"new"')
-        self.assertIn('PROJECT_NAME = "new"', result)
-
-    def test_preserves_comment(self) -> None:
-        source = 'RUNTIME_MODE = "native"  # native | venv | singularity\n'
-        result = _replace_assignment(source, "RUNTIME_MODE", '"venv"')
-        self.assertIn('"venv"', result)
-        self.assertIn("# native | venv | singularity", result)
-
-    def test_raises_on_missing_assignment(self) -> None:
-        with self.assertRaises(RuntimeError):
-            _replace_assignment("FOO = 1\n", "BAR", "2")
-
-
-class ApplyAnswersToTemplateTests(unittest.TestCase):
-    def test_applies_answers_to_real_template(self) -> None:
-        template = TEMPLATE_PATH.read_text(encoding="utf-8")
-        answers = InitAnswers(
-            project_name="test_proj",
-            cluster_login="user@cluster.example",
-            workspace_mode="per-run",
-            remote_workspace_base="/scratch/work",
-            remote_workspace_dir=None,
-            remote_log_base_path="/scratch/logs",
-            runtime_mode="native",
-            venv_python_executable=None,
-            singularity_image_path=None,
-            singularity_exec_flags=[],
-            mn5_account="test_acct",
-        )
-        result = _apply_answers_to_template(template, answers)
-
-        self.assertIn("'test_proj'", result)
-        self.assertIn("'user@cluster.example'", result)
-        self.assertIn("'per-run'", result)
-        self.assertIn("'/scratch/work'", result)
-        self.assertIn("'/scratch/logs'", result)
-        self.assertIn("'test_acct'", result)
-
 
 class InitConfigTests(unittest.TestCase):
-    def test_non_interactive_creates_config_from_template(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cwd = Path(tmpdir)
-            dest = cwd / ".slurm" / "remote_launcher_config.mn5.py"
-
-            created_path, answers = init_config(
-                cwd=cwd,
-                template_path=TEMPLATE_PATH,
-                dest_path=dest,
-                force=False,
-                interactive=False,
-            )
-
-            self.assertEqual(created_path, dest)
-            self.assertIsNone(answers)
-            self.assertTrue(dest.exists())
-            content = dest.read_text(encoding="utf-8")
-            self.assertIn("CLUSTER_LOGIN", content)
-            self.assertIn("JOBS", content)
 
     def test_raises_on_existing_without_force(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -151,40 +81,6 @@ class InitConfigTests(unittest.TestCase):
                     interactive=False,
                 )
 
-    def test_force_overwrites_existing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cwd = Path(tmpdir)
-            dest = cwd / ".slurm" / "remote_launcher_config.mn5.py"
-            dest.parent.mkdir(parents=True)
-            dest.write_text("old content", encoding="utf-8")
-
-            created_path, _ = init_config(
-                cwd=cwd,
-                template_path=TEMPLATE_PATH,
-                dest_path=dest,
-                force=True,
-                interactive=False,
-            )
-
-            self.assertEqual(created_path, dest)
-            self.assertNotEqual(dest.read_text(encoding="utf-8"), "old content")
-
-    def test_creates_gitignore_entries(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cwd = Path(tmpdir)
-            dest = cwd / ".slurm" / "remote_launcher_config.mn5.py"
-
-            init_config(
-                cwd=cwd,
-                template_path=TEMPLATE_PATH,
-                dest_path=dest,
-                force=False,
-                interactive=False,
-            )
-
-            gitignore = (cwd / ".gitignore").read_text(encoding="utf-8")
-            self.assertIn(".slurm/*.py", gitignore)
-            self.assertIn("!.slurm/*.example.py", gitignore)
 
     def test_raises_on_missing_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

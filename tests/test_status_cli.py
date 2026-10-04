@@ -1,10 +1,13 @@
 """Reject mixed identities before accessing the cluster."""
 
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from launcher.cli import main, parse_args
+from tests.test_status import scheduler_fixture
 
 
 class StatusSelectionTests(unittest.TestCase):
@@ -30,3 +33,27 @@ class StatusSelectionTests(unittest.TestCase):
             )
         self.assertEqual(result, 1)
         self.assertFalse(output.call_args.kwargs["data"]["ok"])
+
+    def test_direct_parent_query_json_retains_failed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with scheduler_fixture(
+                Path(directory),
+                "123_0|array|COMPLETED|0:0|-|-|-|00:01|cpu\n"
+                "123_1|array|FAILED|1:0|-|-|-|00:01|cpu\n",
+                "",
+            ):
+                with patch("launcher.status.console.print_json") as output:
+                    result = main(
+                        [
+                            "status", "--job-id", "123",
+                            "--cluster-login", "fixture", "--json",
+                        ]
+                    )
+        self.assertEqual(result, 0)
+        parent = output.call_args.kwargs["data"]["jobs"][0]
+        self.assertEqual(parent["derived_state"], "FAILED")
+        self.assertFalse(parent["array_complete"])
+        self.assertEqual(
+            [(task["job_id"], task["derived_state"]) for task in parent["tasks"]],
+            [("123_0", "DONE"), ("123_1", "FAILED")],
+        )

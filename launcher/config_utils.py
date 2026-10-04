@@ -8,7 +8,13 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from .core import JobSpec, LauncherSettings, resolve_local_project_path
+from .core import (
+    JobSpec,
+    LauncherSettings,
+    format_sbatch_options,
+    resolve_local_project_path,
+    resolve_remote_paths,
+)
 
 WORKSPACE_MODES = {"per-run", "fixed"}
 
@@ -27,7 +33,9 @@ def resolve_config_path(
     return next((path for path in candidates if path.is_file()), None)
 
 
-def configured_run_only(config: ModuleType, args: Any) -> list[str] | None:
+def configured_run_only(
+    config: ModuleType, args: Any, *, require_selection: bool = True
+) -> list[str] | None:
     only = getattr(args, "only", None)
     if getattr(args, "all_jobs", False):
         if only:
@@ -36,18 +44,21 @@ def configured_run_only(config: ModuleType, args: Any) -> list[str] | None:
     selected = only or [
         name for name in ensure_list(getattr(config, "RUN_JOBS", None)) if name.strip()
     ]
-    if not selected:
+    if not selected and require_selection:
         raise ValueError("Select jobs with --only, nonempty RUN_JOBS, or --all.")
-    return selected
+    return selected or None
 
 
 def load_config(config_path: Path) -> ModuleType:
     config_path = config_path.resolve()
     spec = importlib.util.spec_from_file_location("remote_launcher_config", config_path)
     if spec is None or spec.loader is None:
-        raise SystemExit(f"ERROR: Unable to load config from {config_path}")
+        raise ValueError(f"ERROR: Unable to load config from {config_path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise ValueError(f"Unable to load config {config_path}: {exc}") from exc
     return module
 
 
@@ -63,7 +74,7 @@ def normalize_workspace_mode(value: Any, *, setting_name: str) -> str:
     mode = str(value).strip().lower()
     if mode in WORKSPACE_MODES:
         return mode
-    raise SystemExit(f"ERROR: {setting_name} must be one of: per-run, fixed.")
+    raise ValueError(f"ERROR: {setting_name} must be one of: per-run, fixed.")
 
 
 def build_settings(
@@ -85,22 +96,22 @@ def build_settings(
     )
 
     if not cluster_login:
-        raise SystemExit("ERROR: Config must define CLUSTER_LOGIN.")
+        raise ValueError("ERROR: Config must define CLUSTER_LOGIN.")
 
     remote_log_base_path = getattr(config, "REMOTE_LOG_BASE_PATH", None)
     if not remote_log_base_path:
         remote_log_base_path = remote_workspace_base or remote_workspace_dir
     if not remote_log_base_path:
-        raise SystemExit(
+        raise ValueError(
             "ERROR: Config must define REMOTE_LOG_BASE_PATH and one workspace path "
             "(REMOTE_WORKSPACE_BASE/REMOTE_WORKSPACE_DIR)."
         )
     if workspace_mode == "per-run" and not remote_workspace_base:
-        raise SystemExit(
+        raise ValueError(
             "ERROR: REMOTE_WORKSPACE_BASE is required for WORKSPACE_MODE='per-run'."
         )
     if workspace_mode == "fixed" and not remote_workspace_dir:
-        raise SystemExit(
+        raise ValueError(
             "ERROR: REMOTE_WORKSPACE_DIR is required for WORKSPACE_MODE='fixed'."
         )
 
@@ -120,14 +131,12 @@ def build_settings(
     runtime_mode = str(getattr(config, "RUNTIME_MODE", "native")).lower()
     allowed_runtimes = {"native", "venv", "singularity"}
     if runtime_mode not in allowed_runtimes:
-        raise SystemExit(
-            "ERROR: RUNTIME_MODE must be one of: native, venv, singularity."
-        )
+        raise ValueError("ERROR: RUNTIME_MODE must be one of: native, venv, singularity.")
 
     venv_python = getattr(config, "VENV_PYTHON_EXECUTABLE", None)
     singularity_image = getattr(config, "SINGULARITY_IMAGE_PATH", None)
     if hasattr(config, "SINGULARITY_EXTRA_ARGS"):
-        raise SystemExit(
+        raise ValueError(
             "ERROR: SINGULARITY_EXTRA_ARGS was removed. "
             "Rename it to SINGULARITY_EXEC_FLAGS."
         )
@@ -137,12 +146,12 @@ def build_settings(
 
     if runtime_mode == "venv":
         if not venv_python:
-            raise SystemExit(
+            raise ValueError(
                 "ERROR: Set VENV_PYTHON_EXECUTABLE when RUNTIME_MODE='venv'."
             )
     elif runtime_mode == "singularity":
         if not singularity_image:
-            raise SystemExit(
+            raise ValueError(
                 "ERROR: Set SINGULARITY_IMAGE_PATH when RUNTIME_MODE='singularity'."
             )
     default_env = dict(getattr(config, "DEFAULT_ENV", {}))
@@ -155,9 +164,7 @@ def build_settings(
     require_clean_git = bool(getattr(config, "REQUIRE_CLEAN_GIT", False))
     sync_symlinks = str(getattr(config, "SYNC_SYMLINKS", "preserve")).strip().lower()
     if sync_symlinks not in {"copy-links", "preserve"}:
-        raise SystemExit("ERROR: SYNC_SYMLINKS must be one of: copy-links, preserve.")
-    local_artifact_root = getattr(config, "LOCAL_ARTIFACT_ROOT", None)
-    verbose = bool(getattr(config, "VERBOSE", False))
+        raise ValueError("ERROR: SYNC_SYMLINKS must be one of: copy-links, preserve.")
 
     return LauncherSettings(
         cluster_login=cluster_login,
@@ -194,10 +201,6 @@ def build_settings(
         artifact_paths=artifact_paths,
         require_clean_git=require_clean_git,
         sync_symlinks=sync_symlinks,
-        local_artifact_root=(
-            Path(local_artifact_root).resolve() if local_artifact_root else None
-        ),
-        verbose=verbose,
         rsync_login=str(rsync_login) if rsync_login else str(cluster_login),
     )
 
@@ -222,7 +225,7 @@ def python_job(
             args={"--config-name": "train", "--lr": 1e-4},
         )
     """
-    command_parts = ["python", script]
+    command_parts = ["python", shlex.quote(script)]
     for key, value in (args or {}).items():
         command_parts.append(shlex.quote(str(key)))
         command_parts.append(shlex.quote(str(value)))
@@ -241,7 +244,9 @@ def coerce_job(entry: Any) -> JobSpec:
     if isinstance(entry, JobSpec):
         return entry
     if isinstance(entry, dict):
-        name = str(entry["name"])
+        name = entry.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Each job must define a nonempty string name.")
         if "python" in entry:
             raise ValueError(
                 f"Job '{name}' uses unsupported key 'python'. "
@@ -257,10 +262,10 @@ def coerce_job(entry: Any) -> JobSpec:
                 f"Job '{name}' uses unsupported keys ('args'/'shell'/'interpreter'). "
                 "Use a single explicit 'command' string or python_job()."
             )
-        has_command = "command" in entry and bool(str(entry.get("command", "")).strip())
-        has_sbatch_file = "sbatch_file" in entry and bool(
-            str(entry.get("sbatch_file", "")).strip()
-        )
+        command_value = entry.get("command")
+        script_value = entry.get("sbatch_file")
+        has_command = command_value is not None and bool(str(command_value).strip())
+        has_sbatch_file = script_value is not None and bool(str(script_value).strip())
         if has_command == has_sbatch_file:
             raise ValueError(
                 f"Job '{name}' must define exactly one of 'command' or 'sbatch_file'."
@@ -278,7 +283,7 @@ def coerce_job(entry: Any) -> JobSpec:
             artifacts=ensure_list(entry.get("artifacts")),
             requires=ensure_list(entry.get("requires")),
         )
-    raise TypeError(f"Unsupported job entry: {entry!r}")
+    raise ValueError(f"Unsupported job entry: {entry!r}")
 
 
 def select_jobs(jobs: list[JobSpec], run_only: list[str] | None) -> list[JobSpec]:
@@ -288,7 +293,7 @@ def select_jobs(jobs: list[JobSpec], run_only: list[str] | None) -> list[JobSpec
     available = {job.name for job in jobs}
     missing = wanted.difference(available)
     if missing:
-        raise SystemExit(f"ERROR: Requested jobs not found: {sorted(missing)}")
+        raise ValueError(f"ERROR: Requested jobs not found: {sorted(missing)}")
     return [job for job in jobs if job.name in wanted]
 
 
@@ -297,7 +302,7 @@ def prepare_jobs(
 ) -> list[JobSpec]:
     raw_jobs = getattr(config, "JOBS", None)
     if not raw_jobs:
-        raise SystemExit("ERROR: Config must define JOBS.")
+        raise ValueError("ERROR: Config must define JOBS.")
     jobs = [coerce_job(entry) for entry in raw_jobs]
     for job in jobs:
         if job.uses_sbatch_file():
@@ -314,14 +319,14 @@ def fail_duplicate_jobs(jobs: list[JobSpec]) -> None:
             duplicates.add(job.name)
         seen.add(job.name)
     if duplicates:
-        raise SystemExit(f"ERROR: Duplicate job names found: {sorted(duplicates)}")
+        raise ValueError(f"ERROR: Duplicate job names found: {sorted(duplicates)}")
 
 
 def fail_if_not_absolute(label: str, value: str | None) -> None:
     if value is None:
         return
     if not str(value).startswith("/"):
-        raise SystemExit(f"ERROR: {label} must be an absolute path. Got: {value!r}")
+        raise ValueError(f"ERROR: {label} must be an absolute path. Got: {value!r}")
 
 
 def resolve_local_sbatch_file_path(
@@ -337,22 +342,74 @@ def validate_predefined_sbatch_file_job(
         return
     local_path = resolve_local_sbatch_file_path(settings, job.sbatch_file)
     if local_path is None:
-        raise SystemExit(
+        raise ValueError(
             f"ERROR: Job '{job.name}' sbatch_file must stay inside LOCAL_ROOT. "
             f"Got: {job.sbatch_file!r}"
         )
-    if not local_path.exists():
-        raise SystemExit(
+    if not local_path.is_file():
+        raise ValueError(
             f"ERROR: Job '{job.name}' sbatch_file not found in LOCAL_ROOT: {local_path}"
         )
 
 
-def validate_predefined_sbatch_jobs(
-    settings: LauncherSettings, jobs: list[JobSpec]
+def validate_settings(settings: LauncherSettings) -> None:
+    """Validate path contracts shared by previews and live execution."""
+    paths = [
+        ("REMOTE_LOG_BASE_PATH", settings.remote_log_base_path),
+        (
+            "REMOTE_WORKSPACE_BASE"
+            if settings.workspace_mode == "per-run"
+            else "REMOTE_WORKSPACE_DIR",
+            settings.remote_workspace_base
+            if settings.workspace_mode == "per-run"
+            else settings.remote_workspace_dir,
+        ),
+        (
+            "REMOTE_SLURM_DASHBOARD_LOG_ARCHIVE_DIR",
+            settings.remote_slurm_dashboard_log_archive_dir,
+        ),
+        (
+            "REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR",
+            settings.remote_slurm_dashboard_log_view_dir,
+        ),
+    ]
+    if settings.runtime_mode == "venv":
+        paths.append(("VENV_PYTHON_EXECUTABLE", settings.venv_python_executable))
+    elif settings.runtime_mode == "singularity":
+        paths.append(("SINGULARITY_IMAGE_PATH", settings.singularity_image_path))
+    for label, path in paths:
+        fail_if_not_absolute(label, path)
+    prefix = settings.project_prefix
+    if not isinstance(prefix, str) or not prefix or Path(prefix).name != prefix:
+        raise ValueError("PROJECT_NAME must be a nonempty path component.")
+    if prefix in {".", ".."}:
+        raise ValueError("PROJECT_NAME cannot be '.' or '..'.")
+
+
+def validate_jobs(
+    settings: LauncherSettings,
+    jobs: list[JobSpec],
+    *,
+    require_sbatch_files: bool = True,
 ) -> None:
+    """Validate resolved jobs without importing config or preparing inputs."""
+    fail_duplicate_jobs(jobs)
+    paths = resolve_remote_paths(settings, job_folder="validation")
     for job in jobs:
+        if (
+            not isinstance(job.name, str)
+            or not job.name
+            or Path(job.name).name != job.name
+            or job.name in {".", ".."}
+        ):
+            raise ValueError(f"Job name must be a single path component: {job.name!r}")
         if job.uses_sbatch_file():
-            validate_predefined_sbatch_file_job(settings, job)
+            if require_sbatch_files:
+                validate_predefined_sbatch_file_job(settings, job)
+            elif resolve_local_sbatch_file_path(settings, str(job.sbatch_file)) is None:
+                raise ValueError("sbatch_file must stay inside LOCAL_ROOT")
+        else:
+            format_sbatch_options(job, settings, paths)
 
 
 def remote_runtime_checks(settings: LauncherSettings) -> list[str]:
@@ -362,15 +419,15 @@ def remote_runtime_checks(settings: LauncherSettings) -> list[str]:
         activate = str(Path(venv_python).parent / "activate")
         commands.extend(
             [
-                f"test -f {activate}",
-                f"test -x {venv_python}",
+                f"test -f {shlex.quote(activate)}",
+                f"test -x {shlex.quote(venv_python)}",
             ]
         )
     if settings.runtime_mode == "singularity" and settings.singularity_image_path:
         commands.extend(
             [
                 "command -v singularity >/dev/null 2>&1",
-                f"test -f {settings.singularity_image_path}",
+                f"test -f {shlex.quote(settings.singularity_image_path)}",
             ]
         )
     return commands
@@ -378,7 +435,6 @@ def remote_runtime_checks(settings: LauncherSettings) -> list[str]:
 
 # Heuristic known MN5 partitions; kept generic enough to avoid false positives.
 _KNOWN_PARTITIONS = {"acc", "gp_debug", "gp", "bsc_es", "interactive"}
-_GPU_HINTS = {"gpu", "gres"}
 _OUTPUT_DIR_HINTS = ("--output-dir", "output_dir", "hydra.run.dir", "out_dir")
 
 

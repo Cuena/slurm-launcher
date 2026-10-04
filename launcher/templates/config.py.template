@@ -40,8 +40,6 @@ REMOTE_SLURM_DASHBOARD_LOG_VIEW_DIR: str | None = None
 
 PROJECT_NAME = LOCAL_ROOT.name.replace(" ", "_")
 ARTIFACT_PATHS: list[str] = ["outputs"]
-# Local directory used as the default root for `artifacts download`.
-LOCAL_ARTIFACT_ROOT: str | None = None
 # Symlink handling during rsync: "copy-links" (dereference symlinks) or
 # "preserve" (send symlinks as-is). Default: "preserve".
 SYNC_SYMLINKS: str | None = "preserve"
@@ -53,7 +51,7 @@ REQUIRE_CLEAN_GIT = False
 
 # native: run commands as written
 # venv: source the virtualenv from VENV_PYTHON_EXECUTABLE before running jobs
-# singularity: wrap each job with singularity exec <flags> <image> ...
+# singularity: run command via bash -euo pipefail -c inside the image (Bash required)
 RUNTIME_MODE = "native"  # native | venv | singularity
 
 VENV_PYTHON_EXECUTABLE: str | None = None
@@ -100,6 +98,7 @@ def mn5_multinode_accel_sbatch(
         "qos": qos,
         "time": job_time,
         "nodes": max(1, nodes),
+        "ntasks": max(1, nodes),
         "ntasks-per-node": 1,
         "cpus-per-task": max(1, cpus_per_task),
         "gres": f"gpu:{max(1, gpus_per_node)}",
@@ -138,7 +137,6 @@ EXTRA_RSYNC_EXCLUDES = [
     "*.pth",
 ]
 EXTRA_RSYNC_ARGS: list[str] = []
-VERBOSE = False
 
 # Optional default selection. If empty, launch with --only NAME or explicit --all.
 RUN_JOBS: list[str] = []

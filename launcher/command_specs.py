@@ -79,5 +79,3 @@ COMMAND_SPECS = {
         ("summary --run latest --json",),
     ),
 }
-
-COMMAND_NAMES = tuple(COMMAND_SPECS)

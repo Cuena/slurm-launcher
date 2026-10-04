@@ -7,9 +7,9 @@ and distributed-runtime logic; the launcher is not an SSH security sandbox.
 
 ## Install
 
-Requires Python 3.10+, SSH and rsync locally, and SLURM on the remote cluster.
-Bounded log inspection additionally requires `python3` on the remote login node.
-Git is optional for source provenance. Install once for use across projects:
+Requires Python 3.10+, SSH and rsync locally; Bash, rsync and SLURM remotely.
+Log inspection also needs remote `python3`; Git is optional for source provenance.
+Install once with uv for use across projects:
 
 ```bash
 uv tool install --editable /path/to/slurm-launcher
@@ -38,8 +38,13 @@ Bare invocation shows help. Execution requires selected job names, a nonempty
 Use validation after config changes and previews for unfamiliar or costly launches.
 These are available checks, not a mandatory sequence before every established run.
 `--json` selects output format; it never implies `--dry-run`.
-In JSON mode, stdout contains a single JSON result; rsync progress and diagnostics
-go to stderr.
+Operational `--json` results use one stdout document without progress chatter.
+Probe/transfer diagnostics are included in JSON; help and usage errors remain text.
+
+Initialization ignores private configs, `__pycache__/`, and `slurm_output/`, while
+keeping `.slurm/*.example.py` shareable. Existing projects must add these exclusions
+before enabling `REQUIRE_CLEAN_GIT`. Source provenance is captured once after
+preparation and before creating launcher state, then reused for staging and tracking.
 
 For an existing project-owned script:
 
@@ -56,10 +61,11 @@ slurm-launcher preflight --run <returned-run-id> --json
 slurm-launcher submit --run <returned-run-id> --json
 ```
 
-The run directory contains a resolved `plan.json`, script snapshots, and `jobs.json`.
-Submission/preflight read that frozen plan, not the current Python config. Stage a
-new run to change job definitions. `submit --run ... --only ...` can narrow the
-saved selection; it cannot add jobs absent from the plan.
+Each run saves a version-3 `plan.json`, one `.sbatch` snapshot per job, and
+`jobs.json`. Submit/preflight use this frozen plan, not the current config.
+Restage changed job definitions or version-1/2 plans. `submit --only ...` can narrow
+the saved selection, not add jobs. Relocated or renamed bundles save progress in
+the selected directory while retaining their original run ID.
 
 ## Inspect state and logs
 
@@ -70,10 +76,10 @@ slurm-launcher logs --job-id 123
 slurm-launcher logs --job-id 123 --stream stderr --json
 ```
 
-One log call resolves paths and reads content. The default is **both streams**, at
-most **100 lines per initial file tail and 64 KiB total content per response**, with separate labels and filesystem status.
-JSON contains the same content as text. Scheduler-derived paths are not proof of
-existence. Missing, empty, unreadable, and successful reads are distinguished.
+One log call resolves paths and reads content: **both streams**, at most **100
+lines per initial file tail and 64 KiB total content per response**. JSON and text
+read the same content. Per-file status distinguishes missing, empty, unreadable,
+and successful reads; a scheduler-derived path does not prove existence.
 
 ```bash
 slurm-launcher logs --run <run-id> --job train --lines 200 --json
@@ -82,16 +88,27 @@ slurm-launcher logs --cursor <returned-cursor> --json
 slurm-launcher logs --run <run-id> --path logs/application.err --json
 ```
 
-Search is literal, bounded, and resumable; check completion metadata before
-concluding that a pattern does not occur. The cursor continues the read without
-repeating previous bytes and reports file replacement/truncation explicitly.
-Keep cursors private: they contain paths and SSH context, not an authorization token.
-`--path` is a file inside the tracked workspace. For application logs elsewhere,
-use SSH rather than recursively searching GPFS through this tool.
+Search is literal, bounded, and resumable. Continue the returned cursor and check
+completion before concluding that no match exists. Cursors report replacement,
+truncation, and rewrites touching sampled prefix/pre-offset regions—not every
+possible rewrite. Malformed UTF-8 is represented rather than silently skipped.
+Keep cursors private: they contain paths and SSH context, not authorization.
 
-`--path-only` is optional discovery. `--follow` is an interactive text operation;
-agents should normally use bounded reads. Use `job-show 123 --sbatch --json` for
-detailed scheduler metadata or the original submitted batch script.
+`--path` reads inside the tracked workspace; use SSH for application logs elsewhere.
+`--path-only` stats files without reading content. Missing tracked paths are
+resolved initially; saved non-null paths remain authoritative. Per-stream provenance
+and `resolution_errors` persist in cursors.
+
+`--follow` is an interactive text operation; agents should normally use bounded
+reads. Use `job-show 123 --sbatch --json` for detailed scheduler metadata or the
+original submitted batch script. Launcher attribution is restricted to the queried
+cluster and rejects mismatching available submission identities.
+
+Array status includes task IDs. `array_complete` requires the exact saved task set,
+known task states, and a successful queue probe; it does not mean all tasks succeeded.
+`DONE` additionally requires every task to succeed. A failed task takes precedence
+over running/pending tasks. Direct/legacy tracking without a saved task expression
+cannot prove completion. Scalar `COMPLETED` with a nonzero exit code or signal is `FAILED`.
 
 ### Run identity
 
@@ -108,11 +125,12 @@ saved complete SSH context and does not import project configuration.
 
 ## Recover from submission failure
 
-Tracking is updated atomically after each acknowledged submission. Failure output
-preserves earlier successful IDs and identifies the failed or unknown attempt.
+Tracking saves acknowledged IDs atomically before optional log enrichment. Failure
+output retains earlier IDs and the failed/unknown attempt. Uncertain attempts save
+`submission_stdout`, `submission_stderr`, and `submission_returncode` for recovery.
 
 - `submitted`: an acknowledged scheduler ID; never automatically resubmitted.
-- `failed`: a known unsuccessful attempt; inspect the error before retrying.
+- `failed`: an explicit unsuccessful scheduler attempt; inspect the error before retrying.
 - `submitting` or `unknown`: the scheduler may have accepted it. Reconcile through
   scheduler inspection before launching anything again; no blind retry.
 
@@ -135,16 +153,25 @@ slurm-launcher download-logs --run <run-id> --json
 slurm-launcher summary --run <run-id> --json
 ```
 
-`list` reports declarations, `check` probes existence/type/size, and `download`
-copies files. A request to read logs does not authorize a download. `summary` reads
-tracking and current scheduler state; it writes neither local nor remote files.
+`list` reports declarations; `check` probes existence/type and filesystem metadata
+size, not recursive directory usage. `download` copies to the reported destination;
+repeating a directory download does not add another nested copy. Dry runs create no
+directories or remote probes. Transfer failures retain return codes and bounded stderr.
+
+Downloaded logs are separated under
+`<destination>/<job-name>/<job-id>/<stdout|stderr>/<basename>`, so repeated job names
+and identical stdout/stderr basenames do not overwrite each other. If both streams
+refer to the same remote file, it is downloaded once.
+
+A request to read logs does not authorize a download. `summary` reads tracking and
+current scheduler state; it writes neither local nor remote files.
 
 ## Configuration
 
 Config lookup: `.slurm/remote_launcher_config.mn5.py`, then
-`remote_launcher_config.py`; override with `--config`. Direct cluster commands can
-also use `~/.config/slurm-launcher/config.py`. MN5 filenames are conventions, not a
-restriction to that cluster. The template and examples show all supported settings.
+`remote_launcher_config.py`; override with `--config`. Direct cluster commands also
+use `~/.config/slurm-launcher/config.py`. MN5 filenames are conventions, not a
+cluster restriction. Adapt the template's hosts, account, paths, and scripts before use.
 
 ```python
 from pathlib import Path
@@ -170,7 +197,10 @@ Each job supplies exactly one of `command` or `sbatch_file`. Command jobs suppor
 `setup`, `env`, and `sbatch` overrides. Existing-script jobs support `sbatch_args`
 and own their runtime/directives. Both support `requires` and `artifacts`.
 Prerequisites are paths/globs checked in the staged workspace; a job with no
-prerequisites is reported as not configured, not as a passed check.
+prerequisites is reported as not configured, not as a passed check. Literal paths
+can contain spaces, quotes, dollar signs, and pipes. Globs must match existing
+targets, not merely dangling symlinks. An incomplete response or failed SSH process
+cannot pass preflight; JSON retains transport status and bounded diagnostics.
 
 Relevant settings:
 
@@ -180,28 +210,24 @@ Relevant settings:
 - **Runtime:** `RUNTIME_MODE` native/venv/singularity;
   `VENV_PYTHON_EXECUTABLE` for venv; `SINGULARITY_IMAGE_PATH` and
   `SINGULARITY_EXEC_FLAGS` for Singularity.
-- **Transport:** `CLUSTER_LOGIN`, optional `RSYNC_LOGIN` for a transfer endpoint,
-  `SSH_CONFIG_FILE`, `SSH_OPTIONS`.
+- **Transport:** `CLUSTER_LOGIN`, optional `RSYNC_LOGIN`, `SSH_CONFIG_FILE`,
+  `SSH_OPTIONS`. Both SSH endpoints must access the same remote directories.
 - **Staging:** `EXTRA_RSYNC_EXCLUDES`, `EXTRA_RSYNC_ARGS`, `SYNC_SYMLINKS`,
   `REQUIRE_CLEAN_GIT`. Keep datasets, checkpoints, secrets and caches out of code sync.
-- **Outputs:** global `ARTIFACT_PATHS`, per-job `artifacts`, optional
-  `LOCAL_ARTIFACT_ROOT`; dashboard archive/view settings remain optional.
+- **Outputs:** global `ARTIFACT_PATHS`, per-job `artifacts`, optional dashboard
+  archive/view settings. Choose local download roots with `--output-dir`.
+
+Explicit `ntasks` wins; otherwise Slurm determines task count from the other directives.
+Singularity executes the whole `command` via `bash -euo pipefail -c` inside the image,
+which must provide Bash. Job `setup` runs first in the host batch shell.
+`VERBOSE` and the unused `LOCAL_ARTIFACT_ROOT` are no longer settings.
 
 ### Preparation and trust
 
-Python config import is executable trusted code, even for validate/render/dry-run.
-Keep import-time job generation pure. If generated inputs must be written, expose:
-
-```python
-def prepare():
-    # Write already-resolved project inputs here.
-    generated_input.write_text(serialized_input, encoding="utf-8")
-```
-
-The launcher calls this hook only for real stage/run/sbatch operations, before
-syncing. It is skipped during previews and frozen-plan submission. The hook should
-prepare inputs, not silently alter resolved job selection. No environment manager
-or plugin framework is needed.
+Python config import executes trusted code, including during validate/render/dry-run.
+Keep import-time job generation pure. Define a module-level `prepare()` to write
+resolved generated inputs: it runs only for real stage/run/sbatch, before sync.
+Previews and frozen-plan submission skip it. Do not alter job selection inside the hook.
 
 ### Fixed versus per-run
 
@@ -227,7 +253,27 @@ This release intentionally removes overlapping spellings:
 | Bare command launches; empty `RUN_JOBS` launches everything | Explicit `run`; select jobs or pass `--all` |
 | JSON log discovery only | JSON log content and metadata; optional `--path-only` |
 | `summary` writes files and imports config | Read-only tracked summary |
+| `scripts/download_logs.py` | `slurm-launcher download-logs` |
+| `scripts/init_wrapper_repo.sh` | `slurm-launcher init` |
+| `latest_run.txt`, duplicated `.sh` snapshots | `latest_run.json`, one `.sbatch` snapshot per job |
 
 Consult `<command> --help` for exact options. The skill teaches decisions; help
 owns the command reference. Use SSH for investigations outside these workflows,
 with explicit intent for destructive actions and expensive submissions.
+
+## Development
+
+Runtime dependencies contain only Rich. Ruff and Vulture belong to the development
+dependency group:
+
+```bash
+uv sync --locked --group dev
+uv run python -m unittest discover -s tests
+uv run ruff check .
+uv run vulture launcher --min-confidence 100
+uv build
+git diff --check
+```
+
+Regression matrices reuse local SSH/scheduler fixtures; Bash and rsync execute locally.
+No tests submit to a live cluster. Rsync-dependent cases skip if it is unavailable.

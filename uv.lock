@@ -76,13 +76,19 @@ version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "rich" },
+]
+
+[package.dev-dependencies]
+dev = [
     { name = "ruff" },
     { name = "vulture" },
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "rich", specifier = ">=14.3.2" },
+requires-dist = [{ name = "rich", specifier = ">=14.3.2" }]
+
+[package.metadata.requires-dev]
+dev = [
     { name = "ruff", specifier = ">=0.15.0" },
     { name = "vulture", specifier = ">=2.16" },
 ]

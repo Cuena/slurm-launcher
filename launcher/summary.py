@@ -5,7 +5,7 @@ from dataclasses import asdict
 
 from rich.console import Console
 
-from .status import query_job_statuses
+from .status import query_job_statuses, status_payload
 from .tracking import TrackingError, load_tracking_payload, resolve_tracking_file
 
 console = Console()
@@ -32,7 +32,7 @@ def run_summary(args: Namespace) -> int:
             "cluster_login": tracked.cluster_login,
             "remote_workdir": tracked.remote_workdir,
             "jobs": [asdict(job) for job in tracked.jobs],
-            "statuses": [asdict(job) for job in status.statuses],
+            "statuses": [status_payload(job) for job in status.statuses],
             "probes": [asdict(probe) for probe in status.probes],
             "unresolved_job_ids": status.unresolved_job_ids,
         }

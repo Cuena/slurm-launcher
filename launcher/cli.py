@@ -19,30 +19,29 @@ from .logs import add_logs_args, run_logs
 from .core import (
     JobSpec,
     LauncherSettings,
-    build_predefined_sbatch_command,
     build_job_script,
     build_launcher_metadata,
     build_sbatch_script,
     format_sbatch_options,
     resolve_remote_paths,
     ssh_script,
+    submit_job,
     test_ssh_connection,
 )
 from .command_specs import COMMAND_SPECS
 from .config_utils import (
     build_settings,
     collect_config_warnings,
+    configured_run_only,
     ensure_list,
-    fail_duplicate_jobs,
     resolve_config_path,
-    fail_if_not_absolute,
     load_config,
     normalize_workspace_mode,
     prepare_jobs,
     remote_runtime_checks,
     resolve_local_sbatch_file_path,
-    validate_predefined_sbatch_file_job,
-    validate_predefined_sbatch_jobs,
+    validate_jobs,
+    validate_settings,
 )
 from .artifacts import add_artifacts_parser, dispatch_artifacts
 from .download_logs import add_download_logs_args, run_download_logs
@@ -512,29 +511,18 @@ def do_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _configured_run_only(
-    config: ModuleType, args: argparse.Namespace
-) -> list[str] | None:
-    if args.all_jobs:
-        return None
-    return args.only or ensure_list(getattr(config, "RUN_JOBS", None)) or None
-
-
 def _prepare_configured_jobs(
     config: ModuleType,
     settings: LauncherSettings,
     args: argparse.Namespace,
-    *,
-    fail_duplicate_names: bool = False,
-    validate_predefined_jobs: bool = True,
 ) -> list[JobSpec]:
+    validate_settings(settings)
     jobs = prepare_jobs(
-        config, _configured_run_only(config, args), settings.default_env
+        config,
+        configured_run_only(config, args, require_selection=False),
+        settings.default_env,
     )
-    if fail_duplicate_names:
-        fail_duplicate_jobs(jobs)
-    if validate_predefined_jobs:
-        validate_predefined_sbatch_jobs(settings, jobs)
+    validate_jobs(settings, jobs)
     return jobs
 
 
@@ -652,37 +640,10 @@ def do_validate(args: argparse.Namespace) -> int:
             workspace_mode_override=workspace_mode,
         )
         workspace_mode = settings.workspace_mode
-        jobs = _prepare_configured_jobs(
-            config,
-            settings,
-            args,
-            fail_duplicate_names=True,
-            validate_predefined_jobs=False,
-        )
+        jobs = _prepare_configured_jobs(config, settings, args)
         selected_jobs = [job.name for job in jobs]
 
-        fail_if_not_absolute("REMOTE_LOG_BASE_PATH", settings.remote_log_base_path)
-        if settings.workspace_mode == "per-run":
-            fail_if_not_absolute(
-                "REMOTE_WORKSPACE_BASE", settings.remote_workspace_base
-            )
-        if settings.workspace_mode == "fixed":
-            fail_if_not_absolute("REMOTE_WORKSPACE_DIR", settings.remote_workspace_dir)
-        if settings.runtime_mode == "venv":
-            fail_if_not_absolute(
-                "VENV_PYTHON_EXECUTABLE", settings.venv_python_executable
-            )
-        if settings.runtime_mode == "singularity":
-            fail_if_not_absolute(
-                "SINGULARITY_IMAGE_PATH", settings.singularity_image_path
-            )
-
         remote_paths = resolve_remote_paths(settings)
-        for job in jobs:
-            if job.uses_sbatch_file():
-                validate_predefined_sbatch_file_job(settings, job)
-                continue
-            format_sbatch_options(job, settings, remote_paths)
 
         if args.ssh:
             test_ssh_connection(
@@ -713,7 +674,7 @@ def do_validate(args: argparse.Namespace) -> int:
             remote_checks["ok"] = True
 
         warnings = collect_config_warnings(settings, jobs)
-    except (RuntimeError, SystemExit, ValueError) as exc:
+    except (OSError, RuntimeError, SystemExit, TypeError, ValueError) as exc:
         return _emit_command_error(
             str(exc),
             json_output=json_output,
@@ -788,14 +749,9 @@ def do_render(args: argparse.Namespace) -> int:
             config_path,
             workspace_mode_override=_workspace_mode_from_args(args),
         )
-        jobs = _prepare_configured_jobs(
-            config,
-            settings,
-            args,
-            fail_duplicate_names=True,
-        )
+        jobs = _prepare_configured_jobs(config, settings, args)
         remote_paths = resolve_remote_paths(settings)
-    except (RuntimeError, SystemExit, ValueError) as exc:
+    except (OSError, RuntimeError, SystemExit, TypeError, ValueError) as exc:
         return _emit_command_error(
             str(exc),
             json_output=json_output,
@@ -812,26 +768,19 @@ def do_render(args: argparse.Namespace) -> int:
 
     for job in jobs:
         if job.uses_sbatch_file():
-            remote_sbatch_path, sbatch_command = build_predefined_sbatch_command(
-                settings, remote_paths, job
-            )
+            preview = submit_job(settings, remote_paths, job, dry_run=True, quiet=True)
             job_payload: dict[str, Any] = {
                 "job_name": job.name,
                 "job_type": "sbatch_file",
                 "sbatch_file": str(job.sbatch_file),
-                "remote_sbatch_path": remote_sbatch_path,
-                "sbatch_command": sbatch_command,
+                "remote_sbatch_path": preview.remote_sbatch_path,
+                "sbatch_command": preview.sbatch_command,
             }
             if args.job_script:
                 local_path = resolve_local_sbatch_file_path(
                     settings, str(job.sbatch_file)
                 )
-                if local_path and local_path.exists():
-                    job_payload["job_script"] = local_path.read_text(encoding="utf-8")
-                else:
-                    job_payload["warning"] = (
-                        "render cannot preview local contents for sbatch_file outside LOCAL_ROOT."
-                    )
+                job_payload["job_script"] = local_path.read_bytes().decode("utf-8")
             rendered_jobs.append(job_payload)
             continue
 
@@ -967,10 +916,10 @@ def do_doctor(args: argparse.Namespace) -> int:
                 dry_run=False,
                 ssh_config_file=ssh_config_file,
                 ssh_options=ssh_options,
+                quiet=bool(args.json),
             )
-        except SystemExit as exc:
-            err_console.print(str(exc), style="bold red")
-            return 1
+        except (RuntimeError, SystemExit) as exc:
+            return _emit_command_error(str(exc), json_output=bool(args.json))
 
         script = "\n".join(
             [
@@ -984,19 +933,14 @@ def do_doctor(args: argparse.Namespace) -> int:
                 "done",
             ]
         )
-        try:
-            stdout, _ = ssh_script(
-                cluster_login,
-                script,
-                dry_run=False,
-                ssh_config_file=ssh_config_file,
-                ssh_options=ssh_options,
-            )
-        except RuntimeError as exc:
-            err_console.print(
-                f"ERROR: SSH doctor checks failed: {exc}", style="bold red"
-            )
-            return 1
+        stdout, _ = ssh_script(
+            cluster_login,
+            script,
+            dry_run=False,
+            ssh_config_file=ssh_config_file,
+            ssh_options=ssh_options,
+            quiet=bool(args.json),
+        )
         remote_tools: dict[str, str] = {}
         for line in stdout.splitlines():
             if "=" not in line:
@@ -1078,24 +1022,16 @@ def do_job_show(args: argparse.Namespace) -> int:
     )
 
 
-def do_download_logs(args: argparse.Namespace) -> int:
-    return run_download_logs(args)
-
-
-def do_artifacts(args: argparse.Namespace) -> int:
-    return dispatch_artifacts(args)
-
-
 COMMAND_HANDLERS = {
     "doctor": do_doctor,
-    "download-logs": do_download_logs,
+    "download-logs": run_download_logs,
     "init": do_init,
     "job-show": do_job_show,
     "jobs": do_jobs,
     "logs": do_logs,
     "render": do_render,
     "run": do_run,
-    "artifacts": do_artifacts,
+    "artifacts": dispatch_artifacts,
     "preflight": do_preflight,
     "sbatch": do_sbatch,
     "stage": do_stage,
@@ -1111,7 +1047,7 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command
     try:
         return COMMAND_HANDLERS[command](args)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, SystemExit, TypeError, ValueError) as exc:
         return _emit_command_error(
             str(exc), json_output=bool(getattr(args, "json", False))
         )

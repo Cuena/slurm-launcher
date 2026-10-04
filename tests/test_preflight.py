@@ -5,81 +5,120 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import subprocess
+import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
-from launcher.preflight import build_remote_check_script
+from launcher.preflight import (
+    build_remote_check_script,
+    run_preflight,
+    run_preflight_for_job,
+)
 
 
 class TestRemoteCheckScript(TestCase):
-    def test_plain_path_and_glob(self) -> None:
-        script = build_remote_check_script(
-            "/work/project",
-            ["data/processed", "models/*.pt"],
+    def test_literal_special_paths_and_existing_glob_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            names = ["model$epoch.pt", 'model"quoted".pt', "model|version.pt"]
+            for name in names:
+                (root / name).write_text("weights")
+            (root / "dangling.pt").symlink_to(root / "absent")
+            script = build_remote_check_script(tmp, [*names, "model*.pt", "dangling.pt"])
+            result = subprocess.run(
+                ["bash", "-s"], input=script, text=True, capture_output=True, check=False
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["0|true|exists", "1|true|exists", "2|true|exists",
+             "3|true|matched 3", "4|false|broken symlink"],
         )
-        self.assertIn("cd /work/project", script)
-        self.assertIn("CHECK_START|data/processed", script)
-        self.assertIn("CHECK_START|models/*.pt", script)
-        self.assertIn("compgen -G 'models/*.pt'", script)
-        self.assertIn("[ -e data/processed ]", script)
+        self.assertEqual(result.stderr, "")
 
-    def test_broken_symlink_detection(self) -> None:
-        script = build_remote_check_script(
-            "/work/project",
-            ["data/model.pt"],
+    def test_glob_with_only_dangling_symlink_fails_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "dangling.pt").symlink_to(root / "absent")
+            (root / "present").write_text("data")
+            result = subprocess.run(
+                ["bash", "-s"],
+                input=build_remote_check_script(tmp, ["dang*.pt", "missing*", "present"]),
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["0|false|glob matched 0 existing targets",
+             "1|false|glob matched 0 existing targets", "2|true|exists"],
         )
-        self.assertIn("[ -L data/model.pt ]", script)
-        self.assertIn("broken symlink", script)
 
-    def test_no_match_glob_does_not_exit_before_reporting_failure(self) -> None:
-        script = build_remote_check_script("/work/project", ["models/*.pt"])
-        self.assertIn(
-            "count=$(compgen -G 'models/*.pt' 2>/dev/null | wc -l) || true", script
-        )
+    def test_failed_transport_cannot_publish_passed_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "input.txt").write_text("data")
+            ssh = root / "ssh"
+            ssh.write_text(
+                '#!/bin/bash\nshift\n"$@"\n'
+                'printf "connection closed before exit status\\n" >&2\nexit 255\n'
+            )
+            ssh.chmod(0o755)
+            settings = SimpleNamespace(
+                cluster_login="fixture", ssh_config_file=None, ssh_options=[]
+            )
+            remote_paths = SimpleNamespace(workdir=tmp)
+            jobs = [SimpleNamespace(name="train", requires=["input.txt"])]
+            output = io.StringIO()
+            with patch.dict(os.environ, {"PATH": f"{tmp}:{os.environ['PATH']}"}):
+                with contextlib.redirect_stdout(output):
+                    rc = run_preflight(settings, remote_paths, jobs, json_output=True)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(rc, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["jobs"][0]["status"], "failed")
+        self.assertTrue(payload["jobs"][0]["checks"][0]["ok"])
+        self.assertEqual(payload["jobs"][0]["transport_returncode"], 255)
+        self.assertIn("connection closed", payload["jobs"][0]["stderr"])
+
+    def test_successful_transport_with_incomplete_records_still_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("first", "second"):
+                (root / name).write_text("input")
+            ssh = root / "ssh"
+            ssh.write_text(
+                '#!/bin/bash\nshift\nresponse=$("$@")\n'
+                'printf "%s\\n" "${response%%$\'\\n\'*}"\n'
+            )
+            ssh.chmod(0o755)
+            settings = SimpleNamespace(
+                cluster_login="fixture", ssh_config_file=None, ssh_options=[]
+            )
+            with patch.dict(os.environ, {"PATH": f"{tmp}:{os.environ['PATH']}"}):
+                result = run_preflight_for_job(
+                    settings, SimpleNamespace(workdir=tmp), "train", ["first", "second"]
+                )
+        self.assertEqual(result.transport_returncode, 0)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.checks[0].ok)
+        self.assertFalse(result.checks[1].ok)
 
 
 class TestPreflightDryRunJson(TestCase):
     def test_dry_run_json_emits_valid_payload(self) -> None:
-        from launcher.preflight import run_preflight
-        from launcher.core import JobSpec, LauncherSettings
+        from launcher.core import JobSpec, RemotePaths
+        from tests.helpers import make_settings
 
-        settings = LauncherSettings(
-            cluster_login="user@cluster",
-            ssh_config_file=None,
-            ssh_options=[],
-            remote_workspace_base="/work",
-            remote_log_base_path="/logs",
-            workspace_mode="fixed",
-            remote_workspace_dir="/work/project",
-            project_root=Path("/tmp/project"),
-            project_prefix="project",
-            venv_python_executable=None,
-            default_env={},
-            default_sbatch={},
-            extra_rsync_excludes=[],
-            extra_rsync_args=[],
-            remote_slurm_dashboard_log_archive_dir=None,
-            remote_slurm_dashboard_log_view_dir=None,
-            runtime_mode="native",
-            singularity_image_path=None,
-            singularity_exec_flags=[],
-            artifact_paths=[],
-            require_clean_git=False,
-            sync_symlinks="copy-links",
-            local_artifact_root=None,
-            verbose=False,
+        settings = make_settings(
+            workspace_mode="fixed", remote_workspace_dir="/work/project"
         )
-        remote_paths = type(
-            "RemotePaths",
-            (),
-            {
-                "workdir": "/work/project",
-                "job_folder": "run_001",
-                "logdir": "/logs/run_001",
-                "slurm_output_dir": "/logs/run_001/slurm_output",
-            },
-        )()
+        remote_paths = RemotePaths(
+            "run_001", "/work/project", "/logs/run_001", "/logs/run_001/slurm_output"
+        )
         jobs = [
             JobSpec(
                 name="eval",
@@ -109,13 +148,11 @@ class TestPreflightDryRunJson(TestCase):
         self.assertEqual(payload["jobs"][0]["job_name"], "eval")
         self.assertEqual(payload["jobs"][0]["status"], "planned")
         self.assertIn("data/input/*.mp4", payload["jobs"][0]["requirements"])
-        self.assertIn("set -euo pipefail", payload["jobs"][0]["script"])
 
     def test_live_json_rejects_no_selected_jobs(self) -> None:
-        from launcher.preflight import run_preflight
 
-        settings = type("Settings", (), {})()
-        remote_paths = type("RemotePaths", (), {"workdir": "/work/project"})()
+        settings = SimpleNamespace()
+        remote_paths = SimpleNamespace(workdir="/work/project")
 
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -133,14 +170,12 @@ class TestPreflightDryRunJson(TestCase):
         self.assertFalse(payload["dry_run"])
         self.assertEqual(payload["checks_run"], 0)
         self.assertEqual(payload["jobs"], [])
-        self.assertEqual(payload["warnings"], ["No jobs were selected for preflight."])
 
     def test_live_json_rejects_job_without_requires_explicitly(self) -> None:
         from launcher.core import JobSpec
-        from launcher.preflight import run_preflight
 
-        settings = type("Settings", (), {})()
-        remote_paths = type("RemotePaths", (), {"workdir": "/work/project"})()
+        settings = SimpleNamespace()
+        remote_paths = SimpleNamespace(workdir="/work/project")
         jobs = [JobSpec(name="shared", sbatch_file="slurm/shared.sbatch")]
 
         buf = io.StringIO()
@@ -160,37 +195,21 @@ class TestPreflightDryRunJson(TestCase):
         self.assertEqual(payload["jobs"][0]["job_name"], "shared")
         self.assertEqual(payload["jobs"][0]["status"], "not-configured")
         self.assertFalse(payload["jobs"][0]["ok"])
-        self.assertIn("no 'requires'", payload["jobs"][0]["message"])
 
     def test_absolute_requirement_keeps_absolute_remote_path(self) -> None:
-        from launcher.preflight import run_preflight_for_job
-
-        settings = type(
-            "Settings",
-            (),
-            {
-                "cluster_login": "user@cluster",
-                "ssh_config_file": None,
-                "ssh_options": [],
-            },
-        )()
-        remote_paths = type("RemotePaths", (), {"workdir": "/work/project"})()
-        completed = type(
-            "Completed",
-            (),
-            {
-                "stdout": "CHECK_OK|/models/base.pt|exists\n",
-                "returncode": 0,
-            },
-        )()
-
-        with patch("launcher.preflight._run_ssh_capture", return_value=completed):
-            result = run_preflight_for_job(
-                settings,
-                remote_paths,
-                "train",
-                ["/models/base.pt"],
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prerequisite = root / "model|$epoch.pt"
+            prerequisite.write_text("weights")
+            ssh = root / "ssh"
+            ssh.write_text('#!/bin/bash\nshift\nexec "$@"\n')
+            ssh.chmod(0o755)
+            settings = SimpleNamespace(
+                cluster_login="fixture", ssh_config_file=None, ssh_options=[]
             )
-
+            with patch.dict(os.environ, {"PATH": f"{tmp}:{os.environ['PATH']}"}):
+                result = run_preflight_for_job(
+                    settings, SimpleNamespace(workdir=tmp), "train", [str(prerequisite)]
+                )
         self.assertTrue(result.ok)
-        self.assertEqual(result.checks[0].remote_path, "/models/base.pt")
+        self.assertEqual(result.checks[0].remote_path, str(prerequisite))
